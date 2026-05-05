@@ -1,0 +1,14 @@
+[project]
+name = "teach2drive-adapter"
+version = "0.1.0"
+description = "Small-data adapter fine-tuning scaffold for portable end-to-end driving policies."
+requires-python = ">=3.8"
+dependencies = [
+  "numpy",
+  "torch",
+  "opencv-python-headless",
+]
+
+[tool.setuptools.packages.find]
+include = ["teach2drive_adapter*"]
+
