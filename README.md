@@ -167,6 +167,16 @@ This track should compare:
 | layout adapter | Whether camera/LiDAR pose metadata improves small-data adaptation. |
 | partial/full fine-tune | Upper-bound comparison when compute and data are enough. |
 
+If the GPU server cannot run Codex, keep code editing local and generate
+copy-paste server commands locally:
+
+```bash
+cd ~/code/teach2drive_adapter
+python -m teach2drive_adapter.remote_commands --mode all
+```
+
+See `docs/remote_training_workflow.md`.
+
 ## Quick Start
 
 Use an index produced by `teach2drive_bootstrap`:
