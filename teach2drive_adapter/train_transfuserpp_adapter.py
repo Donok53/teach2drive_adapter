@@ -19,8 +19,33 @@ def _camera_list(raw: str):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _substring_list(raw: str):
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _adapter_state_dict(model: nn.Module):
     return {key: value for key, value in model.state_dict().items() if not key.startswith("net.")}
+
+
+def _build_optimizer(model: nn.Module, args: argparse.Namespace):
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    prior_params = [param for param in raw_model.net.parameters() if param.requires_grad]
+    adapter_params = [param for name, param in raw_model.named_parameters() if not name.startswith("net.") and param.requires_grad]
+    param_groups = []
+    if adapter_params:
+        param_groups.append({"params": adapter_params, "lr": args.lr, "weight_decay": args.weight_decay, "group_name": "adapter"})
+    if prior_params:
+        param_groups.append({"params": prior_params, "lr": args.prior_lr, "weight_decay": args.prior_weight_decay, "group_name": "prior"})
+    if not param_groups:
+        raise ValueError("No trainable parameters were found for optimizer setup.")
+    optimizer = torch.optim.AdamW(param_groups)
+    return optimizer, {
+        "adapter_parameters": int(sum(param.numel() for param in adapter_params)),
+        "prior_parameters": int(sum(param.numel() for param in prior_params)),
+        "adapter_lr": float(args.lr),
+        "prior_lr": float(args.prior_lr if prior_params else 0.0),
+        "prior_weight_decay": float(args.prior_weight_decay if prior_params else 0.0),
+    }
 
 
 def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str, float]:
@@ -187,13 +212,14 @@ def train(args: argparse.Namespace) -> None:
         command_mode=args.command_mode,
         tfpp_camera=args.tfpp_camera,
         layout_hidden_dim=args.layout_hidden_dim,
+        train_prior_substrings=_substring_list(args.train_prior_substrings),
     )
     model.to(device)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
         model = nn.DataParallel(model)
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
-    optimizer = torch.optim.AdamW([param for param in model.parameters() if param.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
+    optimizer, optimizer_info = _build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     print(
         json.dumps(
@@ -206,6 +232,8 @@ def train(args: argparse.Namespace) -> None:
                 "tfpp_camera": args.tfpp_camera,
                 "command_mode": args.command_mode,
                 "transfuserpp_load_info": raw_model.load_info,
+                "prior_trainable": raw_model.prior_trainable_info(),
+                "optimizer": optimizer_info,
             },
             indent=2,
         ),
@@ -268,8 +296,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--prior-lr", type=float, default=1e-5)
+    parser.add_argument("--prior-weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--layout-hidden-dim", type=int, default=128)
+    parser.add_argument(
+        "--train-prior-substrings",
+        default="",
+        help="Comma-separated TransFuser++ parameter-name substrings to unfreeze. Leave empty for adapter-only training.",
+    )
     parser.add_argument("--image-size", type=int, nargs=2, default=[640, 360], metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--lidar-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
