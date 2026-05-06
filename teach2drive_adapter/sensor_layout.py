@@ -65,6 +65,16 @@ def canonical_transfuserpp_layout() -> SensorLayout:
     return SensorLayout(cameras=cameras, lidars=lidars, estimated=True)
 
 
+def teach2drive_tokens_layout() -> SensorLayout:
+    cameras = {
+        "left": CameraSpec(Pose6D(x=1.0, y=-0.55, z=1.55, yaw=-45.0), fov=90.0, width=640, height=360),
+        "front": CameraSpec(Pose6D(x=1.5, y=0.0, z=1.6, yaw=0.0), fov=90.0, width=640, height=360),
+        "right": CameraSpec(Pose6D(x=1.0, y=0.55, z=1.55, yaw=45.0), fov=90.0, width=640, height=360),
+    }
+    lidars = {"top": LidarSpec(Pose6D(x=0.0, y=0.0, z=1.8), channels=32, range=60.0)}
+    return SensorLayout(cameras=cameras, lidars=lidars, estimated=False)
+
+
 def _pose_from_mapping(raw: Mapping) -> Pose6D:
     return Pose6D(
         x=float(raw.get("x", 0.0)),

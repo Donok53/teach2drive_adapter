@@ -1,7 +1,13 @@
 import argparse
 from pathlib import Path
 
-from .sensor_layout import canonical_transfuserpp_layout, perturb_layout, save_sensor_layout
+from .sensor_layout import canonical_transfuserpp_layout, perturb_layout, save_sensor_layout, teach2drive_tokens_layout
+
+
+LAYOUT_PRESETS = {
+    "canonical_transfuserpp": canonical_transfuserpp_layout,
+    "teach2drive_tokens": teach2drive_tokens_layout,
+}
 
 
 def find_episode_dirs(root: Path):
@@ -17,6 +23,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Write sensor_layout.json sidecars for Teach2Drive episodes.")
     parser.add_argument("--input-root", required=True)
     parser.add_argument("--output-name", default="sensor_layout.json")
+    parser.add_argument("--layout", choices=sorted(LAYOUT_PRESETS), default="canonical_transfuserpp")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--camera-yaw-deg", type=float, default=0.0)
@@ -31,7 +38,7 @@ def main() -> None:
     if not episode_dirs:
         raise FileNotFoundError(f"No episode directories found under {root}")
 
-    layout = canonical_transfuserpp_layout()
+    layout = LAYOUT_PRESETS[args.layout]()
     layout = perturb_layout(
         layout,
         camera_yaw_deg=args.camera_yaw_deg,
@@ -57,6 +64,7 @@ def main() -> None:
             "input_root": str(root),
             "episodes": len(episode_dirs),
             "output_name": args.output_name,
+            "layout": args.layout,
             "written": written,
             "skipped": skipped,
             "dry_run": bool(args.dry_run),
