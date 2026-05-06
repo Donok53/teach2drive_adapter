@@ -156,6 +156,9 @@ class Teach2DriveIndexDataset(Dataset):
 
         target = np.concatenate([self.traj[idx], self.speed[idx], self.stop[idx]], axis=0).astype(np.float32)
         return {
+            "index": torch.tensor(idx, dtype=torch.long),
+            "episode_idx": torch.tensor(episode_idx, dtype=torch.long),
+            "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
             "scalar": torch.from_numpy(self.scalar[idx]),
             "camera": torch.from_numpy(camera_tensor),
             "lidar": torch.from_numpy(lidar),
