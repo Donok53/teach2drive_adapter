@@ -1,0 +1,523 @@
+import argparse
+import json
+import time
+from pathlib import Path
+from typing import Dict, Optional, Sequence
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+from .data import STOP_REASON_NAMES, STOP_STATE_NAMES, Teach2DriveIndexDataset
+from .layout_conditioning import FiLMLayoutAdapter
+from .model import ConvEncoder, count_trainable_parameters
+from .train_adapter import _masked_weighted_ce, _weighted_mean
+from .train_transfuserpp_cached_adapter import _split_by_episode
+from .transfuserpp_adapter_model import TransFuserPPResidualHeads
+
+
+CAMERA_LAYOUT_ORDER = ("left", "front", "right")
+CAMERA_LAYOUT_WIDTH = 13
+LIDAR_LAYOUT_START = len(CAMERA_LAYOUT_ORDER) * CAMERA_LAYOUT_WIDTH
+LIDAR_LAYOUT_WIDTH = 12
+
+
+def _camera_list(raw: str):
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _metadata_from_cache(arrays) -> Dict:
+    if "metadata" not in arrays.files:
+        return {}
+    return json.loads(str(arrays["metadata"].item()))
+
+
+def _resolve_from_metadata(value: str, metadata: Dict, key: str) -> str:
+    if value:
+        return value
+    return str(metadata.get(key, ""))
+
+
+class CachedVisualPriorDataset(Dataset):
+    """Cached TransFuser++ prior plus raw Teach2Drive camera/LiDAR tensors.
+
+    The cache stores frozen TransFuser++ outputs. This dataset reopens the
+    original Teach2Drive index by cached sample ids so the adapter can still
+    use the full sensor observations without rerunning TransFuser++.
+    """
+
+    def __init__(
+        self,
+        cache_path: str,
+        index_path: str,
+        episode_root_override: str,
+        indices: Optional[np.ndarray] = None,
+        cameras: Optional[Sequence[str]] = None,
+        image_size=(320, 180),
+        lidar_size: int = 128,
+    ) -> None:
+        self.cache_path = Path(cache_path).expanduser()
+        arrays = np.load(self.cache_path, allow_pickle=True)
+        self.metadata = _metadata_from_cache(arrays)
+        self.sample_index = arrays["sample_index"].astype(np.int64)
+        self.sample_episode = arrays["sample_episode"].astype(np.int64)
+        self.scalar = arrays["scalar"].astype(np.float32)
+        self.layout = arrays["layout"].astype(np.float32)
+        self.target = arrays["target"].astype(np.float32)
+        self.stop_state = arrays["stop_state"].astype(np.int64)
+        self.stop_reason = arrays["stop_reason"].astype(np.int64)
+        self.stop_reason_mask = arrays["stop_reason_mask"].astype(np.float32)
+        self.sample_weight = arrays["sample_weight"].astype(np.float32)
+        self.base_target = arrays["base_target"].astype(np.float32)
+        self.checkpoint_flat = arrays["checkpoint_flat"].astype(np.float32)
+        self.speed_logits = arrays["speed_logits"].astype(np.float32)
+        self.expected_speed = arrays["expected_speed"].astype(np.float32)
+        self.indices = np.arange(len(self.sample_index), dtype=np.int64) if indices is None else indices.astype(np.int64)
+
+        raw_sample_indices = self.sample_index[self.indices]
+        self.raw = Teach2DriveIndexDataset(
+            index_path,
+            indices=raw_sample_indices,
+            cameras=cameras,
+            image_size=tuple(int(v) for v in image_size),
+            lidar_size=int(lidar_size),
+            episode_root_override=episode_root_override,
+        )
+
+    @property
+    def scalar_dim(self) -> int:
+        return int(self.scalar.shape[1])
+
+    @property
+    def layout_dim(self) -> int:
+        return int(self.layout.shape[1])
+
+    @property
+    def target_dim(self) -> int:
+        return int(self.target.shape[1])
+
+    @property
+    def camera_count(self) -> int:
+        return len(self.raw.cameras)
+
+    @property
+    def lidar_channels(self) -> int:
+        if len(self.raw) == 0:
+            return 1
+        return int(self.raw[0]["lidar"].shape[0])
+
+    def __len__(self) -> int:
+        return int(len(self.indices))
+
+    def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
+        cache_idx = int(self.indices[item])
+        raw = self.raw[item]
+        return {
+            "camera": raw["camera"],
+            "lidar": raw["lidar"],
+            "scalar": torch.from_numpy(self.scalar[cache_idx]),
+            "layout": torch.from_numpy(self.layout[cache_idx]),
+            "target": torch.from_numpy(self.target[cache_idx]),
+            "stop_state": torch.tensor(self.stop_state[cache_idx], dtype=torch.long),
+            "stop_reason": torch.tensor(self.stop_reason[cache_idx], dtype=torch.long),
+            "stop_reason_mask": torch.from_numpy(self.stop_reason_mask[cache_idx]),
+            "sample_weight": torch.from_numpy(self.sample_weight[cache_idx]),
+            "base_target": torch.from_numpy(self.base_target[cache_idx]),
+            "checkpoint_flat": torch.from_numpy(self.checkpoint_flat[cache_idx]),
+            "speed_logits": torch.from_numpy(self.speed_logits[cache_idx]),
+            "expected_speed": torch.from_numpy(self.expected_speed[cache_idx]),
+        }
+
+
+class MultiSensorVisualEncoder(nn.Module):
+    """Encode three-camera observations and LiDAR BEV into adapter features.
+
+    LiDAR is already ego-BEV in the Teach2Drive dataset. Camera features are
+    layout-conditioned before fusion, so the adapter can learn how each
+    camera pose contributes relative to that BEV anchor.
+    """
+
+    def __init__(
+        self,
+        cameras: Sequence[str],
+        lidar_channels: int,
+        visual_dim: int = 256,
+        token_dim: int = 192,
+        transformer_layers: int = 2,
+        num_heads: int = 4,
+    ) -> None:
+        super().__init__()
+        self.cameras = tuple(cameras)
+        self.image_encoder = ConvEncoder(3, token_dim)
+        self.lidar_encoder = ConvEncoder(lidar_channels, token_dim)
+        self.camera_layout = nn.Sequential(
+            nn.LayerNorm(CAMERA_LAYOUT_WIDTH),
+            nn.Linear(CAMERA_LAYOUT_WIDTH, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.lidar_layout = nn.Sequential(
+            nn.LayerNorm(LIDAR_LAYOUT_WIDTH),
+            nn.Linear(LIDAR_LAYOUT_WIDTH, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=token_dim,
+            nhead=num_heads,
+            dim_feedforward=token_dim * 4,
+            dropout=0.05,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.fusion = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
+        self.norm = nn.LayerNorm(token_dim)
+        self.out = nn.Sequential(nn.Linear(token_dim, visual_dim), nn.GELU(), nn.LayerNorm(visual_dim))
+
+    def _camera_layout_tokens(self, layout: torch.Tensor) -> torch.Tensor:
+        tokens = []
+        for camera in self.cameras:
+            if camera in CAMERA_LAYOUT_ORDER:
+                idx = CAMERA_LAYOUT_ORDER.index(camera)
+                start = idx * CAMERA_LAYOUT_WIDTH
+                tokens.append(layout[:, start : start + CAMERA_LAYOUT_WIDTH])
+            else:
+                tokens.append(torch.zeros((layout.shape[0], CAMERA_LAYOUT_WIDTH), dtype=layout.dtype, device=layout.device))
+        return torch.stack(tokens, dim=1)
+
+    def _lidar_layout_token(self, layout: torch.Tensor) -> torch.Tensor:
+        end = LIDAR_LAYOUT_START + LIDAR_LAYOUT_WIDTH
+        if layout.shape[1] >= end:
+            return layout[:, LIDAR_LAYOUT_START:end]
+        return torch.zeros((layout.shape[0], LIDAR_LAYOUT_WIDTH), dtype=layout.dtype, device=layout.device)
+
+    def forward(self, camera: torch.Tensor, lidar: torch.Tensor, layout: torch.Tensor) -> torch.Tensor:
+        batch, camera_count, channels, height, width = camera.shape
+        image = camera.reshape(batch * camera_count, channels, height, width)
+        image_feat = self.image_encoder(image).reshape(batch, camera_count, -1)
+        camera_layout = self.camera_layout(self._camera_layout_tokens(layout))
+        image_feat = image_feat + camera_layout
+
+        lidar_feat = self.lidar_encoder(lidar).unsqueeze(1)
+        lidar_feat = lidar_feat + self.lidar_layout(self._lidar_layout_token(layout)).unsqueeze(1)
+        tokens = torch.cat([image_feat, lidar_feat], dim=1)
+        fused = self.fusion(tokens)
+        return self.out(self.norm(fused.mean(dim=1)))
+
+
+class CachedVisualTransFuserPPAdapterPolicy(nn.Module):
+    def __init__(
+        self,
+        scalar_dim: int,
+        layout_dim: int,
+        target_dim: int,
+        checkpoint_dim: int,
+        speed_classes: int,
+        cameras: Sequence[str],
+        lidar_channels: int,
+        hidden_dim: int = 512,
+        layout_hidden_dim: int = 128,
+        visual_dim: int = 256,
+        visual_token_dim: int = 192,
+        visual_layers: int = 2,
+        visual_heads: int = 4,
+    ) -> None:
+        super().__init__()
+        self.visual = MultiSensorVisualEncoder(
+            cameras=cameras,
+            lidar_channels=lidar_channels,
+            visual_dim=visual_dim,
+            token_dim=visual_token_dim,
+            transformer_layers=visual_layers,
+            num_heads=visual_heads,
+        )
+        self.feature_dim = scalar_dim + layout_dim + target_dim + checkpoint_dim + speed_classes + 1 + visual_dim
+        self.layout_adapter = FiLMLayoutAdapter(feature_dim=self.feature_dim, layout_dim=layout_dim, hidden_dim=layout_hidden_dim)
+        self.heads = TransFuserPPResidualHeads(self.feature_dim, target_dim, hidden_dim=hidden_dim)
+
+    def forward(
+        self,
+        scalar: torch.Tensor,
+        layout: torch.Tensor,
+        base_target: torch.Tensor,
+        checkpoint_flat: torch.Tensor,
+        speed_logits: torch.Tensor,
+        expected_speed: torch.Tensor,
+        camera: torch.Tensor,
+        lidar: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        visual = self.visual(camera, lidar, layout)
+        features = torch.cat([scalar, layout, base_target, checkpoint_flat, speed_logits, expected_speed, visual], dim=1)
+        adapted = self.layout_adapter(features, layout)["features"]
+        return self.heads(adapted, base_target)
+
+
+def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str, float]:
+    model.train(train)
+    totals = {"loss": 0.0, "xy": 0.0, "yaw": 0.0, "speed": 0.0, "stop": 0.0, "state": 0.0, "reason": 0.0, "samples": 0}
+    start = time.time()
+    for step, batch in enumerate(loader, start=1):
+        scalar = batch["scalar"].to(device, non_blocking=True)
+        layout = batch["layout"].to(device, non_blocking=True)
+        target = batch["target"].to(device, non_blocking=True)
+        base_target = batch["base_target"].to(device, non_blocking=True)
+        checkpoint_flat = batch["checkpoint_flat"].to(device, non_blocking=True)
+        speed_logits = batch["speed_logits"].to(device, non_blocking=True)
+        expected_speed = batch["expected_speed"].to(device, non_blocking=True)
+        camera = batch["camera"].to(device, non_blocking=True)
+        lidar = batch["lidar"].to(device, non_blocking=True)
+        stop_state = batch["stop_state"].to(device, non_blocking=True)
+        stop_reason = batch["stop_reason"].to(device, non_blocking=True)
+        stop_reason_mask = batch["stop_reason_mask"].to(device, non_blocking=True)
+        weight = batch["sample_weight"].to(device, non_blocking=True)
+        with torch.set_grad_enabled(train):
+            out = model(scalar, layout, base_target, checkpoint_flat, speed_logits, expected_speed, camera, lidar)
+            pred = out["target"]
+            speed_dim = int(args.speed_dim)
+            traj_dim = pred.shape[1] - speed_dim - 1
+            pred_traj = pred[:, :traj_dim].reshape(pred.shape[0], -1, 3)
+            target_traj = target[:, :traj_dim].reshape(target.shape[0], -1, 3)
+            xy_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., :2], target_traj[..., :2], reduction="none"), dim=(1, 2)), weight)
+            yaw_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., 2], target_traj[..., 2], reduction="none"), dim=1), weight)
+            speed_loss = _weighted_mean(
+                torch.mean(nn.functional.smooth_l1_loss(pred[:, traj_dim : traj_dim + speed_dim], target[:, traj_dim : traj_dim + speed_dim], reduction="none"), dim=1),
+                weight,
+            )
+            stop_loss = _weighted_mean(nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], target[:, -1:], reduction="none"), weight)
+            state_loss = _weighted_mean(nn.functional.cross_entropy(out["stop_state"], stop_state, reduction="none"), weight)
+            reason_loss = _masked_weighted_ce(out["stop_reason"], stop_reason, stop_reason_mask, weight)
+            loss = (
+                args.xy_loss_weight * xy_loss
+                + args.yaw_loss_weight * yaw_loss
+                + args.speed_loss_weight * speed_loss
+                + args.stop_loss_weight * stop_loss
+                + args.stop_state_loss_weight * state_loss
+                + args.stop_reason_loss_weight * reason_loss
+            )
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if args.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+        batch_size = int(scalar.shape[0])
+        totals["loss"] += float(loss.detach().cpu()) * batch_size
+        totals["xy"] += float(xy_loss.detach().cpu()) * batch_size
+        totals["yaw"] += float(yaw_loss.detach().cpu()) * batch_size
+        totals["speed"] += float(speed_loss.detach().cpu()) * batch_size
+        totals["stop"] += float(stop_loss.detach().cpu()) * batch_size
+        totals["state"] += float(state_loss.detach().cpu()) * batch_size
+        totals["reason"] += float(reason_loss.detach().cpu()) * batch_size
+        totals["samples"] += batch_size
+        if train and args.step_log_every > 0 and (step == 1 or step % args.step_log_every == 0):
+            elapsed = max(time.time() - start, 1e-6)
+            print(f"step={step:05d}/{len(loader):05d} loss={totals['loss']/totals['samples']:.6f} xy={totals['xy']/totals['samples']:.6f} samples/s={totals['samples']/elapsed:.1f}", flush=True)
+    samples = max(int(totals.pop("samples")), 1)
+    return {key: value / samples for key, value in totals.items()}
+
+
+def _evaluate_predictions(model, loader, device) -> Dict:
+    model.eval()
+    stop_correct = 0
+    stop_total = 0
+    state_correct = 0
+    state_total = 0
+    reason_correct = 0
+    reason_total = 0
+    xy_errors = []
+    with torch.no_grad():
+        for batch in loader:
+            scalar = batch["scalar"].to(device, non_blocking=True)
+            layout = batch["layout"].to(device, non_blocking=True)
+            target = batch["target"].to(device, non_blocking=True)
+            base_target = batch["base_target"].to(device, non_blocking=True)
+            checkpoint_flat = batch["checkpoint_flat"].to(device, non_blocking=True)
+            speed_logits = batch["speed_logits"].to(device, non_blocking=True)
+            expected_speed = batch["expected_speed"].to(device, non_blocking=True)
+            camera = batch["camera"].to(device, non_blocking=True)
+            lidar = batch["lidar"].to(device, non_blocking=True)
+            stop_state = batch["stop_state"].to(device, non_blocking=True)
+            stop_reason = batch["stop_reason"].to(device, non_blocking=True)
+            stop_reason_mask = batch["stop_reason_mask"].to(device, non_blocking=True).reshape(-1).bool()
+            out = model(scalar, layout, base_target, checkpoint_flat, speed_logits, expected_speed, camera, lidar)
+            pred = out["target"]
+            stop_pred = (torch.sigmoid(pred[:, -1]) >= 0.5).long()
+            stop_target = (target[:, -1] >= 0.5).long()
+            stop_correct += int((stop_pred == stop_target).sum().cpu())
+            stop_total += int(stop_target.numel())
+            state_pred = torch.argmax(out["stop_state"], dim=1)
+            state_correct += int((state_pred == stop_state).sum().cpu())
+            state_total += int(stop_state.numel())
+            reason_pred = torch.argmax(out["stop_reason"], dim=1)
+            if torch.any(stop_reason_mask):
+                reason_correct += int((reason_pred[stop_reason_mask] == stop_reason[stop_reason_mask]).sum().cpu())
+                reason_total += int(stop_reason_mask.sum().cpu())
+            traj_dim = pred.shape[1] - 1 - 4
+            if traj_dim > 0 and traj_dim % 3 == 0:
+                pred_xy = pred[:, :traj_dim].reshape(pred.shape[0], -1, 3)[..., :2]
+                target_xy = target[:, :traj_dim].reshape(target.shape[0], -1, 3)[..., :2]
+                xy_errors.append(torch.linalg.norm(pred_xy - target_xy, dim=-1).mean(dim=0).cpu().numpy())
+    metrics = {
+        "stop_accuracy": float(stop_correct / max(stop_total, 1)),
+        "stop_state_accuracy": float(state_correct / max(state_total, 1)),
+        "stop_reason_accuracy": float(reason_correct / max(reason_total, 1)) if reason_total else None,
+        "stop_reason_support": int(reason_total),
+        "stop_state_names": STOP_STATE_NAMES,
+        "stop_reason_names": STOP_REASON_NAMES,
+    }
+    if xy_errors:
+        metrics["mean_xy_error_m_by_horizon"] = np.mean(np.stack(xy_errors, axis=0), axis=0).astype(float).tolist()
+    return metrics
+
+
+def train(args: argparse.Namespace) -> None:
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_arrays = np.load(Path(args.cache).expanduser(), allow_pickle=True)
+    metadata = _metadata_from_cache(cache_arrays)
+    index = _resolve_from_metadata(args.index, metadata, "index")
+    episode_root = _resolve_from_metadata(args.episode_root_override, metadata, "episode_root_override")
+    if not index:
+        raise ValueError("--index is required because the cache does not contain index metadata")
+    if not episode_root:
+        raise ValueError("--episode-root-override is required because the cache does not contain episode root metadata")
+    sample_episode = cache_arrays["sample_episode"].astype(np.int64)
+    train_indices, val_indices = _split_by_episode(sample_episode, val_ratio=args.val_ratio, seed=args.seed)
+    if args.max_train_samples > 0:
+        train_indices = train_indices[: args.max_train_samples]
+    if args.max_val_samples > 0:
+        val_indices = val_indices[: args.max_val_samples]
+    cameras = _camera_list(args.cameras)
+    train_ds = CachedVisualPriorDataset(args.cache, index, episode_root, train_indices, cameras=cameras, image_size=tuple(args.image_size), lidar_size=args.lidar_size)
+    val_ds = CachedVisualPriorDataset(args.cache, index, episode_root, val_indices, cameras=cameras, image_size=tuple(args.image_size), lidar_size=args.lidar_size)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
+    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    model = CachedVisualTransFuserPPAdapterPolicy(
+        scalar_dim=train_ds.scalar_dim,
+        layout_dim=train_ds.layout_dim,
+        target_dim=train_ds.target_dim,
+        checkpoint_dim=int(train_ds.checkpoint_flat.shape[1]),
+        speed_classes=int(train_ds.speed_logits.shape[1]),
+        cameras=cameras,
+        lidar_channels=train_ds.lidar_channels,
+        hidden_dim=args.hidden_dim,
+        layout_hidden_dim=args.layout_hidden_dim,
+        visual_dim=args.visual_dim,
+        visual_token_dim=args.visual_token_dim,
+        visual_layers=args.visual_layers,
+        visual_heads=args.visual_heads,
+    )
+    model.to(device)
+    if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
+        model = nn.DataParallel(model)
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    optimizer = torch.optim.AdamW([param for param in model.parameters() if param.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    print(
+        json.dumps(
+            {
+                "mode": "transfuserpp_cached_visual_bev_adapter",
+                "parameters": count_trainable_parameters(raw_model),
+                "train_samples": len(train_ds),
+                "val_samples": len(val_ds),
+                "cache": str(Path(args.cache).expanduser()),
+                "index": index,
+                "episode_root_override": episode_root,
+                "cameras": cameras,
+                "image_size": list(args.image_size),
+                "lidar_size": args.lidar_size,
+                "cache_metadata": metadata,
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+    best_val = float("inf")
+    history = []
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = _run_epoch(model, train_loader, optimizer, device, args, train=True)
+        val_metrics = _run_epoch(model, val_loader, optimizer, device, args, train=False)
+        scheduler.step()
+        row = {"epoch": epoch, "lr": float(optimizer.param_groups[0]["lr"]), "train": train_metrics, "val": val_metrics, "best_val_loss": best_val}
+        if val_metrics["loss"] < best_val:
+            best_val = val_metrics["loss"]
+            row["best_val_loss"] = best_val
+            raw_model = model.module if isinstance(model, nn.DataParallel) else model
+            torch.save(
+                {
+                    "model_state": raw_model.state_dict(),
+                    "args": vars(args),
+                    "scalar_dim": train_ds.scalar_dim,
+                    "layout_dim": train_ds.layout_dim,
+                    "target_dim": train_ds.target_dim,
+                    "checkpoint_dim": int(train_ds.checkpoint_flat.shape[1]),
+                    "speed_classes": int(train_ds.speed_logits.shape[1]),
+                    "lidar_channels": train_ds.lidar_channels,
+                    "cameras": cameras,
+                    "epoch": epoch,
+                    "val_loss": best_val,
+                    "cache_metadata": metadata,
+                },
+                out_dir / "best_model.pt",
+            )
+        history.append(row)
+        (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        (out_dir / "latest.json").write_text(json.dumps(row, indent=2), encoding="utf-8")
+        print(f"epoch={epoch:03d} train={train_metrics['loss']:.6f} val={val_metrics['loss']:.6f} best={best_val:.6f}", flush=True)
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    best = torch.load(out_dir / "best_model.pt", map_location="cpu")
+    raw_model.load_state_dict(best["model_state"])
+    raw_model.to(device)
+    metrics = _evaluate_predictions(raw_model, val_loader, device)
+    metrics.update({"best_epoch": int(best["epoch"]), "best_val_loss": float(best["val_loss"]), "mode": "transfuserpp_cached_visual_bev_adapter"})
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(json.dumps(metrics, indent=2), flush=True)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train a 3-camera/LiDAR visual adapter from cached frozen TransFuser++ priors.")
+    parser.add_argument("--cache", required=True)
+    parser.add_argument("--index", default="")
+    parser.add_argument("--episode-root-override", default="")
+    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--cameras", default="front,left,right")
+    parser.add_argument("--image-size", type=int, nargs=2, default=[320, 180], metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--lidar-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--hidden-dim", type=int, default=512)
+    parser.add_argument("--layout-hidden-dim", type=int, default=128)
+    parser.add_argument("--visual-dim", type=int, default=256)
+    parser.add_argument("--visual-token-dim", type=int, default=192)
+    parser.add_argument("--visual-layers", type=int, default=2)
+    parser.add_argument("--visual-heads", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--data-parallel", action="store_true")
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument("--max-val-samples", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--speed-dim", type=int, default=4)
+    parser.add_argument("--xy-loss-weight", type=float, default=1.0)
+    parser.add_argument("--yaw-loss-weight", type=float, default=0.05)
+    parser.add_argument("--speed-loss-weight", type=float, default=0.10)
+    parser.add_argument("--stop-loss-weight", type=float, default=0.05)
+    parser.add_argument("--stop-state-loss-weight", type=float, default=0.10)
+    parser.add_argument("--stop-reason-loss-weight", type=float, default=0.02)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--step-log-every", type=int, default=50)
+    parser.add_argument("--cpu", action="store_true")
+    return parser
+
+
+def main() -> None:
+    train(build_arg_parser().parse_args())
+
+
+if __name__ == "__main__":
+    main()
