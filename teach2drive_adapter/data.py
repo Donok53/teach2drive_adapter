@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .sensor_layout import flatten_sensor_layout, load_sensor_layout
+
 
 STOP_STATE_NAMES = ["drive", "approach_stop", "stopped_waiting", "release_go"]
 STOP_REASON_NAMES = [
@@ -104,6 +106,11 @@ class Teach2DriveIndexDataset(Dataset):
         self.lidar_size = int(lidar_size)
         self.indices = np.arange(sample_count, dtype=np.int64) if indices is None else indices.astype(np.int64)
         self.frames = [_read_jsonl(path / "frames.jsonl") for path in self.episode_dirs]
+        self.layouts = [flatten_sensor_layout(load_sensor_layout(path)) for path in self.episode_dirs]
+
+    @property
+    def layout_dim(self) -> int:
+        return int(self.layouts[0].shape[0]) if self.layouts else 0
 
     @property
     def scalar_dim(self) -> int:
@@ -157,6 +164,7 @@ class Teach2DriveIndexDataset(Dataset):
             "stop_reason": torch.tensor(self.stop_reason[idx], dtype=torch.long),
             "stop_reason_mask": torch.from_numpy(self.stop_reason_mask[idx]),
             "sample_weight": torch.from_numpy(self.sample_weight[idx]),
+            "layout": torch.from_numpy(self.layouts[episode_idx]),
         }
 
 
@@ -171,4 +179,3 @@ def split_by_episode(index_path: str, val_ratio: float = 0.15, seed: int = 41) -
     val_mask = np.asarray([int(ep) in val_episodes for ep in sample_episode], dtype=bool)
     all_indices = np.arange(len(sample_episode), dtype=np.int64)
     return all_indices[~val_mask], all_indices[val_mask]
-
