@@ -38,6 +38,12 @@ def _install_bootstrap_path() -> None:
 
 def _install_carla_python_path() -> None:
     try:
+        import carla  # noqa: F401
+
+        return
+    except Exception:
+        pass
+    try:
         import os
 
         carla_root = os.environ.get("CARLA_ROOT")
@@ -46,10 +52,17 @@ def _install_carla_python_path() -> None:
     if not carla_root:
         return
     root = Path(carla_root).expanduser()
-    candidates = [root / "PythonAPI" / "carla"]
-    candidates.extend(sorted((root / "PythonAPI" / "carla" / "dist").glob("carla-*.egg")))
-    candidates.extend(sorted((root / "PythonAPI" / "carla" / "dist").glob("carla-*.whl")))
-    for path in candidates:
+    dist = root / "PythonAPI" / "carla" / "dist"
+    py_major = sys.version_info.major
+    py_minor = sys.version_info.minor
+    eggs = [path for path in sorted(dist.glob("carla-*.egg")) if f"py{py_major}" in path.name]
+    wheels = [path for path in sorted(dist.glob("carla-*.whl")) if f"cp{py_major}{py_minor}" in path.name or "py3" in path.name]
+    candidates = [*eggs, *wheels, root / "PythonAPI" / "carla"]
+    seen = set()
+    for path in reversed(candidates):
+        if path in seen:
+            continue
+        seen.add(path)
         if path.exists() and str(path) not in sys.path:
             sys.path.insert(0, str(path))
 

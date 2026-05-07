@@ -23,6 +23,32 @@ class TransFuserPPBatchSpec:
 def _install_runtime_stubs() -> None:
     """Install tiny import stubs for CARLA-only modules not used in offline training."""
 
+    if not getattr(nn.TransformerDecoderLayer, "_teach2drive_activation_compat", False):
+        original_decoder_layer = nn.TransformerDecoderLayer
+
+        def decoder_layer_activation_compat(*args, **kwargs):
+            activation = kwargs.get("activation")
+            if isinstance(activation, nn.GELU):
+                kwargs["activation"] = "gelu"
+            elif isinstance(activation, nn.ReLU):
+                kwargs["activation"] = "relu"
+            return original_decoder_layer(*args, **kwargs)
+
+        decoder_layer_activation_compat._teach2drive_activation_compat = True  # type: ignore[attr-defined]
+        nn.TransformerDecoderLayer = decoder_layer_activation_compat  # type: ignore[assignment]
+
+    if not getattr(nn.CrossEntropyLoss, "_teach2drive_label_smoothing_compat", False):
+        original_ce_loss = nn.CrossEntropyLoss
+
+        class CrossEntropyLossCompat(original_ce_loss):  # type: ignore[misc, valid-type]
+            _teach2drive_label_smoothing_compat = True
+
+            def __init__(self, *args, **kwargs):
+                kwargs.pop("label_smoothing", None)
+                super().__init__(*args, **kwargs)
+
+        nn.CrossEntropyLoss = CrossEntropyLossCompat  # type: ignore[assignment]
+
     try:
         torch.meshgrid(torch.arange(1), torch.arange(1), indexing="ij")
     except TypeError:
