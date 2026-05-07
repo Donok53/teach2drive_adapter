@@ -111,6 +111,18 @@ def _camera_transform(carla, name):
     )
 
 
+def _video_camera_transform(carla, view):
+    if view == "front":
+        return _camera_transform(carla, "front")
+    if view == "chase":
+        return carla.Transform(carla.Location(x=-8.0, z=4.0), carla.Rotation(pitch=-18.0))
+    if view == "topdown":
+        return carla.Transform(carla.Location(x=-6.0, z=14.0), carla.Rotation(pitch=-68.0))
+    if view == "birdview":
+        return carla.Transform(carla.Location(z=22.0), carla.Rotation(pitch=-90.0))
+    raise ValueError(f"Unknown video view: {view}")
+
+
 def _spawn_cameras(carla, world, blueprints, vehicle, cameras, args, actors):
     queues = {}
     for name in cameras:
@@ -166,7 +178,85 @@ def _resolve_model_paths(args, checkpoint):
     return garage_root, team_config, tfpp_checkpoint
 
 
+def _resolve_control_mode(args, baseline: bool) -> str:
+    if args.control_mode != "auto":
+        return args.control_mode
+    return "tfpp_pid" if baseline else "teach2drive"
+
+
+def _load_transfuserpp_baseline(args, device):
+    if not args.garage_root:
+        raise ValueError("--garage-root is required with --baseline-only")
+    if not args.team_config:
+        raise ValueError("--team-config is required with --baseline-only")
+    prior_net, prior_config, prior_load_info = load_transfuserpp(
+        args.garage_root,
+        args.team_config,
+        device=device,
+        checkpoint=args.tfpp_checkpoint,
+    )
+    prior_net.eval()
+
+    target_dim = int(args.target_dim)
+    speed_dim = int(args.speed_dim)
+    checkpoint_dim = int(getattr(prior_config, "predict_checkpoint_len", 10)) * 2
+    speed_classes = len(getattr(prior_config, "target_speeds", [])) or 1
+    cameras = _camera_list(args.cameras or "front")
+    tfpp_camera = args.tfpp_camera or "front"
+    command_mode = args.command_mode or "target_angle"
+    spawn_cameras = list(dict.fromkeys([*cameras, tfpp_camera, "front"]))
+    bad = [name for name in spawn_cameras if name not in CAMERA_TRANSFORMS]
+    if bad:
+        raise ValueError(f"Unknown camera names in baseline args: {bad}")
+    control_mode = _resolve_control_mode(args, baseline=True)
+    print(
+        json.dumps(
+            {
+                "model_mode": "transfuserpp_baseline",
+                "cameras": cameras,
+                "spawn_cameras": spawn_cameras,
+                "tfpp_camera": tfpp_camera,
+                "command_mode": command_mode,
+                "target_dim": target_dim,
+                "speed_dim": speed_dim,
+                "checkpoint_dim": checkpoint_dim,
+                "speed_classes": speed_classes,
+                "control_mode": control_mode,
+                "transfuserpp_load_info": prior_load_info,
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+    return {
+        "adapter": None,
+        "prior_net": prior_net,
+        "prior_config": prior_config,
+        "prior_load_info": prior_load_info,
+        "mode": "transfuserpp_baseline",
+        "is_baseline": True,
+        "is_visual": False,
+        "cameras": cameras,
+        "spawn_cameras": spawn_cameras,
+        "tfpp_camera": tfpp_camera,
+        "command_mode": command_mode,
+        "control_mode": control_mode,
+        "tfpp_speed_mode": args.tfpp_speed_mode,
+        "target_dim": target_dim,
+        "speed_dim": speed_dim,
+        "checkpoint_dim": checkpoint_dim,
+        "speed_classes": speed_classes,
+        "layout_dim": 52,
+        "visual_size": tuple(int(v) for v in args.visual_image_size),
+        "visual_lidar_size": int(args.visual_lidar_size),
+    }
+
+
 def _load_cached_adapter(args, device):
+    if args.baseline_only:
+        return _load_transfuserpp_baseline(args, device)
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required unless --baseline-only is set")
     checkpoint_path = Path(args.checkpoint).expanduser()
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state = checkpoint["model_state"]
@@ -247,6 +337,7 @@ def _load_cached_adapter(args, device):
                 "speed_classes": speed_classes,
                 "visual_image_size": list(visual_size),
                 "visual_lidar_size": visual_lidar_size,
+                "control_mode": _resolve_control_mode(args, baseline=False),
                 "transfuserpp_load_info": prior_load_info,
             },
             indent=2,
@@ -259,11 +350,14 @@ def _load_cached_adapter(args, device):
         "prior_config": prior_config,
         "prior_load_info": prior_load_info,
         "mode": model_mode,
+        "is_baseline": False,
         "is_visual": is_visual,
         "cameras": cameras,
         "spawn_cameras": spawn_cameras,
         "tfpp_camera": tfpp_camera,
         "command_mode": command_mode,
+        "control_mode": _resolve_control_mode(args, baseline=False),
+        "tfpp_speed_mode": args.tfpp_speed_mode,
         "target_dim": target_dim,
         "speed_dim": speed_dim,
         "checkpoint_dim": checkpoint_dim,
@@ -321,6 +415,37 @@ def _episode_layout_vector(episode_dir: Path, layout_dim: int) -> np.ndarray:
     return fixed
 
 
+def _target_speed_scalar(pred_target_speed: torch.Tensor, config, mode: str) -> float:
+    target_speeds = getattr(config, "target_speeds", [0.0])
+    if pred_target_speed is None or len(target_speeds) == 0:
+        return 0.0
+    logits = pred_target_speed[0]
+    if mode == "expected":
+        probs = torch.softmax(logits, dim=0).detach().cpu().numpy()
+        return float(np.sum(probs * np.asarray(target_speeds, dtype=np.float32)))
+    index = int(torch.argmax(logits).item())
+    index = min(max(index, 0), len(target_speeds) - 1)
+    return float(target_speeds[index])
+
+
+def _apply_tfpp_pid_control(carla, vehicle, model_info, aux, current_speed, control_state):
+    pred_checkpoint = aux.get("pred_checkpoint")
+    target_speed = float(aux.get("target_speed_mps", 0.0))
+    if pred_checkpoint is None or len(pred_checkpoint) == 0:
+        control_state["desired_speed"] = 0.0
+        control_state["steer"] = float(control_state.get("steer", 0.0))
+        vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=float(control_state["steer"]), brake=1.0))
+        return
+    device = next(model_info["prior_net"].parameters()).device
+    speed_t = torch.tensor([float(current_speed)], dtype=torch.float32, device=device)
+    steer, throttle, brake = model_info["prior_net"].control_pid_direct(pred_checkpoint, target_speed, speed_t)
+    control_state["desired_speed"] = target_speed
+    control_state["steer"] = float(steer)
+    control_state["throttle"] = float(throttle)
+    control_state["brake"] = float(brake)
+    vehicle.apply_control(carla.VehicleControl(throttle=float(throttle), steer=float(steer), brake=float(brake)))
+
+
 def _predict(model_info, device, scalar, layout, image_by_name, lidar_bev):
     cameras = model_info["cameras"]
     spawn_cameras = model_info["spawn_cameras"]
@@ -363,8 +488,23 @@ def _predict(model_info, device, scalar, layout, image_by_name, lidar_bev):
                 pad = torch.zeros((1, model_info["speed_classes"] - speed_logits.shape[1]), dtype=speed_logits.dtype, device=device)
                 speed_logits = torch.cat([speed_logits, pad], dim=1)
         expected_speed = speed_expectation(pred_target_speed, model_info["prior_config"], 1, device)
+        target_speed_mps = _target_speed_scalar(
+            pred_target_speed,
+            model_info["prior_config"],
+            model_info["tfpp_speed_mode"],
+        )
 
-        if model_info["is_visual"]:
+        if model_info["is_baseline"]:
+            out = {
+                "target": base_target,
+                "stop_state": torch.full((1, 4), -1.0, dtype=base_target.dtype, device=device),
+                "stop_reason": torch.full((1, 8), -1.0, dtype=base_target.dtype, device=device),
+            }
+            aux = {
+                "pred_checkpoint": pred_checkpoint[0].detach().cpu().numpy() if pred_checkpoint is not None else None,
+                "target_speed_mps": target_speed_mps,
+            }
+        elif model_info["is_visual"]:
             visual_images = np.stack([_resize_rgb(image_by_name[name], model_info["visual_size"]) for name in cameras], axis=0)
             visual_camera_t = torch.from_numpy(visual_images.astype(np.float32).transpose(0, 3, 1, 2) / 255.0).unsqueeze(0).to(device)
             visual_lidar = _resize_lidar(lidar_bev, model_info["visual_lidar_size"])
@@ -380,8 +520,16 @@ def _predict(model_info, device, scalar, layout, image_by_name, lidar_bev):
                 visual_camera_t,
                 visual_lidar_t,
             )
+            aux = {
+                "pred_checkpoint": pred_checkpoint[0].detach().cpu().numpy() if pred_checkpoint is not None else None,
+                "target_speed_mps": target_speed_mps,
+            }
         else:
             out = model_info["adapter"](scalar_t, layout_t, base_target, checkpoint_flat, speed_logits, expected_speed)
+            aux = {
+                "pred_checkpoint": pred_checkpoint[0].detach().cpu().numpy() if pred_checkpoint is not None else None,
+                "target_speed_mps": target_speed_mps,
+            }
 
     pred = out["target"].detach().cpu()[0]
     speed_dim = int(model_info["speed_dim"])
@@ -389,9 +537,9 @@ def _predict(model_info, device, scalar, layout, image_by_name, lidar_bev):
     traj = pred[:traj_dim].reshape(-1, 3).numpy().astype(np.float32)
     speeds = pred[traj_dim : traj_dim + speed_dim].numpy().astype(np.float32)
     stop_prob = float(torch.sigmoid(pred[-1]).item())
-    stop_state = int(torch.argmax(out["stop_state"].detach().cpu()[0]).item())
-    stop_reason = int(torch.argmax(out["stop_reason"].detach().cpu()[0]).item())
-    return traj, speeds, stop_prob, stop_state, stop_reason
+    stop_state = -1 if model_info["is_baseline"] else int(torch.argmax(out["stop_state"].detach().cpu()[0]).item())
+    stop_reason = -1 if model_info["is_baseline"] else int(torch.argmax(out["stop_reason"].detach().cpu()[0]).item())
+    return traj, speeds, stop_prob, stop_state, stop_reason, aux
 
 
 def _red_light_infraction(carla, vehicle, odom_speed, seen_red_lights, infractions, location, args):
@@ -452,7 +600,7 @@ def rollout(args):
         video_size = args.video_image_size or args.image_size
         if args.video_output and args.video_image_size:
             video_bp = _camera_blueprint(blueprints, video_size, args.camera_fov, args.hz)
-            video_camera = world.spawn_actor(video_bp, _camera_transform(carla, "front"), attach_to=vehicle)
+            video_camera = world.spawn_actor(video_bp, _video_camera_transform(carla, args.video_view), attach_to=vehicle)
             actors.append(video_camera)
             video_camera_q = queue.Queue()
             video_camera.listen(video_camera_q.put)
@@ -519,8 +667,11 @@ def rollout(args):
             )
             scalar, nearest_idx, route_dist = _make_scalar_monotonic(route, route_len, odom, imu_values, True, True, previous_route_idx, args)
             previous_route_idx = nearest_idx
-            traj, speeds, stop_prob, stop_state, stop_reason = _predict(model_info, device, scalar, layout, image_by_name, lidar_bev)
-            _apply_control(carla, vehicle, traj, speeds, stop_prob, args, control_state)
+            traj, speeds, stop_prob, stop_state, stop_reason, aux = _predict(model_info, device, scalar, layout, image_by_name, lidar_bev)
+            if model_info["control_mode"] == "tfpp_pid":
+                _apply_tfpp_pid_control(carla, vehicle, model_info, aux, float(odom[3]), control_state)
+            else:
+                _apply_control(carla, vehicle, traj, speeds, stop_prob, args, control_state)
 
             cross_track_errors.append(route_dist)
             progress_m = float(route[nearest_idx, 3])
@@ -534,7 +685,7 @@ def rollout(args):
             if video_writer is not None:
                 frame_bgr = _render_video_frame(video_image, route, odom, traj, progress_m, route_len, route_dist, scores_now, step, args)
                 line = (
-                    f"{model_info['mode']}  stop {stop_prob:.2f} state {stop_state} reason {stop_reason} "
+                    f"{model_info['mode']}  {model_info['control_mode']}  stop {stop_prob:.2f} state {stop_state} reason {stop_reason} "
                     f"cmd_v {control_state.get('desired_speed', 0.0):.2f}"
                 )
                 cv2.putText(frame_bgr, line, (12, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 3, cv2.LINE_AA)
@@ -565,8 +716,9 @@ def rollout(args):
         scores = _score_like_leaderboard(route_completion_pct, infractions)
         metrics = {
             "route_source": str(episode_dir),
-            "checkpoint": str(Path(args.checkpoint).expanduser()),
+            "checkpoint": str(Path(args.checkpoint).expanduser()) if args.checkpoint else None,
             "model_mode": model_info["mode"],
+            "control_mode": model_info["control_mode"],
             "status": "Completed" if success else ("Failed - Agent deviated from the route" if route_deviation else "Failed - Route timeout"),
             "success": success,
             "steps": len(cross_track_errors),
@@ -584,6 +736,7 @@ def rollout(args):
             "stop_reason_counts": {str(k): int(v) for k, v in zip(*np.unique(np.asarray(stop_reasons, dtype=np.int64), return_counts=True))} if stop_reasons else {},
             "device": str(device),
             "video_output": args.video_output or None,
+            "video_view": args.video_view,
             "transfuserpp_load_info": model_info["prior_load_info"],
         }
         out_path = Path(args.output).expanduser()
@@ -606,7 +759,8 @@ def build_arg_parser():
     parser.add_argument("--port", type=int, default=2000)
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("--map", default="")
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--baseline-only", action="store_true", help="Run frozen pretrained TransFuser++ without a Teach2Drive adapter checkpoint.")
     parser.add_argument("--route-source", required=True, help="Token episode directory or token_index.npz.")
     parser.add_argument("--episode-index", type=int, default=0)
     parser.add_argument("--output", required=True)
@@ -616,6 +770,8 @@ def build_arg_parser():
     parser.add_argument("--cameras", default="")
     parser.add_argument("--tfpp-camera", default="")
     parser.add_argument("--command-mode", choices=["", "lane_follow", "target_angle"], default="")
+    parser.add_argument("--control-mode", choices=["auto", "teach2drive", "tfpp_pid"], default="auto")
+    parser.add_argument("--tfpp-speed-mode", choices=["argmax", "expected"], default="argmax")
     parser.add_argument("--duration-sec", type=float, default=60.0)
     parser.add_argument("--warmup-sec", type=float, default=1.0)
     parser.add_argument("--hz", type=int, default=10)
@@ -663,6 +819,7 @@ def build_arg_parser():
     parser.add_argument("--red-light-speed-threshold", type=float, default=0.3)
     parser.add_argument("--report-every-sec", type=float, default=5.0)
     parser.add_argument("--video-output", default="")
+    parser.add_argument("--video-view", choices=["front", "chase", "topdown", "birdview"], default="topdown")
     parser.add_argument("--video-image-size", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--video-scale", type=float, default=1.0)
     parser.add_argument("--video-codec", default="mp4v")
@@ -677,6 +834,7 @@ def build_arg_parser():
     parser.add_argument("--visual-lidar-size", type=int, default=128)
     parser.add_argument("--visual-lidar-channels", type=int, default=3)
     parser.add_argument("--speed-dim", type=int, default=4)
+    parser.add_argument("--target-dim", type=int, default=17)
     parser.add_argument("--cpu", action="store_true")
     return parser
 

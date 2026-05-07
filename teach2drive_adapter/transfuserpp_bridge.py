@@ -126,6 +126,18 @@ def _insert_team_code(garage_root: Path) -> None:
         sys.path.insert(0, team_code_str)
 
 
+def _decode_jsonpickle_value(value):
+    if isinstance(value, Mapping):
+        if "py/tuple" in value:
+            return tuple(_decode_jsonpickle_value(item) for item in value["py/tuple"])
+        if value.get("py/object") == "numpy.ndarray" and "values" in value:
+            return _decode_jsonpickle_value(value["values"])
+        return {key: _decode_jsonpickle_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_jsonpickle_value(item) for item in value]
+    return value
+
+
 def _load_config(team_config: Path, garage_root: Path):
     _install_runtime_stubs()
     _insert_team_code(garage_root)
@@ -136,7 +148,7 @@ def _load_config(team_config: Path, garage_root: Path):
     if not config_path.exists():
         raise FileNotFoundError(f"Missing TransFuser++ config.json: {config_path}")
     raw_config = json.loads(config_path.read_text(encoding="utf-8"))
-    config.__dict__.update(raw_config)
+    config.__dict__.update({key: _decode_jsonpickle_value(value) for key, value in raw_config.items()})
     return config
 
 
