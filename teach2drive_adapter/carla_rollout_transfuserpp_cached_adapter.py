@@ -111,6 +111,12 @@ def _camera_transform(carla, name):
     )
 
 
+def _sensor_camera_transform(carla, name, args):
+    if args.sensor_preset == "transfuserpp" and name == "front":
+        return carla.Transform(carla.Location(x=-1.5, y=0.0, z=2.0), carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0))
+    return _camera_transform(carla, name)
+
+
 def _video_camera_transform(carla, view):
     if view == "front":
         return _camera_transform(carla, "front")
@@ -127,7 +133,7 @@ def _spawn_cameras(carla, world, blueprints, vehicle, cameras, args, actors):
     queues = {}
     for name in cameras:
         camera_bp = _camera_blueprint(blueprints, args.image_size, args.camera_fov, args.hz)
-        sensor = world.spawn_actor(camera_bp, _camera_transform(carla, name), attach_to=vehicle)
+        sensor = world.spawn_actor(camera_bp, _sensor_camera_transform(carla, name, args), attach_to=vehicle)
         actors.append(sensor)
         sensor_q = queue.Queue()
         sensor.listen(sensor_q.put)
@@ -140,11 +146,16 @@ def _spawn_lidar(carla, world, blueprints, vehicle, args, actors):
     lidar_bp.set_attribute("channels", str(args.lidar_channels))
     lidar_bp.set_attribute("range", str(args.lidar_range))
     lidar_bp.set_attribute("points_per_second", str(args.lidar_points_per_second))
-    lidar_bp.set_attribute("rotation_frequency", str(args.hz))
+    rotation_frequency = args.lidar_rotation_frequency if args.lidar_rotation_frequency > 0 else args.hz
+    lidar_bp.set_attribute("rotation_frequency", str(rotation_frequency))
     lidar_bp.set_attribute("upper_fov", str(args.lidar_upper_fov))
     lidar_bp.set_attribute("lower_fov", str(args.lidar_lower_fov))
     lidar_bp.set_attribute("sensor_tick", str(1.0 / args.hz))
-    lidar = world.spawn_actor(lidar_bp, carla.Transform(carla.Location(z=args.lidar_z)), attach_to=vehicle)
+    lidar = world.spawn_actor(
+        lidar_bp,
+        carla.Transform(carla.Location(z=args.lidar_z), carla.Rotation(yaw=args.lidar_yaw)),
+        attach_to=vehicle,
+    )
     actors.append(lidar)
     lidar_q = queue.Queue()
     lidar.listen(lidar_q.put)
@@ -182,6 +193,23 @@ def _resolve_control_mode(args, baseline: bool) -> str:
     if args.control_mode != "auto":
         return args.control_mode
     return "tfpp_pid" if baseline else "teach2drive"
+
+
+def _apply_sensor_preset(args) -> None:
+    if args.sensor_preset != "transfuserpp":
+        return
+    if args.image_size == [640, 360]:
+        args.image_size = [1024, 512]
+    if args.camera_fov == 90.0:
+        args.camera_fov = 110.0
+    if args.lidar_z == 1.8:
+        args.lidar_z = 2.5
+    if args.lidar_yaw == 0.0:
+        args.lidar_yaw = -90.0
+    if args.lidar_points_per_second == 180000:
+        args.lidar_points_per_second = 600000
+    if args.lidar_rotation_frequency == 0.0:
+        args.lidar_rotation_frequency = 10.0
 
 
 def _load_transfuserpp_baseline(args, device):
@@ -555,6 +583,7 @@ def _red_light_infraction(carla, vehicle, odom_speed, seen_red_lights, infractio
 
 def rollout(args):
     carla = _import_carla()
+    _apply_sensor_preset(args)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model_info = _load_cached_adapter(args, device)
     route, meta, episode_dir = _load_token_route(args.route_source, args.episode_index)
@@ -778,6 +807,7 @@ def build_arg_parser():
     parser.add_argument("--start-index", type=int, default=30)
     parser.add_argument("--spawn-z", type=float, default=0.6)
     parser.add_argument("--vehicle-filter", default="vehicle.tesla.model3")
+    parser.add_argument("--sensor-preset", choices=["teach2drive", "transfuserpp"], default="teach2drive")
     parser.add_argument("--image-size", type=int, nargs=2, default=[640, 360], metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--camera-fov", type=float, default=90.0)
     parser.add_argument("--bev-size", type=int, default=128)
@@ -788,9 +818,11 @@ def build_arg_parser():
     parser.add_argument("--z-min", type=float, default=-2.0)
     parser.add_argument("--z-max", type=float, default=4.0)
     parser.add_argument("--lidar-z", type=float, default=1.8)
+    parser.add_argument("--lidar-yaw", type=float, default=0.0)
     parser.add_argument("--lidar-channels", type=int, default=32)
     parser.add_argument("--lidar-range", type=float, default=60.0)
     parser.add_argument("--lidar-points-per-second", type=int, default=180000)
+    parser.add_argument("--lidar-rotation-frequency", type=float, default=0.0)
     parser.add_argument("--lidar-upper-fov", type=float, default=10.0)
     parser.add_argument("--lidar-lower-fov", type=float, default=-25.0)
     parser.add_argument("--lookahead-m", type=float, default=8.0)
