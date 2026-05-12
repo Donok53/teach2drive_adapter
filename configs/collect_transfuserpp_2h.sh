@@ -20,6 +20,7 @@ COLLECTION_MODE=${COLLECTION_MODE:-paired}
 PRIMARY_PROFILE=${PRIMARY_PROFILE:-tfpp_ego}
 COMMAND_POLICY=${COMMAND_POLICY:-heuristic}
 EPISODES=${EPISODES:-0}
+START_EPISODE_INDEX=${START_EPISODE_INDEX:-0}
 LIDAR_FORMAT=${LIDAR_FORMAT:-npz}
 OVERWRITE=${OVERWRITE:-0}
 
@@ -29,6 +30,9 @@ if [[ "$OVERWRITE" == "1" || "$OVERWRITE" == "true" || "$OVERWRITE" == "TRUE" ]]
 fi
 if [[ "$EPISODES" != "0" ]]; then
   EXTRA_ARGS+=(--episodes "$EPISODES")
+fi
+if [[ "$START_EPISODE_INDEX" != "0" ]]; then
+  EXTRA_ARGS+=(--start-episode-index "$START_EPISODE_INDEX")
 fi
 
 python -m teach2drive_adapter.collect_transfuserpp_dataset \

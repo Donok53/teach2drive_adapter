@@ -607,12 +607,15 @@ def _episode_seconds_for(profile_index: int, episode_index: int, plan: Mapping[T
 
 
 def _build_episode_plan(profile_count: int, args) -> Dict[Tuple[int, int], float]:
+    start_episode_index = int(getattr(args, "start_episode_index", 0) or 0)
+    if start_episode_index < 0:
+        raise ValueError("--start-episode-index must be non-negative")
     requested_episodes = int(getattr(args, "episodes", 0) or args.episodes_per_profile)
     if requested_episodes > 0:
         return {
             (profile_index, episode_index): float(args.episode_sec)
             for profile_index in range(profile_count)
-            for episode_index in range(requested_episodes)
+            for episode_index in range(start_episode_index, start_episode_index + requested_episodes)
         }
 
     total_seconds = float(args.duration_hours) * 3600.0
@@ -623,13 +626,40 @@ def _build_episode_plan(profile_count: int, args) -> Dict[Tuple[int, int], float
     plan: Dict[Tuple[int, int], float] = {}
     for profile_index in range(profile_count):
         remaining = per_profile
-        for episode_index in range(episodes):
+        for local_episode_index in range(episodes):
+            episode_index = start_episode_index + local_episode_index
             seconds = min(float(args.episode_sec), remaining)
             if seconds <= 0:
                 break
             plan[(profile_index, episode_index)] = seconds
             remaining -= seconds
     return plan
+
+
+def _summary_key(summary: Mapping) -> Tuple[str, str, int]:
+    return (
+        str(summary.get("collection_mode", "")),
+        str(summary.get("profile", "")),
+        int(summary.get("episode_index", -1)),
+    )
+
+
+def _load_existing_summaries(output_root: Path) -> List[Mapping]:
+    summary_path = output_root / "dataset_summary.json"
+    if not summary_path.exists():
+        return []
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    episodes = payload.get("episodes", [])
+    return [episode for episode in episodes if isinstance(episode, Mapping)]
+
+
+def _write_dataset_summary(output_root: Path, summaries: Sequence[Mapping]) -> None:
+    merged = {_summary_key(summary): summary for summary in summaries}
+    ordered = sorted(merged.values(), key=_summary_key)
+    _write_json(output_root / "dataset_summary.json", {"episodes": ordered})
 
 
 def collect_episode(carla, client, world, traffic_manager, profile: SensorProfile, profile_index: int, episode_index: int, episode_sec: float, args) -> Mapping:
@@ -1198,7 +1228,7 @@ def collect(args) -> None:
     original_settings = world.get_settings()
     traffic_manager = client.get_trafficmanager(int(args.traffic_manager_port))
     background_actors = []
-    summaries = []
+    summaries = _load_existing_summaries(output_root)
     plan_profile_count = 1 if args.collection_mode == "paired" else len(profiles)
     episode_plan = _build_episode_plan(plan_profile_count, args)
     try:
@@ -1268,14 +1298,14 @@ def collect(args) -> None:
             for episode_index in episode_indices:
                 episode_sec = _episode_seconds_for(0, episode_index, episode_plan)
                 summaries.append(collect_paired_episode(carla, client, world, traffic_manager, profiles, episode_index, episode_sec, args))
-                _write_json(output_root / "dataset_summary.json", {"episodes": summaries})
+                _write_dataset_summary(output_root, summaries)
         else:
             for profile_index, profile in enumerate(profiles):
                 episode_indices = sorted(index for pidx, index in episode_plan if pidx == profile_index)
                 for episode_index in episode_indices:
                     episode_sec = _episode_seconds_for(profile_index, episode_index, episode_plan)
                     summaries.append(collect_episode(carla, client, world, traffic_manager, profile, profile_index, episode_index, episode_sec, args))
-                    _write_json(output_root / "dataset_summary.json", {"episodes": summaries})
+                    _write_dataset_summary(output_root, summaries)
     finally:
         _destroy_actors(client, background_actors)
         try:
@@ -1309,6 +1339,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-hours", type=float, default=2.0, help="Total simulated saved duration. In paired mode this is total same-ego driving time.")
     parser.add_argument("--episode-sec", type=float, default=300.0)
     parser.add_argument("--episodes", type=int, default=0, help="If set, ignore --duration-hours. In paired mode this is the total episode count.")
+    parser.add_argument("--start-episode-index", type=int, default=0, help="Start numbering new episodes from this index; useful for resuming interrupted paired collection.")
     parser.add_argument("--episodes-per-profile", type=int, default=0, help="Legacy alias for --episodes; in separate mode this many episodes are collected per profile.")
     parser.add_argument("--hz", type=int, default=20)
     parser.add_argument("--save-every-n", type=int, default=5, help="Official TransFuser++ data_save_freq is 5 at 20 Hz, i.e. 4 saved FPS.")
