@@ -93,22 +93,23 @@ def _profile_front_triplet_shifted() -> SensorProfile:
     return SensorProfile(
         name="front_triplet_shifted",
         description=(
-            "Three front-facing RGB cameras with small lateral/yaw offsets plus a "
-            "slightly shifted LiDAR. Names stay left/front/right for adapter compatibility."
+            "Plausible alternate-ego front rig: three windshield/roofline RGB cameras "
+            "named left/front/right plus a centered roof LiDAR. The camera names stay "
+            "left/front/right for adapter compatibility."
         ),
         cameras={
             "left": CameraRigSpec(
-                pose=Pose6D(x=-1.45, y=-0.35, z=2.05, roll=0.0, pitch=0.0, yaw=-8.0),
+                pose=Pose6D(x=1.20, y=-0.38, z=1.95, roll=0.0, pitch=0.0, yaw=-12.0),
             ),
             "front": CameraRigSpec(
-                pose=Pose6D(x=-1.5, y=0.0, z=2.0, roll=0.0, pitch=0.0, yaw=0.0),
+                pose=Pose6D(x=1.25, y=0.0, z=1.95, roll=0.0, pitch=0.0, yaw=0.0),
             ),
             "right": CameraRigSpec(
-                pose=Pose6D(x=-1.45, y=0.35, z=2.05, roll=0.0, pitch=0.0, yaw=8.0),
+                pose=Pose6D(x=1.20, y=0.38, z=1.95, roll=0.0, pitch=0.0, yaw=12.0),
             ),
         },
         lidar=LidarRigSpec(
-            pose=Pose6D(x=0.15, y=0.0, z=2.45, roll=0.0, pitch=0.0, yaw=-90.0),
+            pose=Pose6D(x=0.20, y=0.0, z=2.35, roll=0.0, pitch=0.0, yaw=-90.0),
         ),
     )
 
@@ -206,14 +207,14 @@ def _pose_to_transform(carla, pose: Pose6D):
     )
 
 
-def _make_camera_bp(blueprints, name: str, spec: CameraRigSpec, hz: int):
+def _make_camera_bp(blueprints, name: str, spec: CameraRigSpec, hz: int, role_prefix: str = "tfpp"):
     bp = blueprints.find("sensor.camera.rgb")
     bp.set_attribute("image_size_x", str(spec.width))
     bp.set_attribute("image_size_y", str(spec.height))
     bp.set_attribute("fov", str(spec.fov))
     bp.set_attribute("sensor_tick", str(1.0 / float(hz)))
     if bp.has_attribute("role_name"):
-        bp.set_attribute("role_name", f"tfpp_{name}")
+        bp.set_attribute("role_name", f"{role_prefix}_{name}")
     return bp
 
 
@@ -233,7 +234,7 @@ def _spawn_sensors(carla, world, vehicle, profile: SensorProfile, args, actors: 
     blueprints = world.get_blueprint_library()
     camera_queues = {}
     for name, spec in profile.cameras.items():
-        camera = world.spawn_actor(_make_camera_bp(blueprints, name, spec, args.hz), _pose_to_transform(carla, spec.pose), attach_to=vehicle)
+        camera = world.spawn_actor(_make_camera_bp(blueprints, name, spec, args.hz, profile.name), _pose_to_transform(carla, spec.pose), attach_to=vehicle)
         actors.append(camera)
         sensor_queue = queue.Queue()
         camera.listen(sensor_queue.put)
@@ -252,6 +253,45 @@ def _spawn_sensors(carla, world, vehicle, profile: SensorProfile, args, actors: 
     imu.listen(imu_q.put)
 
     return camera_queues, lidar_q, imu_q
+
+
+def _spawn_shared_state_sensors(carla, world, vehicle, args, actors: List):
+    blueprints = world.get_blueprint_library()
+    imu_bp = blueprints.find("sensor.other.imu")
+    imu_bp.set_attribute("sensor_tick", str(1.0 / float(args.hz)))
+    imu = world.spawn_actor(imu_bp, carla.Transform(), attach_to=vehicle)
+    actors.append(imu)
+    imu_q = queue.Queue()
+    imu.listen(imu_q.put)
+
+    gnss_bp = blueprints.find("sensor.other.gnss")
+    gnss_bp.set_attribute("sensor_tick", str(1.0 / float(args.hz)))
+    gnss = world.spawn_actor(gnss_bp, carla.Transform(), attach_to=vehicle)
+    actors.append(gnss)
+    gnss_q = queue.Queue()
+    gnss.listen(gnss_q.put)
+    return imu_q, gnss_q
+
+
+def _spawn_profile_sensors(carla, world, vehicle, profile: SensorProfile, args, actors: List):
+    blueprints = world.get_blueprint_library()
+    camera_queues = {}
+    for camera_name, camera_spec in profile.cameras.items():
+        camera = world.spawn_actor(
+            _make_camera_bp(blueprints, camera_name, camera_spec, args.hz, profile.name),
+            _pose_to_transform(carla, camera_spec.pose),
+            attach_to=vehicle,
+        )
+        actors.append(camera)
+        camera_q = queue.Queue()
+        camera.listen(camera_q.put)
+        camera_queues[camera_name] = camera_q
+
+    lidar = world.spawn_actor(_make_lidar_bp(blueprints, profile.lidar, args.hz), _pose_to_transform(carla, profile.lidar.pose), attach_to=vehicle)
+    actors.append(lidar)
+    lidar_q = queue.Queue()
+    lidar.listen(lidar_q.put)
+    return {"cameras": camera_queues, "lidar": lidar_q}
 
 
 def _sensor_layout_payload(profile: SensorProfile) -> Mapping:
@@ -395,6 +435,24 @@ def _angle_from_target_point(target_point: Sequence[float]) -> float:
     return float(-math.degrees(math.atan2(-float(target_point[1]), max(float(target_point[0]), 1e-3))) / 90.0)
 
 
+def _command_from_target_point(target_point: Sequence[float], threshold: float = 0.18) -> int:
+    angle = _angle_from_target_point(target_point)
+    if angle > threshold:
+        return 2
+    if angle < -threshold:
+        return 1
+    return LANE_FOLLOW_COMMAND
+
+
+def _command_one_hot(command: int) -> List[float]:
+    index = int(command) - 1
+    if index not in range(6):
+        index = LANE_FOLLOW_COMMAND - 1
+    result = [0.0] * 6
+    result[index] = 1.0
+    return result
+
+
 def _vehicle_light_state(vehicle) -> str:
     try:
         traffic_light = vehicle.get_traffic_light()
@@ -499,6 +557,28 @@ def _prepare_episode_dir(root: Path, profile: SensorProfile, episode_index: int,
     return episode_dir
 
 
+def _prepare_paired_episode_dir(root: Path, profiles: Sequence[SensorProfile], episode_index: int, overwrite: bool) -> Path:
+    episode_dir = root / f"episode_{episode_index:06d}"
+    if episode_dir.exists() and not overwrite:
+        raise FileExistsError(f"Episode directory already exists: {episode_dir}")
+    if episode_dir.exists():
+        shutil.rmtree(episode_dir)
+    (episode_dir / "measurements").mkdir(parents=True, exist_ok=True)
+    (episode_dir / "rgb").mkdir(parents=True, exist_ok=True)
+    (episode_dir / "lidar").mkdir(parents=True, exist_ok=True)
+    (episode_dir / "lidar_bev").mkdir(parents=True, exist_ok=True)
+    for name in ("front",):
+        (episode_dir / "camera" / name).mkdir(parents=True, exist_ok=True)
+    for profile in profiles:
+        rig_root = episode_dir / "rigs" / profile.name
+        for camera_name in profile.cameras:
+            (rig_root / "camera" / camera_name).mkdir(parents=True, exist_ok=True)
+        (rig_root / "rgb").mkdir(parents=True, exist_ok=True)
+        (rig_root / "lidar").mkdir(parents=True, exist_ok=True)
+        (rig_root / "lidar_bev").mkdir(parents=True, exist_ok=True)
+    return episode_dir
+
+
 def _spawn_candidates(world, episode_index: int, seed: int, spawn_indices: Sequence[int]):
     spawn_points = world.get_map().get_spawn_points()
     if not spawn_points:
@@ -527,11 +607,12 @@ def _episode_seconds_for(profile_index: int, episode_index: int, plan: Mapping[T
 
 
 def _build_episode_plan(profile_count: int, args) -> Dict[Tuple[int, int], float]:
-    if args.episodes_per_profile > 0:
+    requested_episodes = int(getattr(args, "episodes", 0) or args.episodes_per_profile)
+    if requested_episodes > 0:
         return {
             (profile_index, episode_index): float(args.episode_sec)
             for profile_index in range(profile_count)
-            for episode_index in range(args.episodes_per_profile)
+            for episode_index in range(requested_episodes)
         }
 
     total_seconds = float(args.duration_hours) * 3600.0
@@ -774,15 +855,332 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
         _destroy_actors(client, actors)
 
 
+def _measurement_payload(carla_frame: int, sim_time: float, vehicle, vehicle_transform, imu_data, gnss_data, route, target_point, target_point_next, args) -> Mapping:
+    control = vehicle.get_control()
+    location = vehicle_transform.location
+    rotation = vehicle_transform.rotation
+    velocity = vehicle.get_velocity()
+    angular = vehicle.get_angular_velocity()
+    speed_mps = _projected_speed(vehicle)
+    speed_limit_mps = float(vehicle.get_speed_limit()) / 3.6
+    target_speed = float(args.target_speed_mps) if args.target_speed_mps > 0 else speed_limit_mps
+    command = _command_from_target_point(target_point) if args.command_policy == "heuristic" else LANE_FOLLOW_COMMAND
+    next_command = _command_from_target_point(target_point_next) if args.command_policy == "heuristic" else command
+    return {
+        "carla_frame": int(carla_frame),
+        "time": float(sim_time),
+        "pos_global": [float(location.x), float(location.y)],
+        "gps": [float(location.x), float(location.y)],
+        "gnss": {
+            "latitude": float(getattr(gnss_data, "latitude", float("nan"))),
+            "longitude": float(getattr(gnss_data, "longitude", float("nan"))),
+            "altitude": float(getattr(gnss_data, "altitude", float("nan"))),
+        },
+        "z": float(location.z),
+        "theta": math.radians(float(rotation.yaw)),
+        "speed": speed_mps,
+        "target_speed": target_speed,
+        "speed_limit": speed_limit_mps,
+        "target_point": target_point,
+        "target_point_next": target_point_next,
+        "command": command,
+        "next_command": next_command,
+        "command_one_hot": _command_one_hot(command),
+        "next_command_one_hot": _command_one_hot(next_command),
+        "command_source": args.command_policy,
+        "aim_wp": target_point,
+        "route": route,
+        "route_original": route,
+        "changed_route": False,
+        "steer": float(control.steer),
+        "throttle": float(control.throttle),
+        "brake": bool(control.brake > 0.05),
+        "brake_float": float(control.brake),
+        "control_brake": bool(control.brake > 0.05),
+        "junction": False,
+        "vehicle_hazard": False,
+        "vehicle_affecting_id": None,
+        "light_hazard": _vehicle_light_state(vehicle) == "Red",
+        "walker_hazard": False,
+        "walker_affecting_id": None,
+        "stop_sign_hazard": False,
+        "stop_sign_close": False,
+        "walker_close": False,
+        "walker_close_id": None,
+        "angle": _angle_from_target_point(target_point),
+        "augmentation_translation": 0.0,
+        "augmentation_rotation": 0.0,
+        "ego_matrix": vehicle_transform.get_matrix(),
+        "world_transform": {
+            "location": [float(location.x), float(location.y), float(location.z)],
+            "rotation": [float(rotation.pitch), float(rotation.yaw), float(rotation.roll)],
+        },
+        "velocity": [float(velocity.x), float(velocity.y), float(velocity.z)],
+        "angular_velocity": [float(angular.x), float(angular.y), float(angular.z)],
+        "imu": {
+            "accelerometer": [float(imu_data.accelerometer.x), float(imu_data.accelerometer.y), float(imu_data.accelerometer.z)],
+            "gyroscope": [float(imu_data.gyroscope.x), float(imu_data.gyroscope.y), float(imu_data.gyroscope.z)],
+            "compass": float(getattr(imu_data, "compass", float("nan"))),
+        },
+    }
+
+
+def _save_profile_frame(episode_dir: Path, profile: SensorProfile, frame_id: int, carla_frame: int, camera_images: Mapping[str, object], lidar_combined: np.ndarray, raw_points: np.ndarray, args, primary: bool) -> Tuple[Mapping, int]:
+    rig_root = episode_dir / "rigs" / profile.name
+    bytes_written = 0
+    camera_tokens = {}
+    for camera_name, image in camera_images.items():
+        image_path = rig_root / "camera" / camera_name / f"{frame_id:04d}.jpg"
+        ok = cv2.imwrite(str(image_path), _camera_bgr(image), [int(cv2.IMWRITE_JPEG_QUALITY), int(args.jpeg_quality)])
+        if not ok:
+            raise RuntimeError(f"Failed to write camera image: {image_path}")
+        bytes_written += image_path.stat().st_size
+        camera_tokens[camera_name] = str(image_path.relative_to(episode_dir))
+    if "front" in camera_tokens:
+        front_source = episode_dir / camera_tokens["front"]
+        rig_rgb = rig_root / "rgb" / f"{frame_id:04d}.jpg"
+        _hardlink_or_copy(front_source, rig_rgb)
+        if primary:
+            _hardlink_or_copy(front_source, episode_dir / "rgb" / f"{frame_id:04d}.jpg")
+            _hardlink_or_copy(front_source, episode_dir / "camera" / "front" / f"{frame_id:04d}.jpg")
+
+    lidar_npz_path = rig_root / "lidar" / f"{frame_id:04d}.npz"
+    _save_lidar_npz(lidar_npz_path, lidar_combined, raw_points, carla_frame)
+    bytes_written += lidar_npz_path.stat().st_size
+    lidar_laz_path = None
+    if args.lidar_format in {"laz", "both"}:
+        candidate = rig_root / "lidar" / f"{frame_id:04d}.laz"
+        if _maybe_save_lidar_laz(candidate, lidar_combined):
+            lidar_laz_path = candidate
+            bytes_written += lidar_laz_path.stat().st_size
+
+    bev = _lidar_bev(lidar_combined, args)
+    lidar_bev_path = rig_root / "lidar_bev" / f"{frame_id:04d}.npy"
+    np.save(lidar_bev_path, bev.astype(np.float16))
+    bytes_written += lidar_bev_path.stat().st_size
+
+    if primary:
+        _hardlink_or_copy(lidar_npz_path, episode_dir / "lidar" / lidar_npz_path.name)
+        if lidar_laz_path is not None:
+            _hardlink_or_copy(lidar_laz_path, episode_dir / "lidar" / lidar_laz_path.name)
+        _hardlink_or_copy(lidar_bev_path, episode_dir / "lidar_bev" / lidar_bev_path.name)
+
+    tokens = {
+        "camera_tokens": camera_tokens,
+        "rgb_token": str((rig_root / "rgb" / f"{frame_id:04d}.jpg").relative_to(episode_dir)) if "front" in camera_tokens else None,
+        "lidar_token": str(lidar_npz_path.relative_to(episode_dir)),
+        "lidar_laz_token": str(lidar_laz_path.relative_to(episode_dir)) if lidar_laz_path is not None else None,
+        "lidar_bev_token": str(lidar_bev_path.relative_to(episode_dir)),
+    }
+    return tokens, bytes_written
+
+
+def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequence[SensorProfile], episode_index: int, episode_sec: float, args) -> Mapping:
+    episode_dir = _prepare_paired_episode_dir(Path(args.output_root).expanduser(), profiles, episode_index, args.overwrite)
+    profile_by_name = {profile.name: profile for profile in profiles}
+    primary_profile = args.primary_profile if args.primary_profile in profile_by_name else profiles[0].name
+    actors = []
+    frame_records_path = episode_dir / "frames.jsonl"
+    frame_records = frame_records_path.open("w", encoding="utf-8", buffering=1)
+    started_wall = time.monotonic()
+    bytes_written = 0
+    saved_frames = 0
+    last_lidar_by_profile = {profile.name: None for profile in profiles}
+    last_transform_by_profile = {profile.name: None for profile in profiles}
+    try:
+        blueprints = world.get_blueprint_library()
+        vehicle_bp = blueprints.filter(args.vehicle_filter)[0]
+        if vehicle_bp.has_attribute("role_name"):
+            vehicle_bp.set_attribute("role_name", "hero")
+        vehicle, spawn = _spawn_ego_vehicle(world, vehicle_bp, episode_index, args.seed, args.spawn_indices)
+        actors.append(vehicle)
+        vehicle.set_autopilot(False, traffic_manager.get_port())
+        vehicle.apply_control(carla.VehicleControl(brake=1.0))
+        traffic_manager.ignore_lights_percentage(vehicle, float(args.ignore_lights_percent))
+
+        rig_queues = {profile.name: _spawn_profile_sensors(carla, world, vehicle, profile, args, actors) for profile in profiles}
+        imu_q, gnss_q = _spawn_shared_state_sensors(carla, world, vehicle, args, actors)
+
+        layout_payloads = {profile.name: _sensor_layout_payload(profile) for profile in profiles}
+        _write_json(episode_dir / "sensor_layouts.json", layout_payloads)
+        _write_json(episode_dir / "sensor_layout.json", layout_payloads[primary_profile])
+        for profile in profiles:
+            _write_json(episode_dir / "rigs" / profile.name / "sensor_layout.json", layout_payloads[profile.name])
+
+        episode_meta = {
+            "dataset": "teach2drive_transfuserpp_carla",
+            "collection_mode": "paired",
+            "episode_index": episode_index,
+            "episode_token": uuid.uuid4().hex,
+            "primary_profile": primary_profile,
+            "profiles": [profile.name for profile in profiles],
+            "map": world.get_map().name,
+            "hz": args.hz,
+            "save_every_n": args.save_every_n,
+            "saved_fps": float(args.hz) / float(args.save_every_n),
+            "episode_sec": episode_sec,
+            "driver": "CARLA Traffic Manager autopilot",
+            "spawn_transform": {
+                "location": [spawn.location.x, spawn.location.y, spawn.location.z],
+                "rotation": [spawn.rotation.pitch, spawn.rotation.yaw, spawn.rotation.roll],
+            },
+        }
+        _write_json(episode_dir / "episode_meta.json", episode_meta)
+
+        for _ in range(max(0, int(round(float(args.warmup_sec) * float(args.hz))))):
+            vehicle.apply_control(carla.VehicleControl(brake=1.0))
+            world.tick()
+        vehicle.set_autopilot(True, traffic_manager.get_port())
+
+        ticks = max(1, int(round(float(episode_sec) * float(args.hz))))
+        carla_map = world.get_map()
+        start_elapsed = None
+        for tick_index in range(ticks):
+            frame = world.tick()
+            snapshot = world.get_snapshot()
+            if start_elapsed is None:
+                start_elapsed = float(snapshot.timestamp.elapsed_seconds)
+
+            vehicle_transform = vehicle.get_transform()
+            profile_observations = {}
+            for profile in profiles:
+                queues = rig_queues[profile.name]
+                camera_images = {
+                    camera_name: _get_matching(sensor_queue, frame, args.sensor_timeout)
+                    for camera_name, sensor_queue in queues["cameras"].items()
+                }
+                lidar_raw = _get_matching(queues["lidar"], frame, args.sensor_timeout)
+                raw_points = _lidar_points(lidar_raw)
+                lidar_ego = _transform_lidar_to_ego(raw_points, profile.lidar)
+                if last_lidar_by_profile[profile.name] is not None and last_transform_by_profile[profile.name] is not None:
+                    translation, yaw = _relative_motion_to_current(last_transform_by_profile[profile.name], vehicle_transform)
+                    lidar_combined = np.concatenate([lidar_ego, _align_lidar_to_current(last_lidar_by_profile[profile.name], translation, yaw)], axis=0)
+                else:
+                    lidar_combined = lidar_ego
+                last_lidar_by_profile[profile.name] = lidar_ego
+                last_transform_by_profile[profile.name] = vehicle_transform
+                profile_observations[profile.name] = {
+                    "camera_images": camera_images,
+                    "raw_points": raw_points,
+                    "lidar_combined": lidar_combined,
+                }
+
+            imu_data = _get_matching(imu_q, frame, args.sensor_timeout)
+            gnss_data = _get_matching(gnss_q, frame, args.sensor_timeout)
+            if tick_index % int(args.save_every_n) != 0:
+                continue
+
+            route, target_point, target_point_next = _route_points(carla_map, vehicle_transform, args)
+            measurement = _measurement_payload(
+                frame,
+                float(snapshot.timestamp.elapsed_seconds - start_elapsed),
+                vehicle,
+                vehicle_transform,
+                imu_data,
+                gnss_data,
+                route,
+                target_point,
+                target_point_next,
+                args,
+            )
+            frame_id = saved_frames
+            measurement_path = episode_dir / "measurements" / f"{frame_id:04d}.json.gz"
+            _write_json_gz(measurement_path, measurement)
+            bytes_written += measurement_path.stat().st_size
+
+            profile_tokens = {}
+            for profile in profiles:
+                tokens, profile_bytes = _save_profile_frame(
+                    episode_dir,
+                    profile,
+                    frame_id,
+                    frame,
+                    profile_observations[profile.name]["camera_images"],
+                    profile_observations[profile.name]["lidar_combined"],
+                    profile_observations[profile.name]["raw_points"],
+                    args,
+                    primary=(profile.name == primary_profile),
+                )
+                profile_tokens[profile.name] = tokens
+                bytes_written += profile_bytes
+
+            location = vehicle_transform.location
+            rotation = vehicle_transform.rotation
+            frame_record = {
+                "episode_token": episode_meta["episode_token"],
+                "frame_token": uuid.uuid4().hex,
+                "step": frame_id,
+                "carla_tick": tick_index,
+                "carla_frame": int(frame),
+                "time": measurement["time"],
+                "collection_mode": "paired",
+                "primary_profile": primary_profile,
+                "profile_tokens": profile_tokens,
+                "measurement_token": str(measurement_path.relative_to(episode_dir)),
+                "rgb_token": f"rgb/{frame_id:04d}.jpg",
+                "lidar_token": f"lidar/{frame_id:04d}.npz",
+                "lidar_bev_token": f"lidar_bev/{frame_id:04d}.npy",
+                "odom": {
+                    "x": float(location.x),
+                    "y": float(location.y),
+                    "z": float(location.z),
+                    "roll": math.radians(float(rotation.roll)),
+                    "pitch": math.radians(float(rotation.pitch)),
+                    "yaw": math.radians(float(rotation.yaw)),
+                    "v_forward": measurement["speed"],
+                },
+                "control": {
+                    "throttle": measurement["throttle"],
+                    "steer": measurement["steer"],
+                    "brake": measurement["brake_float"],
+                },
+            }
+            frame_records.write(json.dumps(frame_record, ensure_ascii=False) + "\n")
+            saved_frames += 1
+
+            if saved_frames % max(1, int(args.report_every_frames)) == 0:
+                wall = time.monotonic() - started_wall
+                mib = bytes_written / (1024 * 1024)
+                print(
+                    f"paired episode={episode_index} saved={saved_frames} "
+                    f"sim={tick_index / float(args.hz):.1f}/{episode_sec:.1f}s "
+                    f"profiles={','.join(profile.name for profile in profiles)} "
+                    f"written={mib:.1f}MiB wall_rate={mib / max(wall, 1e-6):.2f}MiB/s",
+                    flush=True,
+                )
+
+        summary = {
+            "collection_mode": "paired",
+            "episode_index": episode_index,
+            "episode_sec": episode_sec,
+            "saved_frames": saved_frames,
+            "profiles": [profile.name for profile in profiles],
+            "primary_profile": primary_profile,
+            "bytes_written": int(bytes_written),
+            "elapsed_wall_sec": time.monotonic() - started_wall,
+            "episode_dir": str(episode_dir),
+        }
+        _write_json(episode_dir / "episode_summary.json", summary)
+        print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
+        return summary
+    finally:
+        frame_records.close()
+        _destroy_actors(client, actors)
+
+
 def collect(args) -> None:
     _require_runtime_deps()
     _install_carla_python_path(args.carla_root)
     import carla
 
     profile_names = [name.strip() for name in args.profiles.split(",") if name.strip()]
+    if not profile_names:
+        raise ValueError("At least one --profiles entry is required")
     unknown = [name for name in profile_names if name not in SENSOR_PROFILES]
     if unknown:
         raise ValueError(f"Unknown profiles {unknown}; choose from {sorted(SENSOR_PROFILES)}")
+    if args.collection_mode == "paired" and args.primary_profile not in profile_names:
+        raise ValueError(f"--primary-profile must be one of the paired profiles: {profile_names}")
     profiles = [SENSOR_PROFILES[name]() for name in profile_names]
 
     output_root = Path(args.output_root).expanduser()
@@ -801,7 +1199,8 @@ def collect(args) -> None:
     traffic_manager = client.get_trafficmanager(int(args.traffic_manager_port))
     background_actors = []
     summaries = []
-    episode_plan = _build_episode_plan(len(profiles), args)
+    plan_profile_count = 1 if args.collection_mode == "paired" else len(profiles)
+    episode_plan = _build_episode_plan(plan_profile_count, args)
     try:
         settings = world.get_settings()
         settings.synchronous_mode = True
@@ -817,7 +1216,17 @@ def collect(args) -> None:
 
         dataset_meta = {
             "dataset": "teach2drive_transfuserpp_carla",
+            "collection_mode": args.collection_mode,
+            "primary_profile": args.primary_profile,
             "profiles": [profile.name for profile in profiles],
+            "sensor_profiles": {
+                profile.name: {
+                    "description": profile.description,
+                    "cameras": {name: asdict(spec) for name, spec in profile.cameras.items()},
+                    "lidar": asdict(profile.lidar),
+                }
+                for profile in profiles
+            },
             "map": world.get_map().name,
             "hz": args.hz,
             "save_every_n": args.save_every_n,
@@ -846,16 +1255,27 @@ def collect(args) -> None:
                 "next_command",
                 "theta",
                 "controls",
+                "gps",
+                "gnss",
+                "imu",
+                "ego_matrix",
             ],
         }
         _write_json(output_root / "dataset_meta.json", dataset_meta)
 
-        for profile_index, profile in enumerate(profiles):
-            episode_indices = sorted(index for pidx, index in episode_plan if pidx == profile_index)
+        if args.collection_mode == "paired":
+            episode_indices = sorted(index for pidx, index in episode_plan if pidx == 0)
             for episode_index in episode_indices:
-                episode_sec = _episode_seconds_for(profile_index, episode_index, episode_plan)
-                summaries.append(collect_episode(carla, client, world, traffic_manager, profile, profile_index, episode_index, episode_sec, args))
+                episode_sec = _episode_seconds_for(0, episode_index, episode_plan)
+                summaries.append(collect_paired_episode(carla, client, world, traffic_manager, profiles, episode_index, episode_sec, args))
                 _write_json(output_root / "dataset_summary.json", {"episodes": summaries})
+        else:
+            for profile_index, profile in enumerate(profiles):
+                episode_indices = sorted(index for pidx, index in episode_plan if pidx == profile_index)
+                for episode_index in episode_indices:
+                    episode_sec = _episode_seconds_for(profile_index, episode_index, episode_plan)
+                    summaries.append(collect_episode(carla, client, world, traffic_manager, profile, profile_index, episode_index, episode_sec, args))
+                    _write_json(output_root / "dataset_summary.json", {"episodes": summaries})
     finally:
         _destroy_actors(client, background_actors)
         try:
@@ -884,9 +1304,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map", default="Town10HD_Opt")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--profiles", default="tfpp_ego,front_triplet_shifted")
-    parser.add_argument("--duration-hours", type=float, default=2.5, help="Total simulated saved duration across all profiles.")
+    parser.add_argument("--collection-mode", choices=["paired", "separate"], default="paired", help="paired stores every profile on the same ego/timestamp; separate keeps the legacy per-profile episodes.")
+    parser.add_argument("--primary-profile", default="tfpp_ego", help="Profile mirrored into root rgb/lidar paths for TransFuser++ compatibility in paired mode.")
+    parser.add_argument("--duration-hours", type=float, default=2.0, help="Total simulated saved duration. In paired mode this is total same-ego driving time.")
     parser.add_argument("--episode-sec", type=float, default=300.0)
-    parser.add_argument("--episodes-per-profile", type=int, default=0, help="If set, ignore --duration-hours and collect this many episodes per profile.")
+    parser.add_argument("--episodes", type=int, default=0, help="If set, ignore --duration-hours. In paired mode this is the total episode count.")
+    parser.add_argument("--episodes-per-profile", type=int, default=0, help="Legacy alias for --episodes; in separate mode this many episodes are collected per profile.")
     parser.add_argument("--hz", type=int, default=20)
     parser.add_argument("--save-every-n", type=int, default=5, help="Official TransFuser++ data_save_freq is 5 at 20 Hz, i.e. 4 saved FPS.")
     parser.add_argument("--warmup-sec", type=float, default=2.0)
@@ -899,6 +1322,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--global-speed-difference", type=float, default=0.0)
     parser.add_argument("--ignore-lights-percent", type=float, default=0.0)
     parser.add_argument("--target-speed-mps", type=float, default=0.0)
+    parser.add_argument("--command-policy", choices=["heuristic", "lane_follow"], default="heuristic")
     parser.add_argument("--target-point-distance-m", type=float, default=12.0)
     parser.add_argument("--next-target-point-distance-m", type=float, default=24.0)
     parser.add_argument("--num-route-points", type=int, default=20)

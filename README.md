@@ -160,42 +160,56 @@ teach2drive_adapter/layout_conditioning.py
 
 ### Collect TransFuser++-Style CARLA Data
 
-After starting a CARLA 0.9.15 server, collect a 2-3 hour layout-adaptation
-dataset with:
+After starting a CARLA 0.9.15 server, collect a same-trajectory
+layout-adaptation dataset with:
 
 ```bash
 cd ~/code/teach2drive_adapter
 
 CARLA_ROOT=~/dataset/byeongjae/carla-simulator \
-OUTPUT_ROOT=~/dataset/byeongjae/t2d_transfuserpp_2h \
+OUTPUT_ROOT=~/dataset/byeongjae/t2d_transfuserpp_paired_24ep \
+DURATION_HOURS=2.0 \
+EPISODE_SEC=300 \
 bash configs/collect_transfuserpp_2h.sh
 ```
 
-The collector writes two sensor-layout profiles by default:
+The collector writes paired sensor-layout profiles by default: one ego vehicle,
+one Traffic Manager autopilot trajectory, one timestamp stream, and both rigs
+saved for every frame.
 
 | Profile | Sensors |
 | --- | --- |
 | `tfpp_ego` | Official TransFuser++ front RGB camera at `1024x512`, `110 deg` FOV, plus roof LiDAR. |
-| `front_triplet_shifted` | Three front-facing RGB cameras named `left/front/right` with small pose offsets, plus a slightly shifted LiDAR. |
+| `front_triplet_shifted` | Plausible alternate-ego front rig: windshield/roofline front-left, front-center, and front-right RGB cameras named `left/front/right`, plus a centered roof LiDAR. |
 
 Both profiles use the TransFuser++ CARLA rate conventions: simulator at `20 Hz`,
 `data_save_freq=5` (`4` saved frames per second), camera `1024x512`, FOV `110`,
-LiDAR `600000` points/sec and `10 Hz` rotation. Each episode stores:
+LiDAR `600000` points/sec and `10 Hz` rotation. Each paired episode stores:
 
 ```text
 episode_xxxxxx/
-  camera/{front,left,right}/0000.jpg
-  rgb/0000.jpg
-  lidar/0000.npz
-  lidar_bev/0000.npy
-  measurements/0000.json.gz
-  sensor_layout.json
+  rgb/0000.jpg                       # primary tfpp_ego compatibility alias
+  camera/front/0000.jpg              # primary tfpp_ego compatibility alias
+  lidar/0000.npz                     # primary tfpp_ego compatibility alias
+  lidar_bev/0000.npy                 # primary tfpp_ego compatibility alias
+  measurements/0000.json.gz          # shared route, control, ego state, GPS/GNSS/IMU
+  sensor_layout.json                 # primary profile layout
+  sensor_layouts.json                # all paired profile layouts
+  rigs/tfpp_ego/camera/front/0000.jpg
+  rigs/tfpp_ego/lidar/0000.npz
+  rigs/front_triplet_shifted/camera/{left,front,right}/0000.jpg
+  rigs/front_triplet_shifted/lidar/0000.npz
   frames.jsonl
 ```
 
 `measurements/*.json.gz` contains the fields used by TransFuser++ inference and
 training adapters: speed, target speed, target point, next target point, route,
-command, next command, controls, IMU, ego pose, and route angle.
+command, next command, controls, GPS/GNSS, IMU, ego pose, ego matrix, and route
+angle.
+
+To force exactly 24 paired episodes, set either `DURATION_HOURS=2.0` with
+`EPISODE_SEC=300`, or set `EPISODES=24`. The legacy per-profile behavior remains
+available with `COLLECTION_MODE=separate`.
 
 By default LiDAR is stored as compressed NumPy point clouds (`.npz`) plus a
 TransFuser++-shape BEV histogram. If you need CARLA Garage-style `.laz` files,
