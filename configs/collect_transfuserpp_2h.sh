@@ -16,6 +16,12 @@ EPISODE_SEC=${EPISODE_SEC:-300}
 TRAFFIC_VEHICLES=${TRAFFIC_VEHICLES:-60}
 PROFILES=${PROFILES:-tfpp_ego,front_triplet_shifted}
 LIDAR_FORMAT=${LIDAR_FORMAT:-npz}
+OVERWRITE=${OVERWRITE:-0}
+
+EXTRA_ARGS=()
+if [[ "$OVERWRITE" == "1" || "$OVERWRITE" == "true" || "$OVERWRITE" == "TRUE" ]]; then
+  EXTRA_ARGS+=(--overwrite)
+fi
 
 python -m teach2drive_adapter.collect_transfuserpp_dataset \
   --host "$HOST" \
@@ -29,4 +35,5 @@ python -m teach2drive_adapter.collect_transfuserpp_dataset \
   --hz 20 \
   --save-every-n 5 \
   --traffic-vehicles "$TRAFFIC_VEHICLES" \
-  --lidar-format "$LIDAR_FORMAT"
+  --lidar-format "$LIDAR_FORMAT" \
+  "${EXTRA_ARGS[@]}"
