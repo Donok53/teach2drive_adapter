@@ -20,6 +20,8 @@ HZ=${HZ:-10}
 VEHICLE_FILTER=${VEHICLE_FILTER:-vehicle.tesla.model3}
 OUTPUT=${OUTPUT:-"$HOME/dataset/byeongjae/runs/tfpp_baseline_smoke/episode_${EPISODE_INDEX}.json"}
 VIDEO_OUTPUT=${VIDEO_OUTPUT:-"$HOME/dataset/byeongjae/runs/tfpp_baseline_smoke/episode_${EPISODE_INDEX}.mp4"}
+TFPP_SPEED_MODE=${TFPP_SPEED_MODE:-expected}
+VIDEO_VIEW=${VIDEO_VIEW:-topdown}
 
 if [[ ! -d "$GARAGE_ROOT/team_code" ]]; then
   echo "Missing CARLA Garage team_code: $GARAGE_ROOT/team_code" >&2
@@ -58,10 +60,10 @@ ARGS=(
   --sensor-preset transfuserpp
   --control-mode tfpp_pid
   --command-mode target_angle
-  --tfpp-speed-mode official
+  --tfpp-speed-mode "$TFPP_SPEED_MODE"
   --vehicle-filter "$VEHICLE_FILTER"
   --video-output "$VIDEO_OUTPUT"
-  --video-view front_topdown
+  --video-view "$VIDEO_VIEW"
   --video-image-size 640 360
   --report-every-sec 5
 )

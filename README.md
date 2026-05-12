@@ -175,7 +175,7 @@ DURATION_SEC=180 \
 bash configs/transfuserpp_baseline_rollout_smoke.sh
 ```
 
-The smoke test writes a JSON summary and front/top-down video under
+The smoke test writes a JSON summary and top-down video under
 `~/dataset/byeongjae/runs/tfpp_baseline_smoke/`. A successful run reports
 `"success": true` or at least high `route_completion_pct` without import/model
 errors. Do not pass `--no-rendering` for this test because the camera sensors
