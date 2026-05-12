@@ -158,6 +158,29 @@ teach2drive_adapter/sensor_layout.py
 teach2drive_adapter/layout_conditioning.py
 ```
 
+### TransFuser++ Closed-Loop Smoke Test
+
+Before collecting hours of adaptation data, verify that the frozen
+TransFuser++ baseline can load and drive a route in the current CARLA server:
+
+```bash
+cd ~/teach2drive/workspace/teach2drive_adapter
+
+CARLA_ROOT=~/dataset/byeongjae/carla-simulator \
+GARAGE_ROOT=~/teach2drive/workspace/carla_garage \
+TEAM_CONFIG=~/teach2drive/checkpoints/transfuserpp/pretrained_models/all_towns \
+ROUTE_SOURCE=~/teach2drive/workspace/teach2drive_bootstrap/runs/town10_3cam_640x360_tokens/token_index.npz \
+EPISODE_INDEX=0 \
+DURATION_SEC=180 \
+bash configs/transfuserpp_baseline_rollout_smoke.sh
+```
+
+The smoke test writes a JSON summary and front/top-down video under
+`~/dataset/byeongjae/runs/tfpp_baseline_smoke/`. A successful run reports
+`"success": true` or at least high `route_completion_pct` without import/model
+errors. Do not pass `--no-rendering` for this test because the camera sensors
+must render images.
+
 ### Collect TransFuser++-Style CARLA Data
 
 After starting a CARLA 0.9.15 server, collect a same-trajectory
