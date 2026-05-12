@@ -15,6 +15,13 @@ MAP=${MAP:-Town10HD_Opt}
 DURATION_HOURS=${DURATION_HOURS:-2.0}
 EPISODE_SEC=${EPISODE_SEC:-300}
 TRAFFIC_VEHICLES=${TRAFFIC_VEHICLES:-60}
+GLOBAL_DISTANCE_TO_LEADING_VEHICLE=${GLOBAL_DISTANCE_TO_LEADING_VEHICLE:-2.5}
+GLOBAL_SPEED_DIFFERENCE=${GLOBAL_SPEED_DIFFERENCE:-0.0}
+IGNORE_LIGHTS_PERCENT=${IGNORE_LIGHTS_PERCENT:-0.0}
+MIN_MOVING_SPEED_MPS=${MIN_MOVING_SPEED_MPS:-1.0}
+MIN_MOVING_RATIO=${MIN_MOVING_RATIO:-0.20}
+MIN_PATH_LENGTH_M=${MIN_PATH_LENGTH_M:-100.0}
+FAIL_ON_INVALID_MOTION=${FAIL_ON_INVALID_MOTION:-0}
 PROFILES=${PROFILES:-tfpp_ego,front_triplet_shifted}
 COLLECTION_MODE=${COLLECTION_MODE:-paired}
 PRIMARY_PROFILE=${PRIMARY_PROFILE:-tfpp_ego}
@@ -34,6 +41,9 @@ fi
 if [[ "$START_EPISODE_INDEX" != "0" ]]; then
   EXTRA_ARGS+=(--start-episode-index "$START_EPISODE_INDEX")
 fi
+if [[ "$FAIL_ON_INVALID_MOTION" == "1" || "$FAIL_ON_INVALID_MOTION" == "true" || "$FAIL_ON_INVALID_MOTION" == "TRUE" ]]; then
+  EXTRA_ARGS+=(--fail-on-invalid-motion)
+fi
 
 python -m teach2drive_adapter.collect_transfuserpp_dataset \
   --host "$HOST" \
@@ -50,5 +60,11 @@ python -m teach2drive_adapter.collect_transfuserpp_dataset \
   --hz 20 \
   --save-every-n 5 \
   --traffic-vehicles "$TRAFFIC_VEHICLES" \
+  --global-distance-to-leading-vehicle "$GLOBAL_DISTANCE_TO_LEADING_VEHICLE" \
+  --global-speed-difference "$GLOBAL_SPEED_DIFFERENCE" \
+  --ignore-lights-percent "$IGNORE_LIGHTS_PERCENT" \
+  --min-moving-speed-mps "$MIN_MOVING_SPEED_MPS" \
+  --min-moving-ratio "$MIN_MOVING_RATIO" \
+  --min-path-length-m "$MIN_PATH_LENGTH_M" \
   --lidar-format "$LIDAR_FORMAT" \
   "${EXTRA_ARGS[@]}"

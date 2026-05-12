@@ -541,6 +541,59 @@ def _spawn_background_traffic(carla, client, world, traffic_manager, count: int,
     return actors
 
 
+def _new_motion_stats() -> Dict:
+    return {
+        "frames": 0,
+        "moving_frames": 0,
+        "path_length_m": 0.0,
+        "last_xy": None,
+        "speeds": [],
+        "brakes": [],
+        "throttles": [],
+    }
+
+
+def _update_motion_stats(stats: Dict, location, speed_mps: float, control, min_moving_speed_mps: float) -> None:
+    xy = (float(location.x), float(location.y))
+    previous_xy = stats.get("last_xy")
+    if previous_xy is not None:
+        stats["path_length_m"] += math.hypot(xy[0] - previous_xy[0], xy[1] - previous_xy[1])
+    stats["last_xy"] = xy
+    stats["frames"] += 1
+    if abs(float(speed_mps)) > float(min_moving_speed_mps):
+        stats["moving_frames"] += 1
+    stats["speeds"].append(abs(float(speed_mps)))
+    stats["brakes"].append(float(getattr(control, "brake", 0.0)))
+    stats["throttles"].append(float(getattr(control, "throttle", 0.0)))
+
+
+def _motion_summary(stats: Mapping, args) -> Dict:
+    speeds = np.asarray(stats.get("speeds", []), dtype=np.float32)
+    brakes = np.asarray(stats.get("brakes", []), dtype=np.float32)
+    throttles = np.asarray(stats.get("throttles", []), dtype=np.float32)
+    frames = int(stats.get("frames", 0))
+    moving_frames = int(stats.get("moving_frames", 0))
+    moving_ratio = float(moving_frames / max(frames, 1))
+    path_length_m = float(stats.get("path_length_m", 0.0))
+    summary = {
+        "frames": frames,
+        "moving_frames": moving_frames,
+        "moving_ratio": moving_ratio,
+        "path_length_m": path_length_m,
+        "min_moving_speed_mps": float(args.min_moving_speed_mps),
+        "min_required_moving_ratio": float(args.min_moving_ratio),
+        "min_required_path_length_m": float(args.min_path_length_m),
+        "motion_valid": bool(moving_ratio >= float(args.min_moving_ratio) and path_length_m >= float(args.min_path_length_m)),
+        "speed_mean_mps": float(speeds.mean()) if speeds.size else 0.0,
+        "speed_p50_mps": float(np.percentile(speeds, 50)) if speeds.size else 0.0,
+        "speed_p90_mps": float(np.percentile(speeds, 90)) if speeds.size else 0.0,
+        "speed_p99_mps": float(np.percentile(speeds, 99)) if speeds.size else 0.0,
+        "brake_mean": float(brakes.mean()) if brakes.size else 0.0,
+        "throttle_mean": float(throttles.mean()) if throttles.size else 0.0,
+    }
+    return summary
+
+
 def _prepare_episode_dir(root: Path, profile: SensorProfile, episode_index: int, overwrite: bool) -> Path:
     profile_root = root / profile.name
     episode_dir = profile_root / f"episode_{episode_index:06d}"
@@ -670,6 +723,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
     started_wall = time.monotonic()
     bytes_written = 0
     saved_frames = 0
+    motion_stats = _new_motion_stats()
     last_lidar_ego = None
     last_vehicle_transform = None
     try:
@@ -713,6 +767,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
         for _ in range(warmup_ticks):
             vehicle.apply_control(carla.VehicleControl(brake=1.0))
             world.tick()
+        vehicle.apply_control(carla.VehicleControl())
         vehicle.set_autopilot(True, traffic_manager.get_port())
 
         ticks = max(1, int(round(float(episode_sec) * float(args.hz))))
@@ -780,6 +835,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
             rotation = vehicle_transform.rotation
             velocity = vehicle.get_velocity()
             angular = vehicle.get_angular_velocity()
+            _update_motion_stats(motion_stats, location, speed_mps, control, args.min_moving_speed_mps)
             measurement = {
                 "pos_global": [float(location.x), float(location.y)],
                 "z": float(location.z),
@@ -868,6 +924,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
                     flush=True,
                 )
 
+        motion = _motion_summary(motion_stats, args)
         summary = {
             "profile": profile.name,
             "episode_index": episode_index,
@@ -876,8 +933,18 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
             "bytes_written": int(bytes_written),
             "elapsed_wall_sec": time.monotonic() - started_wall,
             "episode_dir": str(episode_dir),
+            "motion": motion,
         }
         _write_json(episode_dir / "episode_summary.json", summary)
+        if not motion["motion_valid"]:
+            print(
+                "WARNING: episode motion check failed: "
+                f"profile={profile.name} episode={episode_index} "
+                f"moving_ratio={motion['moving_ratio']:.3f} path={motion['path_length_m']:.1f}m",
+                flush=True,
+            )
+            if args.fail_on_invalid_motion:
+                raise RuntimeError(f"Episode {profile.name}/{episode_index} failed motion quality check")
         print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
         return summary
     finally:
@@ -1015,6 +1082,7 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
     started_wall = time.monotonic()
     bytes_written = 0
     saved_frames = 0
+    motion_stats = _new_motion_stats()
     last_lidar_by_profile = {profile.name: None for profile in profiles}
     last_transform_by_profile = {profile.name: None for profile in profiles}
     try:
@@ -1060,6 +1128,7 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
         for _ in range(max(0, int(round(float(args.warmup_sec) * float(args.hz))))):
             vehicle.apply_control(carla.VehicleControl(brake=1.0))
             world.tick()
+        vehicle.apply_control(carla.VehicleControl())
         vehicle.set_autopilot(True, traffic_manager.get_port())
 
         ticks = max(1, int(round(float(episode_sec) * float(args.hz))))
@@ -1136,6 +1205,7 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
 
             location = vehicle_transform.location
             rotation = vehicle_transform.rotation
+            _update_motion_stats(motion_stats, location, measurement["speed"], vehicle.get_control(), args.min_moving_speed_mps)
             frame_record = {
                 "episode_token": episode_meta["episode_token"],
                 "frame_token": uuid.uuid4().hex,
@@ -1179,6 +1249,7 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
                     flush=True,
                 )
 
+        motion = _motion_summary(motion_stats, args)
         summary = {
             "collection_mode": "paired",
             "episode_index": episode_index,
@@ -1189,8 +1260,18 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
             "bytes_written": int(bytes_written),
             "elapsed_wall_sec": time.monotonic() - started_wall,
             "episode_dir": str(episode_dir),
+            "motion": motion,
         }
         _write_json(episode_dir / "episode_summary.json", summary)
+        if not motion["motion_valid"]:
+            print(
+                "WARNING: episode motion check failed: "
+                f"paired episode={episode_index} moving_ratio={motion['moving_ratio']:.3f} "
+                f"path={motion['path_length_m']:.1f}m",
+                flush=True,
+            )
+            if args.fail_on_invalid_motion:
+                raise RuntimeError(f"Paired episode {episode_index} failed motion quality check")
         print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
         return summary
     finally:
@@ -1261,6 +1342,12 @@ def collect(args) -> None:
             "hz": args.hz,
             "save_every_n": args.save_every_n,
             "saved_fps": float(args.hz) / float(args.save_every_n),
+            "motion_quality": {
+                "min_moving_speed_mps": float(args.min_moving_speed_mps),
+                "min_moving_ratio": float(args.min_moving_ratio),
+                "min_path_length_m": float(args.min_path_length_m),
+                "fail_on_invalid_motion": bool(args.fail_on_invalid_motion),
+            },
             "camera_width": 1024,
             "camera_height": 512,
             "camera_fov": 110.0,
@@ -1353,6 +1440,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--global-speed-difference", type=float, default=0.0)
     parser.add_argument("--ignore-lights-percent", type=float, default=0.0)
     parser.add_argument("--target-speed-mps", type=float, default=0.0)
+    parser.add_argument("--min-moving-speed-mps", type=float, default=1.0, help="Speed threshold used for episode motion-quality summaries.")
+    parser.add_argument("--min-moving-ratio", type=float, default=0.20, help="Minimum saved-frame ratio above --min-moving-speed-mps for a valid episode.")
+    parser.add_argument("--min-path-length-m", type=float, default=100.0, help="Minimum ego path length required for a valid episode.")
+    parser.add_argument("--fail-on-invalid-motion", action="store_true", help="Raise an error when an episode is mostly static.")
     parser.add_argument("--command-policy", choices=["heuristic", "lane_follow"], default="heuristic")
     parser.add_argument("--target-point-distance-m", type=float, default=12.0)
     parser.add_argument("--next-target-point-distance-m", type=float, default=24.0)

@@ -91,7 +91,14 @@ def export_profile_view(args: argparse.Namespace) -> None:
         raise RuntimeError(f"No paired episodes found under {input_root}")
 
     exported = []
+    skipped = []
     for source_episode in episodes:
+        summary = _read_json(source_episode / "episode_summary.json")
+        motion = summary.get("motion", {}) if isinstance(summary, dict) else {}
+        if args.skip_invalid_motion and motion and motion.get("motion_valid") is False:
+            skipped.append({"source": str(source_episode), "reason": "invalid_motion", "motion": motion})
+            continue
+
         target_episode = output_root / source_episode.name
         if target_episode.exists() and args.overwrite:
             shutil.rmtree(target_episode)
@@ -130,10 +137,23 @@ def export_profile_view(args: argparse.Namespace) -> None:
         "output_root": str(output_root),
         "profile": args.profile,
         "episodes": exported,
+        "skipped": skipped,
         "symlink_assets": bool(args.symlink_assets),
     }
     _write_json(output_root / "profile_view_meta.json", meta)
-    print(json.dumps({"output_root": str(output_root), "profile": args.profile, "episodes": len(exported), "frames": sum(item["frames"] for item in exported)}, indent=2), flush=True)
+    print(
+        json.dumps(
+            {
+                "output_root": str(output_root),
+                "profile": args.profile,
+                "episodes": len(exported),
+                "skipped": len(skipped),
+                "frames": sum(item["frames"] for item in exported),
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -144,6 +164,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-cameras", default="", help="Comma-separated camera names that must be present.")
     parser.add_argument("--include-measurements", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--symlink-assets", action=argparse.BooleanOptionalAction, default=True, help="Symlink rigs/ and measurements/ instead of copying heavy data.")
+    parser.add_argument("--skip-invalid-motion", action="store_true", help="Skip episodes whose episode_summary.motion.motion_valid is false.")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 

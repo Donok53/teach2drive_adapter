@@ -22,6 +22,7 @@ VAL_RATIO=${VAL_RATIO:-0.15}
 SEED=${SEED:-41}
 OVERWRITE=${OVERWRITE:-0}
 DATA_PARALLEL=${DATA_PARALLEL:-1}
+SKIP_INVALID_MOTION=${SKIP_INVALID_MOTION:-1}
 
 VIEW_ROOT=${VIEW_ROOT:-"$WORK_ROOT/profile_views"}
 TFPP_VIEW=${TFPP_VIEW:-"$VIEW_ROOT/tfpp_ego"}
@@ -37,6 +38,9 @@ mkdir -p "$WORK_ROOT" "$INDEX_DIR" "$(dirname "$CACHE")" "$OUT"
 EXPORT_ARGS=()
 if [[ "$OVERWRITE" == "1" ]]; then
   EXPORT_ARGS+=(--overwrite)
+fi
+if [[ "$SKIP_INVALID_MOTION" == "1" || "$SKIP_INVALID_MOTION" == "true" || "$SKIP_INVALID_MOTION" == "TRUE" ]]; then
+  EXPORT_ARGS+=(--skip-invalid-motion)
 fi
 
 echo "=== export tfpp_ego profile view"
