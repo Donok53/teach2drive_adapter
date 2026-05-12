@@ -56,6 +56,7 @@ class CachedVisualPriorDataset(Dataset):
         cameras: Optional[Sequence[str]] = None,
         image_size=(320, 180),
         lidar_size: int = 128,
+        use_raw_layout: bool = False,
     ) -> None:
         self.cache_path = Path(cache_path).expanduser()
         arrays = np.load(self.cache_path, allow_pickle=True)
@@ -74,6 +75,7 @@ class CachedVisualPriorDataset(Dataset):
         self.speed_logits = arrays["speed_logits"].astype(np.float32)
         self.expected_speed = arrays["expected_speed"].astype(np.float32)
         self.indices = np.arange(len(self.sample_index), dtype=np.int64) if indices is None else indices.astype(np.int64)
+        self.use_raw_layout = bool(use_raw_layout)
 
         raw_sample_indices = self.sample_index[self.indices]
         self.raw = Teach2DriveIndexDataset(
@@ -113,11 +115,12 @@ class CachedVisualPriorDataset(Dataset):
     def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
         cache_idx = int(self.indices[item])
         raw = self.raw[item]
+        layout = raw["layout"] if self.use_raw_layout else torch.from_numpy(self.layout[cache_idx])
         return {
             "camera": raw["camera"],
             "lidar": raw["lidar"],
             "scalar": torch.from_numpy(self.scalar[cache_idx]),
-            "layout": torch.from_numpy(self.layout[cache_idx]),
+            "layout": layout,
             "target": torch.from_numpy(self.target[cache_idx]),
             "stop_state": torch.tensor(self.stop_state[cache_idx], dtype=torch.long),
             "stop_reason": torch.tensor(self.stop_reason[cache_idx], dtype=torch.long),
@@ -389,8 +392,26 @@ def train(args: argparse.Namespace) -> None:
     if args.max_val_samples > 0:
         val_indices = val_indices[: args.max_val_samples]
     cameras = _camera_list(args.cameras)
-    train_ds = CachedVisualPriorDataset(args.cache, index, episode_root, train_indices, cameras=cameras, image_size=tuple(args.image_size), lidar_size=args.lidar_size)
-    val_ds = CachedVisualPriorDataset(args.cache, index, episode_root, val_indices, cameras=cameras, image_size=tuple(args.image_size), lidar_size=args.lidar_size)
+    train_ds = CachedVisualPriorDataset(
+        args.cache,
+        index,
+        episode_root,
+        train_indices,
+        cameras=cameras,
+        image_size=tuple(args.image_size),
+        lidar_size=args.lidar_size,
+        use_raw_layout=args.use_raw_layout,
+    )
+    val_ds = CachedVisualPriorDataset(
+        args.cache,
+        index,
+        episode_root,
+        val_indices,
+        cameras=cameras,
+        image_size=tuple(args.image_size),
+        lidar_size=args.lidar_size,
+        use_raw_layout=args.use_raw_layout,
+    )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -429,6 +450,7 @@ def train(args: argparse.Namespace) -> None:
                 "cameras": cameras,
                 "image_size": list(args.image_size),
                 "lidar_size": args.lidar_size,
+                "use_raw_layout": bool(args.use_raw_layout),
                 "cache_metadata": metadata,
             },
             indent=2,
@@ -486,6 +508,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cameras", default="front,left,right")
     parser.add_argument("--image-size", type=int, nargs=2, default=[320, 180], metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--lidar-size", type=int, default=128)
+    parser.add_argument("--use-raw-layout", action="store_true", help="Use the layout from --index/--episode-root-override instead of the cached prior layout.")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-4)
