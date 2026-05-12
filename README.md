@@ -158,6 +158,49 @@ teach2drive_adapter/sensor_layout.py
 teach2drive_adapter/layout_conditioning.py
 ```
 
+### Collect TransFuser++-Style CARLA Data
+
+After starting a CARLA 0.9.15 server, collect a 2-3 hour layout-adaptation
+dataset with:
+
+```bash
+cd ~/code/teach2drive_adapter
+
+CARLA_ROOT=~/dataset/byeongjae/carla-simulator \
+OUTPUT_ROOT=~/dataset/byeongjae/t2d_transfuserpp_2h \
+bash configs/collect_transfuserpp_2h.sh
+```
+
+The collector writes two sensor-layout profiles by default:
+
+| Profile | Sensors |
+| --- | --- |
+| `tfpp_ego` | Official TransFuser++ front RGB camera at `1024x512`, `110 deg` FOV, plus roof LiDAR. |
+| `front_triplet_shifted` | Three front-facing RGB cameras named `left/front/right` with small pose offsets, plus a slightly shifted LiDAR. |
+
+Both profiles use the TransFuser++ CARLA rate conventions: simulator at `20 Hz`,
+`data_save_freq=5` (`4` saved frames per second), camera `1024x512`, FOV `110`,
+LiDAR `600000` points/sec and `10 Hz` rotation. Each episode stores:
+
+```text
+episode_xxxxxx/
+  camera/{front,left,right}/0000.jpg
+  rgb/0000.jpg
+  lidar/0000.npz
+  lidar_bev/0000.npy
+  measurements/0000.json.gz
+  sensor_layout.json
+  frames.jsonl
+```
+
+`measurements/*.json.gz` contains the fields used by TransFuser++ inference and
+training adapters: speed, target speed, target point, next target point, route,
+command, next command, controls, IMU, ego pose, and route angle.
+
+By default LiDAR is stored as compressed NumPy point clouds (`.npz`) plus a
+TransFuser++-shape BEV histogram. If you need CARLA Garage-style `.laz` files,
+install `laspy`/`lazrs` and run with `LIDAR_FORMAT=both`.
+
 This track should compare:
 
 | Method | Purpose |
