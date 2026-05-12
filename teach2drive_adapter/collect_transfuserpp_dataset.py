@@ -444,12 +444,16 @@ def _destroy_actors(client, actors: Iterable) -> None:
         return
     for actor in reversed(actors):
         try:
+            if hasattr(actor, "is_alive") and not actor.is_alive:
+                continue
             if hasattr(actor, "stop"):
                 actor.stop()
         except RuntimeError:
             pass
     for actor in reversed(actors):
         try:
+            if hasattr(actor, "is_alive") and not actor.is_alive:
+                continue
             actor.destroy()
         except RuntimeError:
             pass
@@ -495,14 +499,27 @@ def _prepare_episode_dir(root: Path, profile: SensorProfile, episode_index: int,
     return episode_dir
 
 
-def _choose_spawn(world, episode_index: int, seed: int, spawn_indices: Sequence[int]):
+def _spawn_candidates(world, episode_index: int, seed: int, spawn_indices: Sequence[int]):
     spawn_points = world.get_map().get_spawn_points()
     if not spawn_points:
         raise RuntimeError("Current CARLA map has no spawn points")
+    indices = list(range(len(spawn_points)))
     if spawn_indices:
-        return spawn_points[spawn_indices[episode_index % len(spawn_indices)] % len(spawn_points)]
+        first = spawn_indices[episode_index % len(spawn_indices)] % len(spawn_points)
+        indices.remove(first)
+        indices.insert(0, first)
+        return [spawn_points[index] for index in indices]
     rng = random.Random(seed + episode_index)
-    return spawn_points[rng.randrange(len(spawn_points))]
+    rng.shuffle(indices)
+    return [spawn_points[index] for index in indices]
+
+
+def _spawn_ego_vehicle(world, vehicle_bp, episode_index: int, seed: int, spawn_indices: Sequence[int]):
+    for spawn in _spawn_candidates(world, episode_index, seed, spawn_indices):
+        vehicle = world.try_spawn_actor(vehicle_bp, spawn)
+        if vehicle is not None:
+            return vehicle, spawn
+    raise RuntimeError("Could not spawn ego vehicle after trying every map spawn point. Try lowering --traffic-vehicles.")
 
 
 def _episode_seconds_for(profile_index: int, episode_index: int, plan: Mapping[Tuple[int, int], float]) -> float:
@@ -549,8 +566,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
         vehicle_bp = blueprints.filter(args.vehicle_filter)[0]
         if vehicle_bp.has_attribute("role_name"):
             vehicle_bp.set_attribute("role_name", "hero")
-        spawn = _choose_spawn(world, episode_index + profile_index * 100000, args.seed, args.spawn_indices)
-        vehicle = world.spawn_actor(vehicle_bp, spawn)
+        vehicle, spawn = _spawn_ego_vehicle(world, vehicle_bp, episode_index + profile_index * 100000, args.seed, args.spawn_indices)
         actors.append(vehicle)
         vehicle.set_autopilot(False, traffic_manager.get_port())
         vehicle.apply_control(carla.VehicleControl(brake=1.0))
