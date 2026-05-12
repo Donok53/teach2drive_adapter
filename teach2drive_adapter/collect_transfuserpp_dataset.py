@@ -442,15 +442,17 @@ def _destroy_actors(client, actors: Iterable) -> None:
     actors = [actor for actor in actors if actor is not None]
     if not actors:
         return
-    try:
-        command = __import__("carla").command
-        client.apply_batch([command.DestroyActor(actor) for actor in actors])
-    except Exception:
-        for actor in actors:
-            try:
-                actor.destroy()
-            except RuntimeError:
-                pass
+    for actor in reversed(actors):
+        try:
+            if hasattr(actor, "stop"):
+                actor.stop()
+        except RuntimeError:
+            pass
+    for actor in reversed(actors):
+        try:
+            actor.destroy()
+        except RuntimeError:
+            pass
 
 
 def _spawn_background_traffic(carla, client, world, traffic_manager, count: int, seed: int) -> List:
