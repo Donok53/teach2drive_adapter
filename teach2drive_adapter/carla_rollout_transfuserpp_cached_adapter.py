@@ -581,6 +581,35 @@ def _red_light_infraction(carla, vehicle, odom_speed, seen_red_lights, infractio
         infractions["red_light"].append(f"Agent moved through red light {traffic_light.id} at {_location_text(location)}")
 
 
+def _spawn_ego_near_route_start(carla, world, vehicle_bp, route: np.ndarray, args):
+    base_index = min(max(int(args.start_index), 0), len(route) - 1)
+    seen = set()
+    offsets = [0]
+    for offset in range(10, min(len(route), 220), 10):
+        offsets.extend([offset, -offset])
+
+    for offset in offsets:
+        route_index = min(max(base_index + offset, 0), len(route) - 1)
+        if route_index in seen:
+            continue
+        seen.add(route_index)
+        start = route[route_index]
+        spawn = carla.Transform(
+            carla.Location(x=float(start[0]), y=float(start[1]), z=args.spawn_z),
+            carla.Rotation(yaw=math.degrees(float(start[2]))),
+        )
+        vehicle = world.try_spawn_actor(vehicle_bp, spawn)
+        if vehicle is not None:
+            if route_index != base_index:
+                print(f"warning: route start index {base_index} was occupied; spawned at index {route_index}", flush=True)
+            return vehicle, spawn, route_index
+
+    raise RuntimeError(
+        f"Could not spawn ego vehicle near route index {base_index}. "
+        "Restart CARLA or stop other CARLA clients if the route is still occupied."
+    )
+
+
 def rollout(args):
     carla = _import_carla()
     _apply_sensor_preset(args)
@@ -612,12 +641,7 @@ def rollout(args):
 
         blueprints = world.get_blueprint_library()
         vehicle_bp = blueprints.filter(args.vehicle_filter)[0]
-        start = route[min(args.start_index, len(route) - 1)]
-        spawn = carla.Transform(
-            carla.Location(x=float(start[0]), y=float(start[1]), z=args.spawn_z),
-            carla.Rotation(yaw=math.degrees(float(start[2]))),
-        )
-        vehicle = world.spawn_actor(vehicle_bp, spawn)
+        vehicle, spawn, selected_start_index = _spawn_ego_near_route_start(carla, world, vehicle_bp, route, args)
         actors.append(vehicle)
         vehicle.apply_control(carla.VehicleControl(brake=1.0))
 
@@ -659,7 +683,7 @@ def rollout(args):
         progress_values = []
         success = False
         route_deviation = False
-        previous_route_idx = args.start_index
+        previous_route_idx = selected_start_index
         control_state = {}
         stop_probs = []
         stop_states = []
