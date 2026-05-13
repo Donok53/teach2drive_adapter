@@ -351,18 +351,31 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         stop_reason_mask = batch["stop_reason_mask"].to(device, non_blocking=True)
         weight = batch["sample_weight"].to(device, non_blocking=True)
         speed_dim = int(args.speed_dim)
-        supervision_target = (
-            (1.0 - float(args.teacher_target_blend)) * target
-            + float(args.teacher_target_blend) * teacher_target
+        traj_dim = target.shape[1] - speed_dim - 1
+        fallback_blend = float(args.teacher_target_blend)
+        traj_blend = fallback_blend if args.teacher_traj_blend is None else float(args.teacher_traj_blend)
+        speed_target_blend = fallback_blend if args.teacher_speed_target_blend is None else float(args.teacher_speed_target_blend)
+        stop_target_blend = fallback_blend if args.teacher_stop_target_blend is None else float(args.teacher_stop_target_blend)
+        target_traj_flat = (
+            (1.0 - traj_blend) * target[:, :traj_dim]
+            + traj_blend * teacher_target[:, :traj_dim]
         )
+        speed_supervision = (
+            (1.0 - speed_target_blend) * target[:, traj_dim : traj_dim + speed_dim]
+            + speed_target_blend * teacher_target[:, traj_dim : traj_dim + speed_dim]
+        )
+        stop_supervision = (
+            (1.0 - stop_target_blend) * target[:, -1:]
+            + stop_target_blend * teacher_target[:, -1:]
+        )
+        supervision_target = torch.cat([target_traj_flat, speed_supervision, stop_supervision], dim=1)
         moving = _moving_mask(scalar, supervision_target, base_target, speed_dim, float(args.moving_speed_threshold))
         effective_weight = _effective_weight(weight, moving, args)
         with torch.set_grad_enabled(train):
             out = model(scalar, layout, base_target, checkpoint_flat, speed_logits, expected_speed, camera, lidar)
             pred = out["target"]
-            traj_dim = pred.shape[1] - speed_dim - 1
             pred_traj = pred[:, :traj_dim].reshape(pred.shape[0], -1, 3)
-            target_traj = supervision_target[:, :traj_dim].reshape(supervision_target.shape[0], -1, 3)
+            target_traj = target_traj_flat.reshape(target_traj_flat.shape[0], -1, 3)
             xy_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., :2], target_traj[..., :2], reduction="none"), dim=(1, 2)), effective_weight)
             yaw_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., 2], target_traj[..., 2], reduction="none"), dim=1), effective_weight)
             zero = pred.new_tensor(0.0)
@@ -383,7 +396,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                     effective_weight,
                 )
             pred_speed = pred[:, traj_dim : traj_dim + speed_dim]
-            expert_speed = supervision_target[:, traj_dim : traj_dim + speed_dim]
+            expert_speed = speed_supervision
             base_speed = base_target[:, traj_dim : traj_dim + speed_dim]
             speed_target = (1.0 - float(args.speed_teacher_blend)) * expert_speed + float(args.speed_teacher_blend) * base_speed
             speed_loss = _weighted_mean(
@@ -413,8 +426,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                     torch.mean(nn.functional.smooth_l1_loss(pred_speed_curvature, target_speed_curvature, reduction="none"), dim=1),
                     effective_weight,
                 )
-            stop_raw = nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], target[:, -1:], reduction="none")
-            stop_loss = _weighted_mean(stop_raw * _stop_loss_weight(target[:, -1:], args), effective_weight)
+            stop_raw = nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], stop_supervision, reduction="none")
+            stop_loss = _weighted_mean(stop_raw * _stop_loss_weight(stop_supervision, args), effective_weight)
             state_loss = _weighted_mean(nn.functional.cross_entropy(out["stop_state"], stop_state, reduction="none"), effective_weight)
             reason_loss = _masked_weighted_ce(out["stop_reason"], stop_reason, stop_reason_mask, effective_weight)
             prior_loss = _weighted_mean(
@@ -668,6 +681,9 @@ def train(args: argparse.Namespace) -> None:
                     "moving_sample_weight": args.moving_sample_weight,
                     "stopped_sample_weight": args.stopped_sample_weight,
                     "teacher_target_blend": args.teacher_target_blend,
+                    "teacher_traj_blend": args.teacher_traj_blend,
+                    "teacher_speed_target_blend": args.teacher_speed_target_blend,
+                    "teacher_stop_target_blend": args.teacher_stop_target_blend,
                     "speed_teacher_blend": args.speed_teacher_blend,
                     "speed_distill_loss_weight": args.speed_distill_loss_weight,
                     "speed_floor_loss_weight": args.speed_floor_loss_weight,
@@ -758,6 +774,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--speed-dim", type=int, default=4)
     parser.add_argument("--teacher-target-blend", type=float, default=0.0, help="Blend expert labels with teacher-cache base_target: 0=expert only, 1=canonical teacher only.")
+    parser.add_argument("--teacher-traj-blend", type=float, default=None, help="Optional teacher blend for trajectory/yaw targets. Defaults to --teacher-target-blend.")
+    parser.add_argument("--teacher-speed-target-blend", type=float, default=None, help="Optional teacher blend for speed targets. Defaults to --teacher-target-blend.")
+    parser.add_argument("--teacher-stop-target-blend", type=float, default=None, help="Optional teacher blend for stop targets. Defaults to --teacher-target-blend.")
     parser.add_argument("--moving-speed-threshold", type=float, default=1.0)
     parser.add_argument("--moving-sample-weight", type=float, default=1.0)
     parser.add_argument("--stopped-sample-weight", type=float, default=1.0)
