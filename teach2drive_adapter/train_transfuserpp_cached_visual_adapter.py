@@ -298,6 +298,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         "speed": 0.0,
         "speed_distill": 0.0,
         "speed_floor": 0.0,
+        "speed_delta": 0.0,
+        "speed_curvature": 0.0,
+        "traj_delta": 0.0,
+        "traj_curvature": 0.0,
         "stop": 0.0,
         "state": 0.0,
         "reason": 0.0,
@@ -330,6 +334,23 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             target_traj = target[:, :traj_dim].reshape(target.shape[0], -1, 3)
             xy_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., :2], target_traj[..., :2], reduction="none"), dim=(1, 2)), effective_weight)
             yaw_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., 2], target_traj[..., 2], reduction="none"), dim=1), effective_weight)
+            zero = pred.new_tensor(0.0)
+            traj_delta_loss = zero
+            traj_curvature_loss = zero
+            if pred_traj.shape[1] > 1:
+                pred_delta = pred_traj[:, 1:, :2] - pred_traj[:, :-1, :2]
+                target_delta = target_traj[:, 1:, :2] - target_traj[:, :-1, :2]
+                traj_delta_loss = _weighted_mean(
+                    torch.mean(nn.functional.smooth_l1_loss(pred_delta, target_delta, reduction="none"), dim=(1, 2)),
+                    effective_weight,
+                )
+            if pred_traj.shape[1] > 2:
+                pred_curvature = pred_traj[:, 2:, :2] - 2.0 * pred_traj[:, 1:-1, :2] + pred_traj[:, :-2, :2]
+                target_curvature = target_traj[:, 2:, :2] - 2.0 * target_traj[:, 1:-1, :2] + target_traj[:, :-2, :2]
+                traj_curvature_loss = _weighted_mean(
+                    torch.mean(nn.functional.smooth_l1_loss(pred_curvature, target_curvature, reduction="none"), dim=(1, 2)),
+                    effective_weight,
+                )
             pred_speed = pred[:, traj_dim : traj_dim + speed_dim]
             expert_speed = target[:, traj_dim : traj_dim + speed_dim]
             base_speed = base_target[:, traj_dim : traj_dim + speed_dim]
@@ -345,6 +366,22 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             moving_float = moving.to(dtype=pred_speed.dtype)
             speed_floor_raw = torch.relu(float(args.speed_floor_mps) - pred_speed).mean(dim=1) * moving_float
             speed_floor_loss = _weighted_mean(speed_floor_raw, effective_weight)
+            speed_delta_loss = zero
+            speed_curvature_loss = zero
+            if speed_dim > 1:
+                pred_speed_delta = pred_speed[:, 1:] - pred_speed[:, :-1]
+                target_speed_delta = speed_target[:, 1:] - speed_target[:, :-1]
+                speed_delta_loss = _weighted_mean(
+                    torch.mean(nn.functional.smooth_l1_loss(pred_speed_delta, target_speed_delta, reduction="none"), dim=1),
+                    effective_weight,
+                )
+            if speed_dim > 2:
+                pred_speed_curvature = pred_speed[:, 2:] - 2.0 * pred_speed[:, 1:-1] + pred_speed[:, :-2]
+                target_speed_curvature = speed_target[:, 2:] - 2.0 * speed_target[:, 1:-1] + speed_target[:, :-2]
+                speed_curvature_loss = _weighted_mean(
+                    torch.mean(nn.functional.smooth_l1_loss(pred_speed_curvature, target_speed_curvature, reduction="none"), dim=1),
+                    effective_weight,
+                )
             stop_raw = nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], target[:, -1:], reduction="none")
             stop_loss = _weighted_mean(stop_raw * _stop_loss_weight(target[:, -1:], args), effective_weight)
             state_loss = _weighted_mean(nn.functional.cross_entropy(out["stop_state"], stop_state, reduction="none"), effective_weight)
@@ -358,6 +395,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 + args.speed_loss_weight * speed_loss
                 + args.speed_distill_loss_weight * speed_distill_loss
                 + args.speed_floor_loss_weight * speed_floor_loss
+                + args.speed_delta_loss_weight * speed_delta_loss
+                + args.speed_curvature_loss_weight * speed_curvature_loss
+                + args.traj_delta_loss_weight * traj_delta_loss
+                + args.traj_curvature_loss_weight * traj_curvature_loss
                 + stop_loss_weight * stop_loss
                 + stop_state_loss_weight * state_loss
                 + stop_reason_loss_weight * reason_loss
@@ -375,6 +416,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         totals["speed"] += float(speed_loss.detach().cpu()) * batch_size
         totals["speed_distill"] += float(speed_distill_loss.detach().cpu()) * batch_size
         totals["speed_floor"] += float(speed_floor_loss.detach().cpu()) * batch_size
+        totals["speed_delta"] += float(speed_delta_loss.detach().cpu()) * batch_size
+        totals["speed_curvature"] += float(speed_curvature_loss.detach().cpu()) * batch_size
+        totals["traj_delta"] += float(traj_delta_loss.detach().cpu()) * batch_size
+        totals["traj_curvature"] += float(traj_curvature_loss.detach().cpu()) * batch_size
         totals["stop"] += float(stop_loss.detach().cpu()) * batch_size
         totals["state"] += float(state_loss.detach().cpu()) * batch_size
         totals["reason"] += float(reason_loss.detach().cpu()) * batch_size
@@ -388,6 +433,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 f"xy={totals['xy']/totals['samples']:.6f} "
                 f"speed={totals['speed']/totals['samples']:.6f} "
                 f"floor={totals['speed_floor']/totals['samples']:.6f} "
+                f"sd={totals['speed_delta']/totals['samples']:.6f} "
                 f"moving={totals['moving_ratio']/totals['samples']:.3f} "
                 f"samples/s={totals['samples']/elapsed:.1f}",
                 flush=True,
@@ -406,6 +452,8 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
     reason_total = 0
     xy_errors = []
     speed_errors = []
+    speed_delta_errors = []
+    speed_curvature_errors = []
     pred_speeds = []
     target_speeds = []
     base_speeds = []
@@ -447,6 +495,14 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
             target_speed = target[:, traj_dim : traj_dim + int(speed_dim)]
             base_speed = base_target[:, traj_dim : traj_dim + int(speed_dim)]
             speed_errors.append(torch.mean(torch.abs(pred_speed - target_speed), dim=1).cpu().numpy())
+            if int(speed_dim) > 1:
+                pred_speed_delta = pred_speed[:, 1:] - pred_speed[:, :-1]
+                target_speed_delta = target_speed[:, 1:] - target_speed[:, :-1]
+                speed_delta_errors.append(torch.mean(torch.abs(pred_speed_delta - target_speed_delta), dim=1).cpu().numpy())
+            if int(speed_dim) > 2:
+                pred_speed_curvature = pred_speed[:, 2:] - 2.0 * pred_speed[:, 1:-1] + pred_speed[:, :-2]
+                target_speed_curvature = target_speed[:, 2:] - 2.0 * target_speed[:, 1:-1] + target_speed[:, :-2]
+                speed_curvature_errors.append(torch.mean(torch.abs(pred_speed_curvature - target_speed_curvature), dim=1).cpu().numpy())
             pred_speeds.append(pred_speed.mean(dim=1).cpu().numpy())
             target_speeds.append(target_speed.mean(dim=1).cpu().numpy())
             base_speeds.append(base_speed.mean(dim=1).cpu().numpy())
@@ -465,6 +521,10 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
         metrics["mean_xy_error_m_by_horizon"] = np.mean(np.stack(xy_errors, axis=0), axis=0).astype(float).tolist()
     if speed_errors:
         metrics["mean_speed_abs_error_mps"] = float(np.mean(np.concatenate(speed_errors, axis=0)))
+        if speed_delta_errors:
+            metrics["mean_speed_delta_abs_error_mps"] = float(np.mean(np.concatenate(speed_delta_errors, axis=0)))
+        if speed_curvature_errors:
+            metrics["mean_speed_curvature_abs_error_mps"] = float(np.mean(np.concatenate(speed_curvature_errors, axis=0)))
         metrics["pred_speed_mean_mps"] = float(np.mean(np.concatenate(pred_speeds, axis=0)))
         metrics["target_speed_mean_mps"] = float(np.mean(np.concatenate(target_speeds, axis=0)))
         metrics["base_speed_mean_mps"] = float(np.mean(np.concatenate(base_speeds, axis=0)))
@@ -557,6 +617,10 @@ def train(args: argparse.Namespace) -> None:
                     "speed_distill_loss_weight": args.speed_distill_loss_weight,
                     "speed_floor_loss_weight": args.speed_floor_loss_weight,
                     "speed_floor_mps": args.speed_floor_mps,
+                    "speed_delta_loss_weight": args.speed_delta_loss_weight,
+                    "speed_curvature_loss_weight": args.speed_curvature_loss_weight,
+                    "traj_delta_loss_weight": args.traj_delta_loss_weight,
+                    "traj_curvature_loss_weight": args.traj_curvature_loss_weight,
                     "stop_loss_after_epoch": args.stop_loss_after_epoch,
                 },
                 "cache_metadata": metadata,
@@ -644,6 +708,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speed-distill-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-floor-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-floor-mps", type=float, default=1.0)
+    parser.add_argument("--speed-delta-loss-weight", type=float, default=0.0)
+    parser.add_argument("--speed-curvature-loss-weight", type=float, default=0.0)
+    parser.add_argument("--traj-delta-loss-weight", type=float, default=0.0)
+    parser.add_argument("--traj-curvature-loss-weight", type=float, default=0.0)
     parser.add_argument("--stop-loss-weight", type=float, default=0.05)
     parser.add_argument("--stop-state-loss-weight", type=float, default=0.10)
     parser.add_argument("--stop-reason-loss-weight", type=float, default=0.02)
