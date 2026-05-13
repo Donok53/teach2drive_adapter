@@ -57,6 +57,7 @@ class CachedVisualPriorDataset(Dataset):
         image_size=(320, 180),
         lidar_size: int = 128,
         use_raw_layout: bool = False,
+        teacher_cache_path: str = "",
     ) -> None:
         self.cache_path = Path(cache_path).expanduser()
         arrays = np.load(self.cache_path, allow_pickle=True)
@@ -76,6 +77,25 @@ class CachedVisualPriorDataset(Dataset):
         self.expected_speed = arrays["expected_speed"].astype(np.float32)
         self.indices = np.arange(len(self.sample_index), dtype=np.int64) if indices is None else indices.astype(np.int64)
         self.use_raw_layout = bool(use_raw_layout)
+        self.teacher_cache_path = str(Path(teacher_cache_path).expanduser()) if teacher_cache_path else ""
+        self.teacher_metadata: Dict = {}
+        self.teacher_target = None
+        self.teacher_checkpoint_flat = None
+        self.teacher_speed_logits = None
+        self.teacher_expected_speed = None
+        if self.teacher_cache_path:
+            teacher_arrays = np.load(self.teacher_cache_path, allow_pickle=True)
+            self.teacher_metadata = _metadata_from_cache(teacher_arrays)
+            teacher_episode = teacher_arrays["sample_episode"].astype(np.int64)
+            teacher_frame = teacher_arrays["sample_frame"].astype(np.int64)
+            if len(teacher_episode) != len(self.sample_episode):
+                raise ValueError(f"teacher cache length mismatch: {len(teacher_episode)} != {len(self.sample_episode)}")
+            if not np.array_equal(teacher_episode, self.sample_episode) or not np.array_equal(teacher_frame, self.sample_frame):
+                raise ValueError("teacher cache is not aligned with the input cache by episode/frame")
+            self.teacher_target = teacher_arrays["base_target"].astype(np.float32)
+            self.teacher_checkpoint_flat = teacher_arrays["checkpoint_flat"].astype(np.float32)
+            self.teacher_speed_logits = teacher_arrays["speed_logits"].astype(np.float32)
+            self.teacher_expected_speed = teacher_arrays["expected_speed"].astype(np.float32)
 
         raw_sample_indices = self.sample_index[self.indices]
         self.raw = Teach2DriveIndexDataset(
@@ -130,6 +150,10 @@ class CachedVisualPriorDataset(Dataset):
             "checkpoint_flat": torch.from_numpy(self.checkpoint_flat[cache_idx]),
             "speed_logits": torch.from_numpy(self.speed_logits[cache_idx]),
             "expected_speed": torch.from_numpy(self.expected_speed[cache_idx]),
+            "teacher_target": torch.from_numpy(self.teacher_target[cache_idx]) if self.teacher_target is not None else torch.from_numpy(self.target[cache_idx]),
+            "teacher_checkpoint_flat": torch.from_numpy(self.teacher_checkpoint_flat[cache_idx]) if self.teacher_checkpoint_flat is not None else torch.from_numpy(self.checkpoint_flat[cache_idx]),
+            "teacher_speed_logits": torch.from_numpy(self.teacher_speed_logits[cache_idx]) if self.teacher_speed_logits is not None else torch.from_numpy(self.speed_logits[cache_idx]),
+            "teacher_expected_speed": torch.from_numpy(self.teacher_expected_speed[cache_idx]) if self.teacher_expected_speed is not None else torch.from_numpy(self.expected_speed[cache_idx]),
         }
 
 
@@ -302,6 +326,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         "speed_curvature": 0.0,
         "traj_delta": 0.0,
         "traj_curvature": 0.0,
+        "prior": 0.0,
         "stop": 0.0,
         "state": 0.0,
         "reason": 0.0,
@@ -313,6 +338,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         scalar = batch["scalar"].to(device, non_blocking=True)
         layout = batch["layout"].to(device, non_blocking=True)
         target = batch["target"].to(device, non_blocking=True)
+        teacher_target = batch["teacher_target"].to(device, non_blocking=True)
         base_target = batch["base_target"].to(device, non_blocking=True)
         checkpoint_flat = batch["checkpoint_flat"].to(device, non_blocking=True)
         speed_logits = batch["speed_logits"].to(device, non_blocking=True)
@@ -324,14 +350,18 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         stop_reason_mask = batch["stop_reason_mask"].to(device, non_blocking=True)
         weight = batch["sample_weight"].to(device, non_blocking=True)
         speed_dim = int(args.speed_dim)
-        moving = _moving_mask(scalar, target, base_target, speed_dim, float(args.moving_speed_threshold))
+        supervision_target = (
+            (1.0 - float(args.teacher_target_blend)) * target
+            + float(args.teacher_target_blend) * teacher_target
+        )
+        moving = _moving_mask(scalar, supervision_target, base_target, speed_dim, float(args.moving_speed_threshold))
         effective_weight = _effective_weight(weight, moving, args)
         with torch.set_grad_enabled(train):
             out = model(scalar, layout, base_target, checkpoint_flat, speed_logits, expected_speed, camera, lidar)
             pred = out["target"]
             traj_dim = pred.shape[1] - speed_dim - 1
             pred_traj = pred[:, :traj_dim].reshape(pred.shape[0], -1, 3)
-            target_traj = target[:, :traj_dim].reshape(target.shape[0], -1, 3)
+            target_traj = supervision_target[:, :traj_dim].reshape(supervision_target.shape[0], -1, 3)
             xy_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., :2], target_traj[..., :2], reduction="none"), dim=(1, 2)), effective_weight)
             yaw_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., 2], target_traj[..., 2], reduction="none"), dim=1), effective_weight)
             zero = pred.new_tensor(0.0)
@@ -352,7 +382,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                     effective_weight,
                 )
             pred_speed = pred[:, traj_dim : traj_dim + speed_dim]
-            expert_speed = target[:, traj_dim : traj_dim + speed_dim]
+            expert_speed = supervision_target[:, traj_dim : traj_dim + speed_dim]
             base_speed = base_target[:, traj_dim : traj_dim + speed_dim]
             speed_target = (1.0 - float(args.speed_teacher_blend)) * expert_speed + float(args.speed_teacher_blend) * base_speed
             speed_loss = _weighted_mean(
@@ -386,6 +416,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             stop_loss = _weighted_mean(stop_raw * _stop_loss_weight(target[:, -1:], args), effective_weight)
             state_loss = _weighted_mean(nn.functional.cross_entropy(out["stop_state"], stop_state, reduction="none"), effective_weight)
             reason_loss = _masked_weighted_ce(out["stop_reason"], stop_reason, stop_reason_mask, effective_weight)
+            prior_loss = _weighted_mean(
+                torch.mean(nn.functional.smooth_l1_loss(pred[:, : traj_dim + speed_dim], base_target[:, : traj_dim + speed_dim], reduction="none"), dim=1),
+                effective_weight,
+            )
             stop_loss_weight = float(args.stop_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             stop_state_loss_weight = float(args.stop_state_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             stop_reason_loss_weight = float(args.stop_reason_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
@@ -399,6 +433,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 + args.speed_curvature_loss_weight * speed_curvature_loss
                 + args.traj_delta_loss_weight * traj_delta_loss
                 + args.traj_curvature_loss_weight * traj_curvature_loss
+                + args.prior_loss_weight * prior_loss
                 + stop_loss_weight * stop_loss
                 + stop_state_loss_weight * state_loss
                 + stop_reason_loss_weight * reason_loss
@@ -420,6 +455,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         totals["speed_curvature"] += float(speed_curvature_loss.detach().cpu()) * batch_size
         totals["traj_delta"] += float(traj_delta_loss.detach().cpu()) * batch_size
         totals["traj_curvature"] += float(traj_curvature_loss.detach().cpu()) * batch_size
+        totals["prior"] += float(prior_loss.detach().cpu()) * batch_size
         totals["stop"] += float(stop_loss.detach().cpu()) * batch_size
         totals["state"] += float(state_loss.detach().cpu()) * batch_size
         totals["reason"] += float(reason_loss.detach().cpu()) * batch_size
@@ -451,11 +487,14 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
     reason_correct = 0
     reason_total = 0
     xy_errors = []
+    teacher_xy_errors = []
     speed_errors = []
+    teacher_speed_errors = []
     speed_delta_errors = []
     speed_curvature_errors = []
     pred_speeds = []
     target_speeds = []
+    teacher_speeds = []
     base_speeds = []
     moving_total = 0
     sample_total = 0
@@ -464,6 +503,7 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
             scalar = batch["scalar"].to(device, non_blocking=True)
             layout = batch["layout"].to(device, non_blocking=True)
             target = batch["target"].to(device, non_blocking=True)
+            teacher_target = batch["teacher_target"].to(device, non_blocking=True)
             base_target = batch["base_target"].to(device, non_blocking=True)
             checkpoint_flat = batch["checkpoint_flat"].to(device, non_blocking=True)
             speed_logits = batch["speed_logits"].to(device, non_blocking=True)
@@ -490,11 +530,15 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
             if traj_dim > 0 and traj_dim % 3 == 0:
                 pred_xy = pred[:, :traj_dim].reshape(pred.shape[0], -1, 3)[..., :2]
                 target_xy = target[:, :traj_dim].reshape(target.shape[0], -1, 3)[..., :2]
+                teacher_xy = teacher_target[:, :traj_dim].reshape(teacher_target.shape[0], -1, 3)[..., :2]
                 xy_errors.append(torch.linalg.norm(pred_xy - target_xy, dim=-1).mean(dim=0).cpu().numpy())
+                teacher_xy_errors.append(torch.linalg.norm(pred_xy - teacher_xy, dim=-1).mean(dim=0).cpu().numpy())
             pred_speed = pred[:, traj_dim : traj_dim + int(speed_dim)]
             target_speed = target[:, traj_dim : traj_dim + int(speed_dim)]
+            teacher_speed = teacher_target[:, traj_dim : traj_dim + int(speed_dim)]
             base_speed = base_target[:, traj_dim : traj_dim + int(speed_dim)]
             speed_errors.append(torch.mean(torch.abs(pred_speed - target_speed), dim=1).cpu().numpy())
+            teacher_speed_errors.append(torch.mean(torch.abs(pred_speed - teacher_speed), dim=1).cpu().numpy())
             if int(speed_dim) > 1:
                 pred_speed_delta = pred_speed[:, 1:] - pred_speed[:, :-1]
                 target_speed_delta = target_speed[:, 1:] - target_speed[:, :-1]
@@ -505,6 +549,7 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
                 speed_curvature_errors.append(torch.mean(torch.abs(pred_speed_curvature - target_speed_curvature), dim=1).cpu().numpy())
             pred_speeds.append(pred_speed.mean(dim=1).cpu().numpy())
             target_speeds.append(target_speed.mean(dim=1).cpu().numpy())
+            teacher_speeds.append(teacher_speed.mean(dim=1).cpu().numpy())
             base_speeds.append(base_speed.mean(dim=1).cpu().numpy())
             moving = _moving_mask(scalar, target, base_target, int(speed_dim), float(moving_speed_threshold))
             moving_total += int(moving.sum().cpu())
@@ -519,14 +564,19 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
     }
     if xy_errors:
         metrics["mean_xy_error_m_by_horizon"] = np.mean(np.stack(xy_errors, axis=0), axis=0).astype(float).tolist()
+    if teacher_xy_errors:
+        metrics["mean_teacher_xy_error_m_by_horizon"] = np.mean(np.stack(teacher_xy_errors, axis=0), axis=0).astype(float).tolist()
     if speed_errors:
         metrics["mean_speed_abs_error_mps"] = float(np.mean(np.concatenate(speed_errors, axis=0)))
+        if teacher_speed_errors:
+            metrics["mean_teacher_speed_abs_error_mps"] = float(np.mean(np.concatenate(teacher_speed_errors, axis=0)))
         if speed_delta_errors:
             metrics["mean_speed_delta_abs_error_mps"] = float(np.mean(np.concatenate(speed_delta_errors, axis=0)))
         if speed_curvature_errors:
             metrics["mean_speed_curvature_abs_error_mps"] = float(np.mean(np.concatenate(speed_curvature_errors, axis=0)))
         metrics["pred_speed_mean_mps"] = float(np.mean(np.concatenate(pred_speeds, axis=0)))
         metrics["target_speed_mean_mps"] = float(np.mean(np.concatenate(target_speeds, axis=0)))
+        metrics["teacher_speed_mean_mps"] = float(np.mean(np.concatenate(teacher_speeds, axis=0)))
         metrics["base_speed_mean_mps"] = float(np.mean(np.concatenate(base_speeds, axis=0)))
         metrics["moving_ratio_eval"] = float(moving_total / max(sample_total, 1))
     return metrics
@@ -559,6 +609,7 @@ def train(args: argparse.Namespace) -> None:
         image_size=tuple(args.image_size),
         lidar_size=args.lidar_size,
         use_raw_layout=args.use_raw_layout,
+        teacher_cache_path=args.teacher_cache,
     )
     val_ds = CachedVisualPriorDataset(
         args.cache,
@@ -569,6 +620,7 @@ def train(args: argparse.Namespace) -> None:
         image_size=tuple(args.image_size),
         lidar_size=args.lidar_size,
         use_raw_layout=args.use_raw_layout,
+        teacher_cache_path=args.teacher_cache,
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
@@ -603,6 +655,7 @@ def train(args: argparse.Namespace) -> None:
                 "train_samples": len(train_ds),
                 "val_samples": len(val_ds),
                 "cache": str(Path(args.cache).expanduser()),
+                "teacher_cache": str(Path(args.teacher_cache).expanduser()) if args.teacher_cache else "",
                 "index": index,
                 "episode_root_override": episode_root,
                 "cameras": cameras,
@@ -613,6 +666,7 @@ def train(args: argparse.Namespace) -> None:
                     "moving_speed_threshold": args.moving_speed_threshold,
                     "moving_sample_weight": args.moving_sample_weight,
                     "stopped_sample_weight": args.stopped_sample_weight,
+                    "teacher_target_blend": args.teacher_target_blend,
                     "speed_teacher_blend": args.speed_teacher_blend,
                     "speed_distill_loss_weight": args.speed_distill_loss_weight,
                     "speed_floor_loss_weight": args.speed_floor_loss_weight,
@@ -621,9 +675,11 @@ def train(args: argparse.Namespace) -> None:
                     "speed_curvature_loss_weight": args.speed_curvature_loss_weight,
                     "traj_delta_loss_weight": args.traj_delta_loss_weight,
                     "traj_curvature_loss_weight": args.traj_curvature_loss_weight,
+                    "prior_loss_weight": args.prior_loss_weight,
                     "stop_loss_after_epoch": args.stop_loss_after_epoch,
                 },
                 "cache_metadata": metadata,
+                "teacher_cache_metadata": train_ds.teacher_metadata,
             },
             indent=2,
         ),
@@ -654,6 +710,7 @@ def train(args: argparse.Namespace) -> None:
                     "epoch": epoch,
                     "val_loss": best_val,
                     "cache_metadata": metadata,
+                    "teacher_cache_metadata": train_ds.teacher_metadata,
                 },
                 out_dir / "best_model.pt",
             )
@@ -674,6 +731,7 @@ def train(args: argparse.Namespace) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a 3-camera/LiDAR visual adapter from cached frozen TransFuser++ priors.")
     parser.add_argument("--cache", required=True)
+    parser.add_argument("--teacher-cache", default="", help="Optional canonical-prior cache used as a distillation target while --cache supplies the adapter input prior.")
     parser.add_argument("--index", default="")
     parser.add_argument("--episode-root-override", default="")
     parser.add_argument("--out-dir", required=True)
@@ -698,6 +756,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-val-samples", type=int, default=0)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--speed-dim", type=int, default=4)
+    parser.add_argument("--teacher-target-blend", type=float, default=0.0, help="Blend expert labels with teacher-cache base_target: 0=expert only, 1=canonical teacher only.")
     parser.add_argument("--moving-speed-threshold", type=float, default=1.0)
     parser.add_argument("--moving-sample-weight", type=float, default=1.0)
     parser.add_argument("--stopped-sample-weight", type=float, default=1.0)
@@ -712,6 +771,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speed-curvature-loss-weight", type=float, default=0.0)
     parser.add_argument("--traj-delta-loss-weight", type=float, default=0.0)
     parser.add_argument("--traj-curvature-loss-weight", type=float, default=0.0)
+    parser.add_argument("--prior-loss-weight", type=float, default=0.0, help="Small regularizer toward the input prior from --cache.")
     parser.add_argument("--stop-loss-weight", type=float, default=0.05)
     parser.add_argument("--stop-state-loss-weight", type=float, default=0.10)
     parser.add_argument("--stop-reason-loss-weight", type=float, default=0.02)

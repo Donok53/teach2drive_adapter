@@ -26,6 +26,7 @@ SKIP_INVALID_MOTION=${SKIP_INVALID_MOTION:-1}
 MOVING_SPEED_THRESHOLD=${MOVING_SPEED_THRESHOLD:-1.0}
 MOVING_SAMPLE_WEIGHT=${MOVING_SAMPLE_WEIGHT:-1.0}
 STOPPED_SAMPLE_WEIGHT=${STOPPED_SAMPLE_WEIGHT:-1.0}
+TEACHER_TARGET_BLEND=${TEACHER_TARGET_BLEND:-0.0}
 XY_LOSS_WEIGHT=${XY_LOSS_WEIGHT:-1.0}
 YAW_LOSS_WEIGHT=${YAW_LOSS_WEIGHT:-0.05}
 SPEED_LOSS_WEIGHT=${SPEED_LOSS_WEIGHT:-0.10}
@@ -37,6 +38,7 @@ SPEED_DELTA_LOSS_WEIGHT=${SPEED_DELTA_LOSS_WEIGHT:-0.0}
 SPEED_CURVATURE_LOSS_WEIGHT=${SPEED_CURVATURE_LOSS_WEIGHT:-0.0}
 TRAJ_DELTA_LOSS_WEIGHT=${TRAJ_DELTA_LOSS_WEIGHT:-0.0}
 TRAJ_CURVATURE_LOSS_WEIGHT=${TRAJ_CURVATURE_LOSS_WEIGHT:-0.0}
+PRIOR_LOSS_WEIGHT=${PRIOR_LOSS_WEIGHT:-0.0}
 STOP_LOSS_WEIGHT=${STOP_LOSS_WEIGHT:-0.05}
 STOP_STATE_LOSS_WEIGHT=${STOP_STATE_LOSS_WEIGHT:-0.10}
 STOP_REASON_LOSS_WEIGHT=${STOP_REASON_LOSS_WEIGHT:-0.02}
@@ -51,9 +53,13 @@ INDEX_DIR=${INDEX_DIR:-"$WORK_ROOT/indexes"}
 TFPP_INDEX=${TFPP_INDEX:-"$INDEX_DIR/tfpp_ego_index.npz"}
 SHIFT_INDEX=${SHIFT_INDEX:-"$INDEX_DIR/front_triplet_shifted_index.npz"}
 CACHE=${CACHE:-"$WORK_ROOT/cache/tfpp_ego_prior_cache.npz"}
+SHIFT_CACHE=${SHIFT_CACHE:-"$WORK_ROOT/cache/front_triplet_shifted_prior_cache.npz"}
+TRAIN_CACHE=${TRAIN_CACHE:-"$CACHE"}
+TEACHER_CACHE=${TEACHER_CACHE:-""}
+BUILD_SHIFT_CACHE=${BUILD_SHIFT_CACHE:-0}
 OUT=${OUT:-"$WORK_ROOT/train_shifted_visual_layout_adapter"}
 
-mkdir -p "$WORK_ROOT" "$INDEX_DIR" "$(dirname "$CACHE")" "$OUT"
+mkdir -p "$WORK_ROOT" "$INDEX_DIR" "$(dirname "$CACHE")" "$(dirname "$SHIFT_CACHE")" "$OUT"
 
 EXPORT_ARGS=()
 if [[ "$OVERWRITE" == "1" ]]; then
@@ -144,14 +150,39 @@ else
     "${CACHE_ARGS[@]}"
 fi
 
+if [[ "$BUILD_SHIFT_CACHE" == "1" || "$BUILD_SHIFT_CACHE" == "true" || "$BUILD_SHIFT_CACHE" == "TRUE" ]]; then
+  if [[ -f "$SHIFT_CACHE" && "$OVERWRITE" != "1" ]]; then
+    echo "=== reuse shifted prior cache $SHIFT_CACHE"
+  else
+    echo "=== cache shifted front_triplet prior"
+    "$PY" -m teach2drive_adapter.cache_transfuserpp_prior \
+      --index "$SHIFT_INDEX" \
+      --output "$SHIFT_CACHE" \
+      --garage-root "$GARAGE_ROOT" \
+      --team-config "$TEAM_CONFIG" \
+      --episode-root-override "$SHIFT_VIEW" \
+      --cameras left,front,right \
+      --tfpp-camera front \
+      --command-mode target_angle \
+      --image-size 640 360 \
+      --lidar-size 128 \
+      --batch-size "$CACHE_BATCH_SIZE" \
+      --num-workers "$CACHE_WORKERS" \
+      "${CACHE_ARGS[@]}"
+  fi
+fi
+
 TRAIN_ARGS=()
 if [[ "$DATA_PARALLEL" == "1" ]]; then
   TRAIN_ARGS+=(--data-parallel)
 fi
+if [[ -n "$TEACHER_CACHE" ]]; then
+  TRAIN_ARGS+=(--teacher-cache "$TEACHER_CACHE")
+fi
 
 echo "=== train shifted visual/layout adapter"
 PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_cached_visual_adapter \
-  --cache "$CACHE" \
+  --cache "$TRAIN_CACHE" \
   --index "$SHIFT_INDEX" \
   --episode-root-override "$SHIFT_VIEW" \
   --out-dir "$OUT" \
@@ -168,6 +199,7 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_cached_visual
   --moving-speed-threshold "$MOVING_SPEED_THRESHOLD" \
   --moving-sample-weight "$MOVING_SAMPLE_WEIGHT" \
   --stopped-sample-weight "$STOPPED_SAMPLE_WEIGHT" \
+  --teacher-target-blend "$TEACHER_TARGET_BLEND" \
   --xy-loss-weight "$XY_LOSS_WEIGHT" \
   --yaw-loss-weight "$YAW_LOSS_WEIGHT" \
   --speed-loss-weight "$SPEED_LOSS_WEIGHT" \
@@ -179,6 +211,7 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_cached_visual
   --speed-curvature-loss-weight "$SPEED_CURVATURE_LOSS_WEIGHT" \
   --traj-delta-loss-weight "$TRAJ_DELTA_LOSS_WEIGHT" \
   --traj-curvature-loss-weight "$TRAJ_CURVATURE_LOSS_WEIGHT" \
+  --prior-loss-weight "$PRIOR_LOSS_WEIGHT" \
   --stop-loss-weight "$STOP_LOSS_WEIGHT" \
   --stop-state-loss-weight "$STOP_STATE_LOSS_WEIGHT" \
   --stop-reason-loss-weight "$STOP_REASON_LOSS_WEIGHT" \
