@@ -271,6 +271,8 @@ def _moving_mask(scalar: torch.Tensor, target: torch.Tensor, base_target: torch.
 
 
 def _effective_weight(weight: torch.Tensor, moving: torch.Tensor, args) -> torch.Tensor:
+    weight = weight.reshape(-1)
+    moving = moving.reshape(-1).bool()
     moving_scale = torch.where(
         moving,
         torch.full_like(weight, float(args.moving_sample_weight)),
