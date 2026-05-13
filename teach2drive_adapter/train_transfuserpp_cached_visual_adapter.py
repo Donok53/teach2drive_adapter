@@ -256,9 +256,52 @@ class CachedVisualTransFuserPPAdapterPolicy(nn.Module):
         return self.heads(adapted, base_target)
 
 
-def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str, float]:
+def _speed_region(pred: torch.Tensor, speed_dim: int):
+    traj_dim = pred.shape[1] - int(speed_dim) - 1
+    return traj_dim, pred[:, traj_dim : traj_dim + int(speed_dim)]
+
+
+def _moving_mask(scalar: torch.Tensor, target: torch.Tensor, base_target: torch.Tensor, speed_dim: int, threshold: float) -> torch.Tensor:
+    traj_dim, target_speed = _speed_region(target, speed_dim)
+    base_speed = base_target[:, traj_dim : traj_dim + int(speed_dim)]
+    current_speed = scalar[:, :1].abs() if scalar.shape[1] else torch.zeros_like(target_speed[:, :1])
+    target_speed_max = target_speed.abs().amax(dim=1, keepdim=True)
+    base_speed_max = base_speed.abs().amax(dim=1, keepdim=True)
+    return ((target_speed_max > threshold) | (base_speed_max > threshold) | (current_speed > threshold)).reshape(-1)
+
+
+def _effective_weight(weight: torch.Tensor, moving: torch.Tensor, args) -> torch.Tensor:
+    moving_scale = torch.where(
+        moving,
+        torch.full_like(weight, float(args.moving_sample_weight)),
+        torch.full_like(weight, float(args.stopped_sample_weight)),
+    )
+    return weight * moving_scale
+
+
+def _stop_loss_weight(target_stop: torch.Tensor, args) -> torch.Tensor:
+    return torch.where(
+        target_stop >= 0.5,
+        torch.full_like(target_stop, float(args.stop_positive_loss_scale)),
+        torch.full_like(target_stop, float(args.stop_negative_loss_scale)),
+    )
+
+
+def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int = 1) -> Dict[str, float]:
     model.train(train)
-    totals = {"loss": 0.0, "xy": 0.0, "yaw": 0.0, "speed": 0.0, "stop": 0.0, "state": 0.0, "reason": 0.0, "samples": 0}
+    totals = {
+        "loss": 0.0,
+        "xy": 0.0,
+        "yaw": 0.0,
+        "speed": 0.0,
+        "speed_distill": 0.0,
+        "speed_floor": 0.0,
+        "stop": 0.0,
+        "state": 0.0,
+        "reason": 0.0,
+        "moving_ratio": 0.0,
+        "samples": 0,
+    }
     start = time.time()
     for step, batch in enumerate(loader, start=1):
         scalar = batch["scalar"].to(device, non_blocking=True)
@@ -274,29 +317,48 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
         stop_reason = batch["stop_reason"].to(device, non_blocking=True)
         stop_reason_mask = batch["stop_reason_mask"].to(device, non_blocking=True)
         weight = batch["sample_weight"].to(device, non_blocking=True)
+        speed_dim = int(args.speed_dim)
+        moving = _moving_mask(scalar, target, base_target, speed_dim, float(args.moving_speed_threshold))
+        effective_weight = _effective_weight(weight, moving, args)
         with torch.set_grad_enabled(train):
             out = model(scalar, layout, base_target, checkpoint_flat, speed_logits, expected_speed, camera, lidar)
             pred = out["target"]
-            speed_dim = int(args.speed_dim)
             traj_dim = pred.shape[1] - speed_dim - 1
             pred_traj = pred[:, :traj_dim].reshape(pred.shape[0], -1, 3)
             target_traj = target[:, :traj_dim].reshape(target.shape[0], -1, 3)
-            xy_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., :2], target_traj[..., :2], reduction="none"), dim=(1, 2)), weight)
-            yaw_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., 2], target_traj[..., 2], reduction="none"), dim=1), weight)
+            xy_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., :2], target_traj[..., :2], reduction="none"), dim=(1, 2)), effective_weight)
+            yaw_loss = _weighted_mean(torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., 2], target_traj[..., 2], reduction="none"), dim=1), effective_weight)
+            pred_speed = pred[:, traj_dim : traj_dim + speed_dim]
+            expert_speed = target[:, traj_dim : traj_dim + speed_dim]
+            base_speed = base_target[:, traj_dim : traj_dim + speed_dim]
+            speed_target = (1.0 - float(args.speed_teacher_blend)) * expert_speed + float(args.speed_teacher_blend) * base_speed
             speed_loss = _weighted_mean(
-                torch.mean(nn.functional.smooth_l1_loss(pred[:, traj_dim : traj_dim + speed_dim], target[:, traj_dim : traj_dim + speed_dim], reduction="none"), dim=1),
-                weight,
+                torch.mean(nn.functional.smooth_l1_loss(pred_speed, speed_target, reduction="none"), dim=1),
+                effective_weight,
             )
-            stop_loss = _weighted_mean(nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], target[:, -1:], reduction="none"), weight)
-            state_loss = _weighted_mean(nn.functional.cross_entropy(out["stop_state"], stop_state, reduction="none"), weight)
-            reason_loss = _masked_weighted_ce(out["stop_reason"], stop_reason, stop_reason_mask, weight)
+            speed_distill_loss = _weighted_mean(
+                torch.mean(nn.functional.smooth_l1_loss(pred_speed, base_speed.detach(), reduction="none"), dim=1),
+                effective_weight,
+            )
+            moving_float = moving.to(dtype=pred_speed.dtype)
+            speed_floor_raw = torch.relu(float(args.speed_floor_mps) - pred_speed).mean(dim=1) * moving_float
+            speed_floor_loss = _weighted_mean(speed_floor_raw, effective_weight)
+            stop_raw = nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], target[:, -1:], reduction="none")
+            stop_loss = _weighted_mean(stop_raw * _stop_loss_weight(target[:, -1:], args), effective_weight)
+            state_loss = _weighted_mean(nn.functional.cross_entropy(out["stop_state"], stop_state, reduction="none"), effective_weight)
+            reason_loss = _masked_weighted_ce(out["stop_reason"], stop_reason, stop_reason_mask, effective_weight)
+            stop_loss_weight = float(args.stop_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
+            stop_state_loss_weight = float(args.stop_state_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
+            stop_reason_loss_weight = float(args.stop_reason_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             loss = (
                 args.xy_loss_weight * xy_loss
                 + args.yaw_loss_weight * yaw_loss
                 + args.speed_loss_weight * speed_loss
-                + args.stop_loss_weight * stop_loss
-                + args.stop_state_loss_weight * state_loss
-                + args.stop_reason_loss_weight * reason_loss
+                + args.speed_distill_loss_weight * speed_distill_loss
+                + args.speed_floor_loss_weight * speed_floor_loss
+                + stop_loss_weight * stop_loss
+                + stop_state_loss_weight * state_loss
+                + stop_reason_loss_weight * reason_loss
             )
             if train:
                 optimizer.zero_grad(set_to_none=True)
@@ -309,18 +371,30 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
         totals["xy"] += float(xy_loss.detach().cpu()) * batch_size
         totals["yaw"] += float(yaw_loss.detach().cpu()) * batch_size
         totals["speed"] += float(speed_loss.detach().cpu()) * batch_size
+        totals["speed_distill"] += float(speed_distill_loss.detach().cpu()) * batch_size
+        totals["speed_floor"] += float(speed_floor_loss.detach().cpu()) * batch_size
         totals["stop"] += float(stop_loss.detach().cpu()) * batch_size
         totals["state"] += float(state_loss.detach().cpu()) * batch_size
         totals["reason"] += float(reason_loss.detach().cpu()) * batch_size
+        totals["moving_ratio"] += float(moving.float().mean().detach().cpu()) * batch_size
         totals["samples"] += batch_size
         if train and args.step_log_every > 0 and (step == 1 or step % args.step_log_every == 0):
             elapsed = max(time.time() - start, 1e-6)
-            print(f"step={step:05d}/{len(loader):05d} loss={totals['loss']/totals['samples']:.6f} xy={totals['xy']/totals['samples']:.6f} samples/s={totals['samples']/elapsed:.1f}", flush=True)
+            print(
+                f"step={step:05d}/{len(loader):05d} "
+                f"loss={totals['loss']/totals['samples']:.6f} "
+                f"xy={totals['xy']/totals['samples']:.6f} "
+                f"speed={totals['speed']/totals['samples']:.6f} "
+                f"floor={totals['speed_floor']/totals['samples']:.6f} "
+                f"moving={totals['moving_ratio']/totals['samples']:.3f} "
+                f"samples/s={totals['samples']/elapsed:.1f}",
+                flush=True,
+            )
     samples = max(int(totals.pop("samples")), 1)
     return {key: value / samples for key, value in totals.items()}
 
 
-def _evaluate_predictions(model, loader, device) -> Dict:
+def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_speed_threshold: float = 1.0) -> Dict:
     model.eval()
     stop_correct = 0
     stop_total = 0
@@ -329,6 +403,12 @@ def _evaluate_predictions(model, loader, device) -> Dict:
     reason_correct = 0
     reason_total = 0
     xy_errors = []
+    speed_errors = []
+    pred_speeds = []
+    target_speeds = []
+    base_speeds = []
+    moving_total = 0
+    sample_total = 0
     with torch.no_grad():
         for batch in loader:
             scalar = batch["scalar"].to(device, non_blocking=True)
@@ -356,11 +436,21 @@ def _evaluate_predictions(model, loader, device) -> Dict:
             if torch.any(stop_reason_mask):
                 reason_correct += int((reason_pred[stop_reason_mask] == stop_reason[stop_reason_mask]).sum().cpu())
                 reason_total += int(stop_reason_mask.sum().cpu())
-            traj_dim = pred.shape[1] - 1 - 4
+            traj_dim = pred.shape[1] - 1 - int(speed_dim)
             if traj_dim > 0 and traj_dim % 3 == 0:
                 pred_xy = pred[:, :traj_dim].reshape(pred.shape[0], -1, 3)[..., :2]
                 target_xy = target[:, :traj_dim].reshape(target.shape[0], -1, 3)[..., :2]
                 xy_errors.append(torch.linalg.norm(pred_xy - target_xy, dim=-1).mean(dim=0).cpu().numpy())
+            pred_speed = pred[:, traj_dim : traj_dim + int(speed_dim)]
+            target_speed = target[:, traj_dim : traj_dim + int(speed_dim)]
+            base_speed = base_target[:, traj_dim : traj_dim + int(speed_dim)]
+            speed_errors.append(torch.mean(torch.abs(pred_speed - target_speed), dim=1).cpu().numpy())
+            pred_speeds.append(pred_speed.mean(dim=1).cpu().numpy())
+            target_speeds.append(target_speed.mean(dim=1).cpu().numpy())
+            base_speeds.append(base_speed.mean(dim=1).cpu().numpy())
+            moving = _moving_mask(scalar, target, base_target, int(speed_dim), float(moving_speed_threshold))
+            moving_total += int(moving.sum().cpu())
+            sample_total += int(moving.numel())
     metrics = {
         "stop_accuracy": float(stop_correct / max(stop_total, 1)),
         "stop_state_accuracy": float(state_correct / max(state_total, 1)),
@@ -371,6 +461,12 @@ def _evaluate_predictions(model, loader, device) -> Dict:
     }
     if xy_errors:
         metrics["mean_xy_error_m_by_horizon"] = np.mean(np.stack(xy_errors, axis=0), axis=0).astype(float).tolist()
+    if speed_errors:
+        metrics["mean_speed_abs_error_mps"] = float(np.mean(np.concatenate(speed_errors, axis=0)))
+        metrics["pred_speed_mean_mps"] = float(np.mean(np.concatenate(pred_speeds, axis=0)))
+        metrics["target_speed_mean_mps"] = float(np.mean(np.concatenate(target_speeds, axis=0)))
+        metrics["base_speed_mean_mps"] = float(np.mean(np.concatenate(base_speeds, axis=0)))
+        metrics["moving_ratio_eval"] = float(moving_total / max(sample_total, 1))
     return metrics
 
 
@@ -451,6 +547,16 @@ def train(args: argparse.Namespace) -> None:
                 "image_size": list(args.image_size),
                 "lidar_size": args.lidar_size,
                 "use_raw_layout": bool(args.use_raw_layout),
+                "training_strategy": {
+                    "moving_speed_threshold": args.moving_speed_threshold,
+                    "moving_sample_weight": args.moving_sample_weight,
+                    "stopped_sample_weight": args.stopped_sample_weight,
+                    "speed_teacher_blend": args.speed_teacher_blend,
+                    "speed_distill_loss_weight": args.speed_distill_loss_weight,
+                    "speed_floor_loss_weight": args.speed_floor_loss_weight,
+                    "speed_floor_mps": args.speed_floor_mps,
+                    "stop_loss_after_epoch": args.stop_loss_after_epoch,
+                },
                 "cache_metadata": metadata,
             },
             indent=2,
@@ -460,8 +566,8 @@ def train(args: argparse.Namespace) -> None:
     best_val = float("inf")
     history = []
     for epoch in range(1, args.epochs + 1):
-        train_metrics = _run_epoch(model, train_loader, optimizer, device, args, train=True)
-        val_metrics = _run_epoch(model, val_loader, optimizer, device, args, train=False)
+        train_metrics = _run_epoch(model, train_loader, optimizer, device, args, train=True, epoch=epoch)
+        val_metrics = _run_epoch(model, val_loader, optimizer, device, args, train=False, epoch=epoch)
         scheduler.step()
         row = {"epoch": epoch, "lr": float(optimizer.param_groups[0]["lr"]), "train": train_metrics, "val": val_metrics, "best_val_loss": best_val}
         if val_metrics["loss"] < best_val:
@@ -493,7 +599,7 @@ def train(args: argparse.Namespace) -> None:
     best = torch.load(out_dir / "best_model.pt", map_location="cpu")
     raw_model.load_state_dict(best["model_state"])
     raw_model.to(device)
-    metrics = _evaluate_predictions(raw_model, val_loader, device)
+    metrics = _evaluate_predictions(raw_model, val_loader, device, speed_dim=args.speed_dim, moving_speed_threshold=args.moving_speed_threshold)
     metrics.update({"best_epoch": int(best["epoch"]), "best_val_loss": float(best["val_loss"]), "mode": "transfuserpp_cached_visual_bev_adapter"})
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(json.dumps(metrics, indent=2), flush=True)
@@ -526,12 +632,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-val-samples", type=int, default=0)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--speed-dim", type=int, default=4)
+    parser.add_argument("--moving-speed-threshold", type=float, default=1.0)
+    parser.add_argument("--moving-sample-weight", type=float, default=1.0)
+    parser.add_argument("--stopped-sample-weight", type=float, default=1.0)
     parser.add_argument("--xy-loss-weight", type=float, default=1.0)
     parser.add_argument("--yaw-loss-weight", type=float, default=0.05)
     parser.add_argument("--speed-loss-weight", type=float, default=0.10)
+    parser.add_argument("--speed-teacher-blend", type=float, default=0.0)
+    parser.add_argument("--speed-distill-loss-weight", type=float, default=0.0)
+    parser.add_argument("--speed-floor-loss-weight", type=float, default=0.0)
+    parser.add_argument("--speed-floor-mps", type=float, default=1.0)
     parser.add_argument("--stop-loss-weight", type=float, default=0.05)
     parser.add_argument("--stop-state-loss-weight", type=float, default=0.10)
     parser.add_argument("--stop-reason-loss-weight", type=float, default=0.02)
+    parser.add_argument("--stop-positive-loss-scale", type=float, default=1.0)
+    parser.add_argument("--stop-negative-loss-scale", type=float, default=1.0)
+    parser.add_argument("--stop-loss-after-epoch", type=int, default=1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--step-log-every", type=int, default=50)
     parser.add_argument("--cpu", action="store_true")
