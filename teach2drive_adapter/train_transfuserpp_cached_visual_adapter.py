@@ -64,6 +64,7 @@ class CachedVisualPriorDataset(Dataset):
         self.metadata = _metadata_from_cache(arrays)
         self.sample_index = arrays["sample_index"].astype(np.int64)
         self.sample_episode = arrays["sample_episode"].astype(np.int64)
+        self.sample_frame = arrays["sample_frame"].astype(np.int64)
         self.scalar = arrays["scalar"].astype(np.float32)
         self.layout = arrays["layout"].astype(np.float32)
         self.target = arrays["target"].astype(np.float32)
