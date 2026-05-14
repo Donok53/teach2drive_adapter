@@ -18,6 +18,9 @@ TRAFFIC_VEHICLES=${TRAFFIC_VEHICLES:-60}
 GLOBAL_DISTANCE_TO_LEADING_VEHICLE=${GLOBAL_DISTANCE_TO_LEADING_VEHICLE:-2.5}
 GLOBAL_SPEED_DIFFERENCE=${GLOBAL_SPEED_DIFFERENCE:-0.0}
 IGNORE_LIGHTS_PERCENT=${IGNORE_LIGHTS_PERCENT:-0.0}
+TRAFFIC_SCHEDULE=${TRAFFIC_SCHEDULE:-fixed}
+TRAFFIC_SCHEDULE_SEED=${TRAFFIC_SCHEDULE_SEED:-0}
+TRAFFIC_SCHEDULE_SPEC=${TRAFFIC_SCHEDULE_SPEC:-}
 VEHICLE_FILTER=${VEHICLE_FILTER:-vehicle.tesla.model3}
 MIN_MOVING_SPEED_MPS=${MIN_MOVING_SPEED_MPS:-1.0}
 MIN_MOVING_RATIO=${MIN_MOVING_RATIO:-0.20}
@@ -45,6 +48,9 @@ fi
 if [[ "$FAIL_ON_INVALID_MOTION" == "1" || "$FAIL_ON_INVALID_MOTION" == "true" || "$FAIL_ON_INVALID_MOTION" == "TRUE" ]]; then
   EXTRA_ARGS+=(--fail-on-invalid-motion)
 fi
+if [[ -n "$TRAFFIC_SCHEDULE_SPEC" ]]; then
+  EXTRA_ARGS+=(--traffic-schedule-spec "$TRAFFIC_SCHEDULE_SPEC")
+fi
 
 python -m teach2drive_adapter.collect_transfuserpp_dataset \
   --host "$HOST" \
@@ -65,6 +71,8 @@ python -m teach2drive_adapter.collect_transfuserpp_dataset \
   --global-distance-to-leading-vehicle "$GLOBAL_DISTANCE_TO_LEADING_VEHICLE" \
   --global-speed-difference "$GLOBAL_SPEED_DIFFERENCE" \
   --ignore-lights-percent "$IGNORE_LIGHTS_PERCENT" \
+  --traffic-schedule "$TRAFFIC_SCHEDULE" \
+  --traffic-schedule-seed "$TRAFFIC_SCHEDULE_SEED" \
   --min-moving-speed-mps "$MIN_MOVING_SPEED_MPS" \
   --min-moving-ratio "$MIN_MOVING_RATIO" \
   --min-path-length-m "$MIN_PATH_LENGTH_M" \

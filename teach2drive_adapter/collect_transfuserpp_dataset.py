@@ -463,6 +463,88 @@ def _vehicle_light_state(vehicle) -> str:
         return "Unknown"
 
 
+def _nearby_stop_sign(carla_map, location, distance_m: float = 15.0) -> bool:
+    try:
+        waypoint = carla_map.get_waypoint(location, project_to_road=True)
+        landmarks = waypoint.get_landmarks(float(distance_m), False)
+    except (AttributeError, RuntimeError):
+        return False
+    for landmark in landmarks:
+        landmark_type = str(getattr(landmark, "type", "")).lower()
+        landmark_name = str(getattr(landmark, "name", "")).lower()
+        if "stop" in landmark_type or "stop" in landmark_name or landmark_type == "206":
+            return True
+    return False
+
+
+def _front_vehicle_context(world, carla_map, vehicle, vehicle_transform, max_distance_m: float = 28.0) -> Mapping:
+    try:
+        ego_location = vehicle_transform.location
+        yaw = math.radians(float(vehicle_transform.rotation.yaw))
+        forward = (math.cos(yaw), math.sin(yaw))
+        right = (-math.sin(yaw), math.cos(yaw))
+        ego_waypoint = carla_map.get_waypoint(ego_location, project_to_road=True) if carla_map is not None else None
+        vehicles = world.get_actors().filter("vehicle.*")
+    except (AttributeError, RuntimeError):
+        return {"vehicle_hazard": False, "vehicle_close": False, "vehicle_affecting_id": None, "vehicle_distance": None}
+
+    nearest = None
+    nearest_id = None
+    for other in vehicles:
+        if int(other.id) == int(vehicle.id):
+            continue
+        try:
+            other_location = other.get_location()
+            dx = float(other_location.x - ego_location.x)
+            dy = float(other_location.y - ego_location.y)
+            longitudinal = dx * forward[0] + dy * forward[1]
+            lateral = dx * right[0] + dy * right[1]
+            if longitudinal <= 0.0 or longitudinal > float(max_distance_m):
+                continue
+            other_waypoint = carla_map.get_waypoint(other_location, project_to_road=True) if carla_map is not None else None
+        except RuntimeError:
+            continue
+
+        same_lane = False
+        if ego_waypoint is not None and other_waypoint is not None:
+            same_lane = ego_waypoint.road_id == other_waypoint.road_id and ego_waypoint.lane_id == other_waypoint.lane_id
+        if not same_lane and abs(lateral) > 2.8:
+            continue
+        if nearest is None or longitudinal < nearest:
+            nearest = float(longitudinal)
+            nearest_id = int(other.id)
+
+    vehicle_close = nearest is not None
+    return {
+        "vehicle_hazard": bool(vehicle_close and nearest <= 18.0),
+        "vehicle_close": bool(vehicle_close),
+        "vehicle_affecting_id": nearest_id,
+        "vehicle_distance": nearest,
+    }
+
+
+def _traffic_context(world, carla_map, vehicle, vehicle_transform) -> Mapping:
+    light_state = _vehicle_light_state(vehicle)
+    front_vehicle = _front_vehicle_context(world, carla_map, vehicle, vehicle_transform)
+    try:
+        waypoint = carla_map.get_waypoint(vehicle_transform.location, project_to_road=True)
+        junction = bool(getattr(waypoint, "is_junction", False))
+    except (AttributeError, RuntimeError):
+        junction = False
+    stop_sign_close = _nearby_stop_sign(carla_map, vehicle_transform.location)
+    context = dict(front_vehicle)
+    context.update(
+        {
+            "junction": junction,
+            "traffic_light_state": light_state,
+            "light_hazard": light_state in {"Red", "Yellow"},
+            "stop_sign_hazard": bool(stop_sign_close),
+            "stop_sign_close": bool(stop_sign_close),
+        }
+    )
+    return context
+
+
 def _hardlink_or_copy(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -539,6 +621,116 @@ def _spawn_background_traffic(carla, client, world, traffic_manager, count: int,
         vehicle.set_autopilot(True, traffic_manager.get_port())
         actors.append(vehicle)
     return actors
+
+
+def _fixed_traffic_profile(args) -> Dict:
+    return {
+        "name": "fixed",
+        "traffic_vehicles": int(args.traffic_vehicles),
+        "global_distance_to_leading_vehicle": float(args.global_distance_to_leading_vehicle),
+        "global_speed_difference": float(args.global_speed_difference),
+        "ignore_lights_percent": float(args.ignore_lights_percent),
+        "weight": 1.0,
+    }
+
+
+def _builtin_vehicle_b_mixed_traffic_profiles(args) -> List[Dict]:
+    normal_count = int(args.traffic_vehicles)
+    if normal_count <= 0:
+        normal_count = 60
+    dense_count = max(normal_count + 20, int(round(normal_count * 1.6)))
+    default_distance = float(args.global_distance_to_leading_vehicle)
+    return [
+        {
+            "name": "free_drive",
+            "traffic_vehicles": 0,
+            "global_distance_to_leading_vehicle": default_distance,
+            "global_speed_difference": float(args.global_speed_difference),
+            "ignore_lights_percent": float(args.ignore_lights_percent),
+            "weight": 0.35,
+        },
+        {
+            "name": "normal_flow",
+            "traffic_vehicles": normal_count,
+            "global_distance_to_leading_vehicle": default_distance,
+            "global_speed_difference": float(args.global_speed_difference),
+            "ignore_lights_percent": float(args.ignore_lights_percent),
+            "weight": 0.45,
+        },
+        {
+            "name": "dense_interaction",
+            "traffic_vehicles": dense_count,
+            "global_distance_to_leading_vehicle": min(default_distance, 1.5),
+            "global_speed_difference": float(args.global_speed_difference),
+            "ignore_lights_percent": float(args.ignore_lights_percent),
+            "weight": 0.20,
+        },
+    ]
+
+
+def _parse_traffic_schedule_spec(spec: str) -> List[Dict]:
+    """Parse name:vehicles:distance:speed_diff:ignore_lights:weight entries."""
+    profiles = []
+    for raw_entry in (part.strip() for part in spec.split(",")):
+        if not raw_entry:
+            continue
+        fields = [field.strip() for field in raw_entry.split(":")]
+        if len(fields) != 6:
+            raise ValueError(
+                "--traffic-schedule-spec entries must be "
+                "name:vehicles:distance:speed_diff:ignore_lights:weight"
+            )
+        name, vehicles, distance, speed_diff, ignore_lights, weight = fields
+        profiles.append(
+            {
+                "name": name,
+                "traffic_vehicles": int(vehicles),
+                "global_distance_to_leading_vehicle": float(distance),
+                "global_speed_difference": float(speed_diff),
+                "ignore_lights_percent": float(ignore_lights),
+                "weight": float(weight),
+            }
+        )
+    if not profiles:
+        raise ValueError("--traffic-schedule-spec must contain at least one profile when --traffic-schedule=custom")
+    return profiles
+
+
+def _traffic_schedule_profiles(args) -> List[Dict]:
+    if args.traffic_schedule == "fixed":
+        return [_fixed_traffic_profile(args)]
+    if args.traffic_schedule == "vehicle_b_mixed":
+        return _builtin_vehicle_b_mixed_traffic_profiles(args)
+    if args.traffic_schedule == "custom":
+        return _parse_traffic_schedule_spec(args.traffic_schedule_spec)
+    raise ValueError(f"Unknown --traffic-schedule: {args.traffic_schedule}")
+
+
+def _traffic_schedule_cycle(args) -> List[Dict]:
+    profiles = _traffic_schedule_profiles(args)
+    slots = []
+    for profile in profiles:
+        weight = max(0.0, float(profile.get("weight", 0.0)))
+        repeats = int(round(weight * 20.0))
+        if weight > 0.0:
+            repeats = max(1, repeats)
+        slots.extend([profile] * repeats)
+    if not slots:
+        raise ValueError("Traffic schedule must have at least one positive-weight profile")
+    rng = random.Random(int(args.seed) + int(args.traffic_schedule_seed))
+    rng.shuffle(slots)
+    return slots
+
+
+def _traffic_profile_for_episode(schedule_cycle: Sequence[Mapping], episode_index: int) -> Dict:
+    profile = dict(schedule_cycle[int(episode_index) % len(schedule_cycle)])
+    profile["schedule_slot"] = int(episode_index) % len(schedule_cycle)
+    return profile
+
+
+def _apply_traffic_profile(traffic_manager, profile: Mapping) -> None:
+    traffic_manager.set_global_distance_to_leading_vehicle(float(profile["global_distance_to_leading_vehicle"]))
+    traffic_manager.global_percentage_speed_difference(float(profile["global_speed_difference"]))
 
 
 def _new_motion_stats() -> Dict:
@@ -715,8 +907,9 @@ def _write_dataset_summary(output_root: Path, summaries: Sequence[Mapping]) -> N
     _write_json(output_root / "dataset_summary.json", {"episodes": ordered})
 
 
-def collect_episode(carla, client, world, traffic_manager, profile: SensorProfile, profile_index: int, episode_index: int, episode_sec: float, args) -> Mapping:
+def collect_episode(carla, client, world, traffic_manager, profile: SensorProfile, profile_index: int, episode_index: int, episode_sec: float, args, traffic_profile: Mapping | None = None) -> Mapping:
     episode_dir = _prepare_episode_dir(Path(args.output_root).expanduser(), profile, episode_index, args.overwrite)
+    traffic_profile = dict(traffic_profile or _fixed_traffic_profile(args))
     actors = []
     frame_records_path = episode_dir / "frames.jsonl"
     frame_records = frame_records_path.open("w", encoding="utf-8", buffering=1)
@@ -735,7 +928,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
         actors.append(vehicle)
         vehicle.set_autopilot(False, traffic_manager.get_port())
         vehicle.apply_control(carla.VehicleControl(brake=1.0))
-        traffic_manager.ignore_lights_percentage(vehicle, float(args.ignore_lights_percent))
+        traffic_manager.ignore_lights_percentage(vehicle, float(traffic_profile["ignore_lights_percent"]))
 
         camera_queues, lidar_q, imu_q = _spawn_sensors(carla, world, vehicle, profile, args, actors)
 
@@ -751,6 +944,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
             "save_every_n": args.save_every_n,
             "saved_fps": float(args.hz) / float(args.save_every_n),
             "episode_sec": episode_sec,
+            "traffic_profile": traffic_profile,
             "spawn_transform": {
                 "location": [spawn.location.x, spawn.location.y, spawn.location.z],
                 "rotation": [spawn.rotation.pitch, spawn.rotation.yaw, spawn.rotation.roll],
@@ -835,6 +1029,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
             rotation = vehicle_transform.rotation
             velocity = vehicle.get_velocity()
             angular = vehicle.get_angular_velocity()
+            traffic_context = _traffic_context(world, carla_map, vehicle, vehicle_transform)
             _update_motion_stats(motion_stats, location, speed_mps, control, args.min_moving_speed_mps)
             measurement = {
                 "pos_global": [float(location.x), float(location.y)],
@@ -856,14 +1051,17 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
                 "brake": bool(control.brake > 0.05),
                 "brake_float": float(control.brake),
                 "control_brake": bool(control.brake > 0.05),
-                "junction": False,
-                "vehicle_hazard": False,
-                "vehicle_affecting_id": None,
-                "light_hazard": _vehicle_light_state(vehicle) == "Red",
+                "junction": traffic_context["junction"],
+                "vehicle_hazard": traffic_context["vehicle_hazard"],
+                "vehicle_close": traffic_context["vehicle_close"],
+                "vehicle_affecting_id": traffic_context["vehicle_affecting_id"],
+                "vehicle_distance": traffic_context["vehicle_distance"],
+                "traffic_light_state": traffic_context["traffic_light_state"],
+                "light_hazard": traffic_context["light_hazard"],
                 "walker_hazard": False,
                 "walker_affecting_id": None,
-                "stop_sign_hazard": False,
-                "stop_sign_close": False,
+                "stop_sign_hazard": traffic_context["stop_sign_hazard"],
+                "stop_sign_close": traffic_context["stop_sign_close"],
                 "walker_close": False,
                 "walker_close_id": None,
                 "angle": _angle_from_target_point(target_point),
@@ -933,6 +1131,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
             "bytes_written": int(bytes_written),
             "elapsed_wall_sec": time.monotonic() - started_wall,
             "episode_dir": str(episode_dir),
+            "traffic_profile": traffic_profile,
             "motion": motion,
         }
         _write_json(episode_dir / "episode_summary.json", summary)
@@ -952,7 +1151,7 @@ def collect_episode(carla, client, world, traffic_manager, profile: SensorProfil
         _destroy_actors(client, actors)
 
 
-def _measurement_payload(carla_frame: int, sim_time: float, vehicle, vehicle_transform, imu_data, gnss_data, route, target_point, target_point_next, args) -> Mapping:
+def _measurement_payload(carla_frame: int, sim_time: float, world, carla_map, vehicle, vehicle_transform, imu_data, gnss_data, route, target_point, target_point_next, args) -> Mapping:
     control = vehicle.get_control()
     location = vehicle_transform.location
     rotation = vehicle_transform.rotation
@@ -963,6 +1162,7 @@ def _measurement_payload(carla_frame: int, sim_time: float, vehicle, vehicle_tra
     target_speed = float(args.target_speed_mps) if args.target_speed_mps > 0 else speed_limit_mps
     command = _command_from_target_point(target_point) if args.command_policy == "heuristic" else LANE_FOLLOW_COMMAND
     next_command = _command_from_target_point(target_point_next) if args.command_policy == "heuristic" else command
+    traffic_context = _traffic_context(world, carla_map, vehicle, vehicle_transform)
     return {
         "carla_frame": int(carla_frame),
         "time": float(sim_time),
@@ -994,14 +1194,17 @@ def _measurement_payload(carla_frame: int, sim_time: float, vehicle, vehicle_tra
         "brake": bool(control.brake > 0.05),
         "brake_float": float(control.brake),
         "control_brake": bool(control.brake > 0.05),
-        "junction": False,
-        "vehicle_hazard": False,
-        "vehicle_affecting_id": None,
-        "light_hazard": _vehicle_light_state(vehicle) == "Red",
+        "junction": traffic_context["junction"],
+        "vehicle_hazard": traffic_context["vehicle_hazard"],
+        "vehicle_close": traffic_context["vehicle_close"],
+        "vehicle_affecting_id": traffic_context["vehicle_affecting_id"],
+        "vehicle_distance": traffic_context["vehicle_distance"],
+        "traffic_light_state": traffic_context["traffic_light_state"],
+        "light_hazard": traffic_context["light_hazard"],
         "walker_hazard": False,
         "walker_affecting_id": None,
-        "stop_sign_hazard": False,
-        "stop_sign_close": False,
+        "stop_sign_hazard": traffic_context["stop_sign_hazard"],
+        "stop_sign_close": traffic_context["stop_sign_close"],
         "walker_close": False,
         "walker_close_id": None,
         "angle": _angle_from_target_point(target_point),
@@ -1072,8 +1275,9 @@ def _save_profile_frame(episode_dir: Path, profile: SensorProfile, frame_id: int
     return tokens, bytes_written
 
 
-def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequence[SensorProfile], episode_index: int, episode_sec: float, args) -> Mapping:
+def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequence[SensorProfile], episode_index: int, episode_sec: float, args, traffic_profile: Mapping | None = None) -> Mapping:
     episode_dir = _prepare_paired_episode_dir(Path(args.output_root).expanduser(), profiles, episode_index, args.overwrite)
+    traffic_profile = dict(traffic_profile or _fixed_traffic_profile(args))
     profile_by_name = {profile.name: profile for profile in profiles}
     primary_profile = args.primary_profile if args.primary_profile in profile_by_name else profiles[0].name
     actors = []
@@ -1094,7 +1298,7 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
         actors.append(vehicle)
         vehicle.set_autopilot(False, traffic_manager.get_port())
         vehicle.apply_control(carla.VehicleControl(brake=1.0))
-        traffic_manager.ignore_lights_percentage(vehicle, float(args.ignore_lights_percent))
+        traffic_manager.ignore_lights_percentage(vehicle, float(traffic_profile["ignore_lights_percent"]))
 
         rig_queues = {profile.name: _spawn_profile_sensors(carla, world, vehicle, profile, args, actors) for profile in profiles}
         imu_q, gnss_q = _spawn_shared_state_sensors(carla, world, vehicle, args, actors)
@@ -1118,6 +1322,7 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
             "saved_fps": float(args.hz) / float(args.save_every_n),
             "episode_sec": episode_sec,
             "driver": "CARLA Traffic Manager autopilot",
+            "traffic_profile": traffic_profile,
             "spawn_transform": {
                 "location": [spawn.location.x, spawn.location.y, spawn.location.z],
                 "rotation": [spawn.rotation.pitch, spawn.rotation.yaw, spawn.rotation.roll],
@@ -1173,6 +1378,8 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
             measurement = _measurement_payload(
                 frame,
                 float(snapshot.timestamp.elapsed_seconds - start_elapsed),
+                world,
+                carla_map,
                 vehicle,
                 vehicle_transform,
                 imu_data,
@@ -1260,6 +1467,7 @@ def collect_paired_episode(carla, client, world, traffic_manager, profiles: Sequ
             "bytes_written": int(bytes_written),
             "elapsed_wall_sec": time.monotonic() - started_wall,
             "episode_dir": str(episode_dir),
+            "traffic_profile": traffic_profile,
             "motion": motion,
         }
         _write_json(episode_dir / "episode_summary.json", summary)
@@ -1312,6 +1520,8 @@ def collect(args) -> None:
     summaries = _load_existing_summaries(output_root)
     plan_profile_count = 1 if args.collection_mode == "paired" else len(profiles)
     episode_plan = _build_episode_plan(plan_profile_count, args)
+    traffic_cycle = _traffic_schedule_cycle(args)
+    schedule_per_episode = args.traffic_schedule != "fixed"
     try:
         settings = world.get_settings()
         settings.synchronous_mode = True
@@ -1320,10 +1530,17 @@ def collect(args) -> None:
         world.apply_settings(settings)
         traffic_manager.set_synchronous_mode(True)
         traffic_manager.set_random_device_seed(int(args.seed))
-        traffic_manager.set_global_distance_to_leading_vehicle(float(args.global_distance_to_leading_vehicle))
-        traffic_manager.global_percentage_speed_difference(float(args.global_speed_difference))
-
-        background_actors = _spawn_background_traffic(carla, client, world, traffic_manager, int(args.traffic_vehicles), int(args.seed) + 1701)
+        fixed_traffic_profile = _traffic_profile_for_episode(traffic_cycle, 0)
+        if not schedule_per_episode:
+            _apply_traffic_profile(traffic_manager, fixed_traffic_profile)
+            background_actors = _spawn_background_traffic(
+                carla,
+                client,
+                world,
+                traffic_manager,
+                int(fixed_traffic_profile["traffic_vehicles"]),
+                int(args.seed) + 1701,
+            )
 
         dataset_meta = {
             "dataset": "teach2drive_transfuserpp_carla",
@@ -1347,6 +1564,13 @@ def collect(args) -> None:
                 "min_moving_ratio": float(args.min_moving_ratio),
                 "min_path_length_m": float(args.min_path_length_m),
                 "fail_on_invalid_motion": bool(args.fail_on_invalid_motion),
+            },
+            "traffic_schedule": {
+                "mode": args.traffic_schedule,
+                "seed": int(args.traffic_schedule_seed),
+                "spec": args.traffic_schedule_spec,
+                "profiles": _traffic_schedule_profiles(args),
+                "per_episode": bool(schedule_per_episode),
             },
             "camera_width": 1024,
             "camera_height": 512,
@@ -1384,14 +1608,46 @@ def collect(args) -> None:
             episode_indices = sorted(index for pidx, index in episode_plan if pidx == 0)
             for episode_index in episode_indices:
                 episode_sec = _episode_seconds_for(0, episode_index, episode_plan)
-                summaries.append(collect_paired_episode(carla, client, world, traffic_manager, profiles, episode_index, episode_sec, args))
+                traffic_profile = _traffic_profile_for_episode(traffic_cycle, episode_index)
+                episode_background_actors = []
+                if schedule_per_episode:
+                    _apply_traffic_profile(traffic_manager, traffic_profile)
+                    episode_background_actors = _spawn_background_traffic(
+                        carla,
+                        client,
+                        world,
+                        traffic_manager,
+                        int(traffic_profile["traffic_vehicles"]),
+                        int(args.seed) + 1701 + int(episode_index),
+                    )
+                try:
+                    summaries.append(collect_paired_episode(carla, client, world, traffic_manager, profiles, episode_index, episode_sec, args, traffic_profile))
+                finally:
+                    if episode_background_actors:
+                        _destroy_actors(client, episode_background_actors)
                 _write_dataset_summary(output_root, summaries)
         else:
             for profile_index, profile in enumerate(profiles):
                 episode_indices = sorted(index for pidx, index in episode_plan if pidx == profile_index)
                 for episode_index in episode_indices:
                     episode_sec = _episode_seconds_for(profile_index, episode_index, episode_plan)
-                    summaries.append(collect_episode(carla, client, world, traffic_manager, profile, profile_index, episode_index, episode_sec, args))
+                    traffic_profile = _traffic_profile_for_episode(traffic_cycle, episode_index)
+                    episode_background_actors = []
+                    if schedule_per_episode:
+                        _apply_traffic_profile(traffic_manager, traffic_profile)
+                        episode_background_actors = _spawn_background_traffic(
+                            carla,
+                            client,
+                            world,
+                            traffic_manager,
+                            int(traffic_profile["traffic_vehicles"]),
+                            int(args.seed) + 1701 + int(profile_index) * 100000 + int(episode_index),
+                        )
+                    try:
+                        summaries.append(collect_episode(carla, client, world, traffic_manager, profile, profile_index, episode_index, episode_sec, args, traffic_profile))
+                    finally:
+                        if episode_background_actors:
+                            _destroy_actors(client, episode_background_actors)
                     _write_dataset_summary(output_root, summaries)
     finally:
         _destroy_actors(client, background_actors)
@@ -1439,6 +1695,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--global-distance-to-leading-vehicle", type=float, default=2.5)
     parser.add_argument("--global-speed-difference", type=float, default=0.0)
     parser.add_argument("--ignore-lights-percent", type=float, default=0.0)
+    parser.add_argument(
+        "--traffic-schedule",
+        choices=["fixed", "vehicle_b_mixed", "custom"],
+        default="fixed",
+        help="fixed keeps one Traffic Manager setting for the whole run; vehicle_b_mixed changes traffic density per episode inside one dataset.",
+    )
+    parser.add_argument("--traffic-schedule-seed", type=int, default=0)
+    parser.add_argument(
+        "--traffic-schedule-spec",
+        default="",
+        help="Custom schedule as comma-separated name:vehicles:distance:speed_diff:ignore_lights:weight entries.",
+    )
     parser.add_argument("--target-speed-mps", type=float, default=0.0)
     parser.add_argument("--min-moving-speed-mps", type=float, default=1.0, help="Speed threshold used for episode motion-quality summaries.")
     parser.add_argument("--min-moving-ratio", type=float, default=0.20, help="Minimum saved-frame ratio above --min-moving-speed-mps for a valid episode.")
