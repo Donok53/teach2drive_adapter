@@ -296,8 +296,13 @@ def _moving_mask(scalar: torch.Tensor, target: torch.Tensor, base_target: torch.
 
 
 def _effective_weight(weight: torch.Tensor, moving: torch.Tensor, args) -> torch.Tensor:
-    weight = weight.reshape(-1)
+    if weight.ndim > 1:
+        weight = weight.reshape(weight.shape[0], -1).mean(dim=1)
+    else:
+        weight = weight.reshape(-1)
     moving = moving.reshape(-1).bool()
+    if weight.shape[0] != moving.shape[0]:
+        raise ValueError(f"sample weight batch mismatch: weight={tuple(weight.shape)} moving={tuple(moving.shape)}")
     moving_scale = torch.where(
         moving,
         torch.full_like(weight, float(args.moving_sample_weight)),
