@@ -54,6 +54,37 @@ def _copy_optional_file(source: Path, target: Path) -> None:
         shutil.copy2(source, target)
 
 
+def _merge_measurement_semantics(selected: Dict, measurement: Dict) -> None:
+    if measurement.get("light_hazard") and "traffic_light" not in selected:
+        selected["traffic_light"] = {
+            "is_at_traffic_light": True,
+            "state": "Red",
+            "valid": True,
+            "confidence": 1.0,
+            "source": "carla_measurement_light_hazard",
+        }
+    if measurement.get("stop_sign_hazard") and "stop_sign" not in selected:
+        selected["stop_sign"] = {
+            "valid": True,
+            "distance_m": 0.0,
+            "confidence": 1.0,
+            "source": "carla_measurement_stop_sign_hazard",
+        }
+    if measurement.get("vehicle_hazard") and "front_vehicle" not in selected:
+        selected["front_vehicle"] = {
+            "valid": True,
+            "distance_m": 0.0,
+            "confidence": 1.0,
+            "source": "carla_measurement_vehicle_hazard",
+        }
+    if measurement.get("junction") and "lane" not in selected:
+        selected["lane"] = {
+            "valid": True,
+            "is_junction": True,
+            "source": "carla_measurement_junction",
+        }
+
+
 def _selected_frame(source_episode: Path, frame: Dict, profile: str, include_measurements: bool) -> Dict:
     profile_tokens = frame.get("profile_tokens", {})
     if profile not in profile_tokens:
@@ -79,6 +110,7 @@ def _selected_frame(source_episode: Path, frame: Dict, profile: str, include_mea
             for key in ("target_point", "target_point_next", "command", "command_onehot", "route_angle"):
                 if key in measurement and key not in selected:
                     selected[key] = measurement[key]
+            _merge_measurement_semantics(selected, measurement)
     return selected
 
 

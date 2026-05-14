@@ -21,6 +21,8 @@ LR=${LR:-2e-4}
 VAL_RATIO=${VAL_RATIO:-0.15}
 SEED=${SEED:-41}
 OVERWRITE=${OVERWRITE:-0}
+EXPORT_OVERWRITE=${EXPORT_OVERWRITE:-$OVERWRITE}
+INDEX_OVERWRITE=${INDEX_OVERWRITE:-$OVERWRITE}
 DATA_PARALLEL=${DATA_PARALLEL:-1}
 SKIP_INVALID_MOTION=${SKIP_INVALID_MOTION:-1}
 MOVING_SPEED_THRESHOLD=${MOVING_SPEED_THRESHOLD:-1.0}
@@ -65,7 +67,7 @@ OUT=${OUT:-"$WORK_ROOT/train_shifted_visual_layout_adapter"}
 mkdir -p "$WORK_ROOT" "$INDEX_DIR" "$(dirname "$CACHE")" "$(dirname "$SHIFT_CACHE")" "$OUT"
 
 EXPORT_ARGS=()
-if [[ "$OVERWRITE" == "1" ]]; then
+if [[ "$EXPORT_OVERWRITE" == "1" ]]; then
   EXPORT_ARGS+=(--overwrite)
 fi
 if [[ "$SKIP_INVALID_MOTION" == "1" || "$SKIP_INVALID_MOTION" == "true" || "$SKIP_INVALID_MOTION" == "TRUE" ]]; then
@@ -92,7 +94,7 @@ build_index() {
   local input_root=$1
   local output=$2
   local cameras=$3
-  if [[ -f "$output" && "$OVERWRITE" != "1" ]]; then
+  if [[ -f "$output" && "$INDEX_OVERWRITE" != "1" ]]; then
     echo "=== reuse index $output"
     return
   fi
