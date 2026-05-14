@@ -314,6 +314,25 @@ def _stop_loss_weight(target_stop: torch.Tensor, args) -> torch.Tensor:
     )
 
 
+def _apply_camera_dropout(camera: torch.Tensor, camera_names: Sequence[str], args) -> torch.Tensor:
+    if not camera.requires_grad and not torch.is_grad_enabled():
+        return camera
+    batch, camera_count = camera.shape[:2]
+    keep = torch.ones((batch, camera_count, 1, 1, 1), dtype=camera.dtype, device=camera.device)
+    drop_prob = float(args.camera_dropout_prob)
+    if drop_prob > 0.0:
+        keep = keep * (torch.rand_like(keep) >= drop_prob).to(camera.dtype)
+    front_drop_prob = float(args.front_camera_dropout_prob)
+    if front_drop_prob > 0.0 and "front" in camera_names:
+        front_idx = int(list(camera_names).index("front"))
+        keep[:, front_idx] = keep[:, front_idx] * (torch.rand((batch, 1, 1, 1), dtype=camera.dtype, device=camera.device) >= front_drop_prob).to(camera.dtype)
+    # Do not let augmentation remove every camera in a sample.
+    empty = keep.reshape(batch, camera_count, -1).amax(dim=2).sum(dim=1) <= 0
+    if torch.any(empty):
+        keep[empty, 0] = 1.0
+    return camera * keep
+
+
 def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int = 1) -> Dict[str, float]:
     model.train(train)
     totals = {
@@ -345,6 +364,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         speed_logits = batch["speed_logits"].to(device, non_blocking=True)
         expected_speed = batch["expected_speed"].to(device, non_blocking=True)
         camera = batch["camera"].to(device, non_blocking=True)
+        if train and (float(args.camera_dropout_prob) > 0.0 or float(args.front_camera_dropout_prob) > 0.0):
+            camera = _apply_camera_dropout(camera, _camera_list(args.cameras), args)
         lidar = batch["lidar"].to(device, non_blocking=True)
         stop_state = batch["stop_state"].to(device, non_blocking=True)
         stop_reason = batch["stop_reason"].to(device, non_blocking=True)
@@ -694,6 +715,8 @@ def train(args: argparse.Namespace) -> None:
                     "traj_curvature_loss_weight": args.traj_curvature_loss_weight,
                     "prior_loss_weight": args.prior_loss_weight,
                     "stop_loss_after_epoch": args.stop_loss_after_epoch,
+                    "camera_dropout_prob": args.camera_dropout_prob,
+                    "front_camera_dropout_prob": args.front_camera_dropout_prob,
                 },
                 "cache_metadata": metadata,
                 "teacher_cache_metadata": train_ds.teacher_metadata,
@@ -766,6 +789,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-token-dim", type=int, default=192)
     parser.add_argument("--visual-layers", type=int, default=2)
     parser.add_argument("--visual-heads", type=int, default=4)
+    parser.add_argument("--camera-dropout-prob", type=float, default=0.0)
+    parser.add_argument("--front-camera-dropout-prob", type=float, default=0.0)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--val-ratio", type=float, default=0.15)
