@@ -13,6 +13,8 @@ TFPP_CHECKPOINT=${TFPP_CHECKPOINT:-""}
 
 AUGMENTATIONS=${AUGMENTATIONS:-0}
 EPOCHS=${EPOCHS:-8}
+EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-15}
+EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-0.0}
 BATCH_SIZE=${BATCH_SIZE:-128}
 CACHE_BATCH_SIZE=${CACHE_BATCH_SIZE:-64}
 NUM_WORKERS=${NUM_WORKERS:-8}
@@ -205,6 +207,8 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_cached_visual
   --image-size 320 180 \
   --lidar-size 128 \
   --epochs "$EPOCHS" \
+  --early-stop-patience "$EARLY_STOP_PATIENCE" \
+  --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
   --batch-size "$BATCH_SIZE" \
   --num-workers "$NUM_WORKERS" \
   --lr "$LR" \

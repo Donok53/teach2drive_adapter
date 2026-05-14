@@ -717,6 +717,8 @@ def train(args: argparse.Namespace) -> None:
                     "stop_loss_after_epoch": args.stop_loss_after_epoch,
                     "camera_dropout_prob": args.camera_dropout_prob,
                     "front_camera_dropout_prob": args.front_camera_dropout_prob,
+                    "early_stop_patience": args.early_stop_patience,
+                    "early_stop_min_delta": args.early_stop_min_delta,
                 },
                 "cache_metadata": metadata,
                 "teacher_cache_metadata": train_ds.teacher_metadata,
@@ -726,15 +728,27 @@ def train(args: argparse.Namespace) -> None:
         flush=True,
     )
     best_val = float("inf")
+    epochs_since_improvement = 0
     history = []
     for epoch in range(1, args.epochs + 1):
         train_metrics = _run_epoch(model, train_loader, optimizer, device, args, train=True, epoch=epoch)
         val_metrics = _run_epoch(model, val_loader, optimizer, device, args, train=False, epoch=epoch)
         scheduler.step()
-        row = {"epoch": epoch, "lr": float(optimizer.param_groups[0]["lr"]), "train": train_metrics, "val": val_metrics, "best_val_loss": best_val}
-        if val_metrics["loss"] < best_val:
+        improved = val_metrics["loss"] < (best_val - float(args.early_stop_min_delta))
+        row = {
+            "epoch": epoch,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "train": train_metrics,
+            "val": val_metrics,
+            "best_val_loss": best_val,
+            "epochs_since_improvement": epochs_since_improvement,
+            "early_stop_patience": int(args.early_stop_patience),
+        }
+        if improved:
             best_val = val_metrics["loss"]
+            epochs_since_improvement = 0
             row["best_val_loss"] = best_val
+            row["epochs_since_improvement"] = epochs_since_improvement
             raw_model = model.module if isinstance(model, nn.DataParallel) else model
             torch.save(
                 {
@@ -754,10 +768,23 @@ def train(args: argparse.Namespace) -> None:
                 },
                 out_dir / "best_model.pt",
             )
+        else:
+            epochs_since_improvement += 1
+            row["epochs_since_improvement"] = epochs_since_improvement
         history.append(row)
         (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
         (out_dir / "latest.json").write_text(json.dumps(row, indent=2), encoding="utf-8")
         print(f"epoch={epoch:03d} train={train_metrics['loss']:.6f} val={val_metrics['loss']:.6f} best={best_val:.6f}", flush=True)
+        if int(args.early_stop_patience) > 0 and epochs_since_improvement >= int(args.early_stop_patience):
+            print(
+                f"early_stop: no val improvement for {epochs_since_improvement} epochs "
+                f"(patience={int(args.early_stop_patience)}, best={best_val:.6f})",
+                flush=True,
+            )
+            row["early_stopped"] = True
+            (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+            (out_dir / "latest.json").write_text(json.dumps(row, indent=2), encoding="utf-8")
+            break
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     best = torch.load(out_dir / "best_model.pt", map_location="cpu")
     raw_model.load_state_dict(best["model_state"])
@@ -780,6 +807,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lidar-size", type=int, default=128)
     parser.add_argument("--use-raw-layout", action="store_true", help="Use the layout from --index/--episode-root-override instead of the cached prior layout.")
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--early-stop-patience", type=int, default=0, help="Stop when validation loss does not improve for this many epochs. Use 0 to disable.")
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0, help="Minimum validation-loss decrease required to count as an improvement.")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
