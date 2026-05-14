@@ -13,14 +13,32 @@ from .data import STOP_REASON_NAMES, STOP_STATE_NAMES, Teach2DriveIndexDataset, 
 from .model import Teach2DriveAdapterPolicy, configure_train_mode, count_trainable_parameters
 
 
+def _per_sample_vector(value: torch.Tensor, sample_count: int, *, reduce: str = "mean") -> torch.Tensor:
+    value = value.reshape(-1)
+    sample_count = int(sample_count)
+    if value.numel() == sample_count:
+        return value
+    if value.numel() == 1:
+        return value.expand(sample_count)
+    if sample_count > 0 and value.numel() % sample_count == 0:
+        value = value.reshape(sample_count, -1)
+        if reduce == "any":
+            return (value > 0).any(dim=1).to(dtype=value.dtype)
+        if reduce == "max":
+            return value.max(dim=1).values
+        return value.mean(dim=1)
+    raise ValueError(f"Cannot reduce tensor with {value.numel()} values to {sample_count} samples")
+
+
 def _weighted_mean(loss: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    weight = weight.reshape(-1)
-    return torch.sum(loss.reshape(-1) * weight) / torch.clamp(torch.sum(weight), min=1e-6)
+    loss = loss.reshape(-1)
+    weight = _per_sample_vector(weight, int(loss.numel()))
+    return torch.sum(loss * weight) / torch.clamp(torch.sum(weight), min=1e-6)
 
 
 def _masked_weighted_ce(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    active = mask.reshape(-1) * weight.reshape(-1)
     loss = nn.functional.cross_entropy(logits, target.long(), reduction="none")
+    active = _per_sample_vector(mask, int(loss.numel())) * _per_sample_vector(weight, int(loss.numel()))
     return torch.sum(loss * active) / torch.clamp(torch.sum(active), min=1e-6)
 
 

@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from .data import STOP_REASON_NAMES, STOP_STATE_NAMES, Teach2DriveIndexDataset
 from .layout_conditioning import FiLMLayoutAdapter
 from .model import ConvEncoder, count_trainable_parameters
-from .train_adapter import _masked_weighted_ce, _weighted_mean
+from .train_adapter import _masked_weighted_ce, _per_sample_vector, _weighted_mean
 from .train_transfuserpp_cached_adapter import _split_by_episode
 from .transfuserpp_adapter_model import TransFuserPPResidualHeads
 
@@ -287,22 +287,19 @@ def _speed_region(pred: torch.Tensor, speed_dim: int):
 
 
 def _moving_mask(scalar: torch.Tensor, target: torch.Tensor, base_target: torch.Tensor, speed_dim: int, threshold: float) -> torch.Tensor:
+    batch_size = int(target.shape[0])
     traj_dim, target_speed = _speed_region(target, speed_dim)
     base_speed = base_target[:, traj_dim : traj_dim + int(speed_dim)]
     current_speed = scalar[:, :1].abs() if scalar.shape[1] else torch.zeros_like(target_speed[:, :1])
     target_speed_max = target_speed.abs().amax(dim=1, keepdim=True)
     base_speed_max = base_speed.abs().amax(dim=1, keepdim=True)
-    return ((target_speed_max > threshold) | (base_speed_max > threshold) | (current_speed > threshold)).reshape(-1)
+    mask = ((target_speed_max > threshold) | (base_speed_max > threshold) | (current_speed > threshold)).to(dtype=target.dtype)
+    return _per_sample_vector(mask, batch_size, reduce="any").bool()
 
 
 def _effective_weight(weight: torch.Tensor, moving: torch.Tensor, args) -> torch.Tensor:
-    if weight.ndim > 1:
-        weight = weight.reshape(weight.shape[0], -1).mean(dim=1)
-    else:
-        weight = weight.reshape(-1)
     moving = moving.reshape(-1).bool()
-    if weight.shape[0] != moving.shape[0]:
-        raise ValueError(f"sample weight batch mismatch: weight={tuple(weight.shape)} moving={tuple(moving.shape)}")
+    weight = _per_sample_vector(weight, int(moving.numel()))
     moving_scale = torch.where(
         moving,
         torch.full_like(weight, float(args.moving_sample_weight)),
@@ -396,6 +393,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         speed_target_blend = fallback_blend if args.teacher_speed_target_blend is None else float(args.teacher_speed_target_blend)
         stop_target_blend = fallback_blend if args.teacher_stop_target_blend is None else float(args.teacher_stop_target_blend)
         hazard = _hazard_reason_mask(stop_reason, stop_reason_mask, args.hazard_stop_reasons)
+        hazard = _per_sample_vector(hazard.to(dtype=target.dtype), int(target.shape[0]), reduce="any").bool()
         target_traj_flat = (
             (1.0 - traj_blend) * target[:, :traj_dim]
             + traj_blend * teacher_target[:, :traj_dim]
