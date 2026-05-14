@@ -58,7 +58,7 @@ def _merge_measurement_semantics(selected: Dict, measurement: Dict) -> None:
     if measurement.get("light_hazard") and "traffic_light" not in selected:
         selected["traffic_light"] = {
             "is_at_traffic_light": True,
-            "state": "Red",
+            "state": measurement.get("traffic_light_state") or "Red",
             "valid": True,
             "confidence": 1.0,
             "source": "carla_measurement_light_hazard",
@@ -73,7 +73,7 @@ def _merge_measurement_semantics(selected: Dict, measurement: Dict) -> None:
     if measurement.get("vehicle_hazard") and "front_vehicle" not in selected:
         selected["front_vehicle"] = {
             "valid": True,
-            "distance_m": 0.0,
+            "distance_m": measurement.get("vehicle_distance") if measurement.get("vehicle_distance") is not None else 0.0,
             "confidence": 1.0,
             "source": "carla_measurement_vehicle_hazard",
         }
