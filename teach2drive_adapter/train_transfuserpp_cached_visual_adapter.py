@@ -314,6 +314,19 @@ def _stop_loss_weight(target_stop: torch.Tensor, args) -> torch.Tensor:
     )
 
 
+def _hazard_reason_mask(stop_reason: torch.Tensor, stop_reason_mask: torch.Tensor, raw_names: str) -> torch.Tensor:
+    names = {item.strip() for item in raw_names.split(",") if item.strip()}
+    if not names:
+        return torch.zeros_like(stop_reason, dtype=torch.bool)
+    reason_ids = [idx for idx, name in enumerate(STOP_REASON_NAMES) if name in names]
+    if not reason_ids:
+        return torch.zeros_like(stop_reason, dtype=torch.bool)
+    hazard = torch.zeros_like(stop_reason, dtype=torch.bool)
+    for reason_id in reason_ids:
+        hazard = hazard | (stop_reason == int(reason_id))
+    return hazard & (stop_reason_mask > 0.5)
+
+
 def _apply_camera_dropout(camera: torch.Tensor, camera_names: Sequence[str], args) -> torch.Tensor:
     if not camera.requires_grad and not torch.is_grad_enabled():
         return camera
@@ -377,13 +390,18 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         traj_blend = fallback_blend if args.teacher_traj_blend is None else float(args.teacher_traj_blend)
         speed_target_blend = fallback_blend if args.teacher_speed_target_blend is None else float(args.teacher_speed_target_blend)
         stop_target_blend = fallback_blend if args.teacher_stop_target_blend is None else float(args.teacher_stop_target_blend)
+        hazard = _hazard_reason_mask(stop_reason, stop_reason_mask, args.hazard_stop_reasons)
         target_traj_flat = (
             (1.0 - traj_blend) * target[:, :traj_dim]
             + traj_blend * teacher_target[:, :traj_dim]
         )
+        speed_blend_tensor = torch.full_like(target[:, traj_dim : traj_dim + 1], speed_target_blend)
+        if float(args.hazard_speed_target_blend) >= 0.0:
+            hazard_speed_blend = torch.full_like(speed_blend_tensor, float(args.hazard_speed_target_blend))
+            speed_blend_tensor = torch.where(hazard.reshape(-1, 1), hazard_speed_blend, speed_blend_tensor)
         speed_supervision = (
-            (1.0 - speed_target_blend) * target[:, traj_dim : traj_dim + speed_dim]
-            + speed_target_blend * teacher_target[:, traj_dim : traj_dim + speed_dim]
+            (1.0 - speed_blend_tensor) * target[:, traj_dim : traj_dim + speed_dim]
+            + speed_blend_tensor * teacher_target[:, traj_dim : traj_dim + speed_dim]
         )
         stop_supervision = (
             (1.0 - stop_target_blend) * target[:, -1:]
@@ -392,6 +410,13 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         supervision_target = torch.cat([target_traj_flat, speed_supervision, stop_supervision], dim=1)
         moving = _moving_mask(scalar, supervision_target, base_target, speed_dim, float(args.moving_speed_threshold))
         effective_weight = _effective_weight(weight, moving, args)
+        if float(args.hazard_sample_weight) != 1.0:
+            hazard_weight = torch.where(
+                hazard,
+                torch.full_like(effective_weight, float(args.hazard_sample_weight)),
+                torch.ones_like(effective_weight),
+            )
+            effective_weight = effective_weight * hazard_weight
         with torch.set_grad_enabled(train):
             out = model(scalar, layout, base_target, checkpoint_flat, speed_logits, expected_speed, camera, lidar)
             pred = out["target"]
@@ -705,6 +730,9 @@ def train(args: argparse.Namespace) -> None:
                     "teacher_traj_blend": args.teacher_traj_blend,
                     "teacher_speed_target_blend": args.teacher_speed_target_blend,
                     "teacher_stop_target_blend": args.teacher_stop_target_blend,
+                    "hazard_stop_reasons": args.hazard_stop_reasons,
+                    "hazard_speed_target_blend": args.hazard_speed_target_blend,
+                    "hazard_sample_weight": args.hazard_sample_weight,
                     "speed_teacher_blend": args.speed_teacher_blend,
                     "speed_distill_loss_weight": args.speed_distill_loss_weight,
                     "speed_floor_loss_weight": args.speed_floor_loss_weight,
@@ -831,6 +859,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-traj-blend", type=float, default=None, help="Optional teacher blend for trajectory/yaw targets. Defaults to --teacher-target-blend.")
     parser.add_argument("--teacher-speed-target-blend", type=float, default=None, help="Optional teacher blend for speed targets. Defaults to --teacher-target-blend.")
     parser.add_argument("--teacher-stop-target-blend", type=float, default=None, help="Optional teacher blend for stop targets. Defaults to --teacher-target-blend.")
+    parser.add_argument("--hazard-stop-reasons", default="", help="Comma-separated stop_reason names whose speed targets should use --hazard-speed-target-blend.")
+    parser.add_argument("--hazard-speed-target-blend", type=float, default=-1.0, help="Teacher speed blend used on hazard frames. Negative disables hazard-conditional speed targets.")
+    parser.add_argument("--hazard-sample-weight", type=float, default=1.0, help="Extra sample weight multiplier for frames matching --hazard-stop-reasons.")
     parser.add_argument("--moving-speed-threshold", type=float, default=1.0)
     parser.add_argument("--moving-sample-weight", type=float, default=1.0)
     parser.add_argument("--stopped-sample-weight", type=float, default=1.0)
