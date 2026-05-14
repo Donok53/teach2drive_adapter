@@ -18,6 +18,7 @@ TRAFFIC_VEHICLES=${TRAFFIC_VEHICLES:-60}
 GLOBAL_DISTANCE_TO_LEADING_VEHICLE=${GLOBAL_DISTANCE_TO_LEADING_VEHICLE:-2.5}
 GLOBAL_SPEED_DIFFERENCE=${GLOBAL_SPEED_DIFFERENCE:-0.0}
 IGNORE_LIGHTS_PERCENT=${IGNORE_LIGHTS_PERCENT:-0.0}
+VEHICLE_FILTER=${VEHICLE_FILTER:-vehicle.tesla.model3}
 MIN_MOVING_SPEED_MPS=${MIN_MOVING_SPEED_MPS:-1.0}
 MIN_MOVING_RATIO=${MIN_MOVING_RATIO:-0.20}
 MIN_PATH_LENGTH_M=${MIN_PATH_LENGTH_M:-100.0}
@@ -60,6 +61,7 @@ python -m teach2drive_adapter.collect_transfuserpp_dataset \
   --hz 20 \
   --save-every-n 5 \
   --traffic-vehicles "$TRAFFIC_VEHICLES" \
+  --vehicle-filter "$VEHICLE_FILTER" \
   --global-distance-to-leading-vehicle "$GLOBAL_DISTANCE_TO_LEADING_VEHICLE" \
   --global-speed-difference "$GLOBAL_SPEED_DIFFERENCE" \
   --ignore-lights-percent "$IGNORE_LIGHTS_PERCENT" \
