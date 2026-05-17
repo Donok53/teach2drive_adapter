@@ -297,6 +297,14 @@ def _moving_mask(scalar: torch.Tensor, target: torch.Tensor, base_target: torch.
     return _per_sample_vector(mask, batch_size, reduce="any").bool()
 
 
+def _launch_mask(scalar: torch.Tensor, speed_target: torch.Tensor, current_threshold: float, future_threshold: float) -> torch.Tensor:
+    batch_size = int(speed_target.shape[0])
+    current_speed = scalar[:, :1].abs() if scalar.shape[1] else torch.zeros_like(speed_target[:, :1])
+    future_speed = speed_target.clamp_min(0.0).amax(dim=1, keepdim=True)
+    mask = ((current_speed <= float(current_threshold)) & (future_speed >= float(future_threshold))).to(dtype=speed_target.dtype)
+    return _per_sample_vector(mask, batch_size, reduce="any").bool()
+
+
 def _effective_weight(weight: torch.Tensor, moving: torch.Tensor, args) -> torch.Tensor:
     moving = moving.reshape(-1).bool()
     weight = _per_sample_vector(weight, int(moving.numel()))
@@ -357,6 +365,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         "speed": 0.0,
         "speed_distill": 0.0,
         "speed_floor": 0.0,
+        "launch_floor": 0.0,
         "speed_delta": 0.0,
         "speed_curvature": 0.0,
         "traj_delta": 0.0,
@@ -410,9 +419,24 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             (1.0 - stop_target_blend) * target[:, -1:]
             + stop_target_blend * teacher_target[:, -1:]
         )
+        launch = _launch_mask(
+            scalar,
+            speed_supervision,
+            float(args.launch_current_speed_threshold),
+            float(args.launch_target_speed_threshold),
+        )
+        if int(args.launch_stop_negative) != 0:
+            stop_supervision = torch.where(launch.reshape(-1, 1), torch.zeros_like(stop_supervision), stop_supervision)
         supervision_target = torch.cat([target_traj_flat, speed_supervision, stop_supervision], dim=1)
         moving = _moving_mask(scalar, supervision_target, base_target, speed_dim, float(args.moving_speed_threshold))
         effective_weight = _effective_weight(weight, moving, args)
+        if float(args.launch_sample_weight) != 1.0:
+            launch_weight = torch.where(
+                launch,
+                torch.full_like(effective_weight, float(args.launch_sample_weight)),
+                torch.ones_like(effective_weight),
+            )
+            effective_weight = effective_weight * launch_weight
         if float(args.hazard_sample_weight) != 1.0:
             hazard_weight = torch.where(
                 hazard,
@@ -459,6 +483,9 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             moving_float = moving.to(dtype=pred_speed.dtype)
             speed_floor_raw = torch.relu(float(args.speed_floor_mps) - pred_speed).mean(dim=1) * moving_float
             speed_floor_loss = _weighted_mean(speed_floor_raw, effective_weight)
+            launch_float = launch.to(dtype=pred_speed.dtype)
+            launch_floor_raw = torch.relu(float(args.launch_speed_floor_mps) - pred_speed).mean(dim=1) * launch_float
+            launch_floor_loss = _weighted_mean(launch_floor_raw, effective_weight)
             speed_delta_loss = zero
             speed_curvature_loss = zero
             if speed_dim > 1:
@@ -492,6 +519,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 + args.speed_loss_weight * speed_loss
                 + args.speed_distill_loss_weight * speed_distill_loss
                 + args.speed_floor_loss_weight * speed_floor_loss
+                + args.launch_speed_floor_loss_weight * launch_floor_loss
                 + args.speed_delta_loss_weight * speed_delta_loss
                 + args.speed_curvature_loss_weight * speed_curvature_loss
                 + args.traj_delta_loss_weight * traj_delta_loss
@@ -514,6 +542,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         totals["speed"] += float(speed_loss.detach().cpu()) * batch_size
         totals["speed_distill"] += float(speed_distill_loss.detach().cpu()) * batch_size
         totals["speed_floor"] += float(speed_floor_loss.detach().cpu()) * batch_size
+        totals["launch_floor"] += float(launch_floor_loss.detach().cpu()) * batch_size
         totals["speed_delta"] += float(speed_delta_loss.detach().cpu()) * batch_size
         totals["speed_curvature"] += float(speed_curvature_loss.detach().cpu()) * batch_size
         totals["traj_delta"] += float(traj_delta_loss.detach().cpu()) * batch_size
@@ -532,6 +561,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 f"xy={totals['xy']/totals['samples']:.6f} "
                 f"speed={totals['speed']/totals['samples']:.6f} "
                 f"floor={totals['speed_floor']/totals['samples']:.6f} "
+                f"launch={totals['launch_floor']/totals['samples']:.6f} "
                 f"sd={totals['speed_delta']/totals['samples']:.6f} "
                 f"moving={totals['moving_ratio']/totals['samples']:.3f} "
                 f"samples/s={totals['samples']/elapsed:.1f}",
@@ -740,6 +770,12 @@ def train(args: argparse.Namespace) -> None:
                     "speed_distill_loss_weight": args.speed_distill_loss_weight,
                     "speed_floor_loss_weight": args.speed_floor_loss_weight,
                     "speed_floor_mps": args.speed_floor_mps,
+                    "launch_current_speed_threshold": args.launch_current_speed_threshold,
+                    "launch_target_speed_threshold": args.launch_target_speed_threshold,
+                    "launch_sample_weight": args.launch_sample_weight,
+                    "launch_speed_floor_loss_weight": args.launch_speed_floor_loss_weight,
+                    "launch_speed_floor_mps": args.launch_speed_floor_mps,
+                    "launch_stop_negative": bool(args.launch_stop_negative),
                     "speed_delta_loss_weight": args.speed_delta_loss_weight,
                     "speed_curvature_loss_weight": args.speed_curvature_loss_weight,
                     "traj_delta_loss_weight": args.traj_delta_loss_weight,
@@ -875,6 +911,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speed-distill-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-floor-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-floor-mps", type=float, default=1.0)
+    parser.add_argument("--launch-current-speed-threshold", type=float, default=0.5, help="Current-speed upper bound for launch/recovery samples.")
+    parser.add_argument("--launch-target-speed-threshold", type=float, default=2.0, help="Future expert speed lower bound for launch/recovery samples.")
+    parser.add_argument("--launch-sample-weight", type=float, default=1.0, help="Extra sample weight multiplier for launch/recovery samples.")
+    parser.add_argument("--launch-speed-floor-loss-weight", type=float, default=0.0, help="Loss weight that prevents zero-speed predictions on launch/recovery samples.")
+    parser.add_argument("--launch-speed-floor-mps", type=float, default=2.0)
+    parser.add_argument("--launch-stop-negative", type=int, default=0, help="When nonzero, train launch/recovery samples as non-stop even if pseudo stop labels say stop.")
     parser.add_argument("--speed-delta-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-curvature-loss-weight", type=float, default=0.0)
     parser.add_argument("--traj-delta-loss-weight", type=float, default=0.0)
