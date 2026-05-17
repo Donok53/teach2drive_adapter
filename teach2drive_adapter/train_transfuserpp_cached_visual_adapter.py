@@ -305,6 +305,13 @@ def _launch_mask(scalar: torch.Tensor, speed_target: torch.Tensor, current_thres
     return _per_sample_vector(mask, batch_size, reduce="any").bool()
 
 
+def _target_speed_mask(speed_target: torch.Tensor, threshold: float) -> torch.Tensor:
+    batch_size = int(speed_target.shape[0])
+    future_speed = speed_target.clamp_min(0.0).amax(dim=1, keepdim=True)
+    mask = (future_speed >= float(threshold)).to(dtype=speed_target.dtype)
+    return _per_sample_vector(mask, batch_size, reduce="any").bool()
+
+
 def _effective_weight(weight: torch.Tensor, moving: torch.Tensor, args) -> torch.Tensor:
     moving = moving.reshape(-1).bool()
     weight = _per_sample_vector(weight, int(moving.numel()))
@@ -480,8 +487,13 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 torch.mean(nn.functional.smooth_l1_loss(pred_speed, base_speed.detach(), reduction="none"), dim=1),
                 effective_weight,
             )
-            moving_float = moving.to(dtype=pred_speed.dtype)
-            speed_floor_raw = torch.relu(float(args.speed_floor_mps) - pred_speed).mean(dim=1) * moving_float
+            target_go = _target_speed_mask(speed_target, float(args.speed_floor_target_threshold))
+            if args.speed_floor_mask == "target":
+                speed_floor_mask = target_go
+            else:
+                speed_floor_mask = moving
+            speed_floor_mask_float = speed_floor_mask.to(dtype=pred_speed.dtype)
+            speed_floor_raw = torch.relu(float(args.speed_floor_mps) - pred_speed).mean(dim=1) * speed_floor_mask_float
             speed_floor_loss = _weighted_mean(speed_floor_raw, effective_weight)
             launch_float = launch.to(dtype=pred_speed.dtype)
             launch_floor_raw = torch.relu(float(args.launch_speed_floor_mps) - pred_speed).mean(dim=1) * launch_float
@@ -770,6 +782,8 @@ def train(args: argparse.Namespace) -> None:
                     "speed_distill_loss_weight": args.speed_distill_loss_weight,
                     "speed_floor_loss_weight": args.speed_floor_loss_weight,
                     "speed_floor_mps": args.speed_floor_mps,
+                    "speed_floor_mask": args.speed_floor_mask,
+                    "speed_floor_target_threshold": args.speed_floor_target_threshold,
                     "launch_current_speed_threshold": args.launch_current_speed_threshold,
                     "launch_target_speed_threshold": args.launch_target_speed_threshold,
                     "launch_sample_weight": args.launch_sample_weight,
@@ -911,6 +925,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speed-distill-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-floor-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-floor-mps", type=float, default=1.0)
+    parser.add_argument("--speed-floor-mask", choices=("moving", "target"), default="moving", help="Use base-aware moving mask or expert target-speed mask for speed floor loss.")
+    parser.add_argument("--speed-floor-target-threshold", type=float, default=2.0, help="Future speed threshold used when --speed-floor-mask=target.")
     parser.add_argument("--launch-current-speed-threshold", type=float, default=0.5, help="Current-speed upper bound for launch/recovery samples.")
     parser.add_argument("--launch-target-speed-threshold", type=float, default=2.0, help="Future expert speed lower bound for launch/recovery samples.")
     parser.add_argument("--launch-sample-weight", type=float, default=1.0, help="Extra sample weight multiplier for launch/recovery samples.")
