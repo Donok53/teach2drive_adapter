@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 # preset fine-tunes from v5 and explicitly upweights stop_state=release_go.
 
 export DATA_ROOT=${DATA_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_vehicle_b_front_triplet_town13_target_3h"}
-export WORK_ROOT=${WORK_ROOT:-"$HOME/teach2drive/runs/tfpp_vehicle_b_front_triplet_expert_v1"}
+export WORK_ROOT=${WORK_ROOT:-"$HOME/teach2drive/runs/tfpp_vehicle_b_front_triplet_town13_expert_v1"}
 export OUT=${OUT:-"$HOME/teach2drive/runs/tfpp_vehicle_b_front_triplet_town13_expert_v6_release_recovery/train_front_triplet_shifted_town13_expert_v6_release_recovery"}
 export INIT_CHECKPOINT=${INIT_CHECKPOINT:-"$HOME/teach2drive/runs/tfpp_vehicle_b_front_triplet_town13_expert_v5_launch_nobrake/train_front_triplet_shifted_town13_expert_v5_launch_nobrake/best_model.pt"}
 
