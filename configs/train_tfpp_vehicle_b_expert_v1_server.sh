@@ -165,6 +165,9 @@ TRAIN_ARGS=()
 if [[ "$DATA_PARALLEL" == "1" ]]; then
   TRAIN_ARGS+=(--data-parallel)
 fi
+if [[ -n "${EVAL_ONLY_CHECKPOINT:-}" ]]; then
+  TRAIN_ARGS+=(--eval-only-checkpoint "$EVAL_ONLY_CHECKPOINT")
+fi
 
 echo "=== train B-vehicle expert adapter"
 PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_cached_visual_adapter \

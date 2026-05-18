@@ -620,6 +620,17 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
     teacher_speeds = []
     base_speeds = []
     control_errors = []
+    decision_pred_speeds = []
+    decision_target_speeds = []
+    decision_target_future_speeds = []
+    decision_current_speeds = []
+    decision_stop_probs = []
+    decision_stop_targets = []
+    decision_stop_reasons = []
+    decision_stop_reason_masks = []
+    decision_control_preds = []
+    decision_control_targets = []
+    decision_control_masks = []
     moving_total = 0
     sample_total = 0
     with torch.no_grad():
@@ -663,6 +674,16 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
             target_speed = target[:, traj_dim : traj_dim + int(speed_dim)]
             teacher_speed = teacher_target[:, traj_dim : traj_dim + int(speed_dim)]
             base_speed = base_target[:, traj_dim : traj_dim + int(speed_dim)]
+            decision_idx = min(1, int(speed_dim) - 1)
+            decision_pred_speeds.append(pred_speed[:, decision_idx].cpu().numpy())
+            decision_target_speeds.append(target_speed[:, decision_idx].cpu().numpy())
+            decision_target_future_speeds.append(target_speed.clamp_min(0.0).amax(dim=1).cpu().numpy())
+            current_speed = scalar[:, :1].abs() if scalar.shape[1] else torch.zeros_like(target_speed[:, :1])
+            decision_current_speeds.append(current_speed.reshape(-1).cpu().numpy())
+            decision_stop_probs.append(torch.sigmoid(pred[:, -1]).cpu().numpy())
+            decision_stop_targets.append(stop_target.cpu().numpy())
+            decision_stop_reasons.append(stop_reason.cpu().numpy())
+            decision_stop_reason_masks.append(stop_reason_mask.cpu().numpy())
             speed_errors.append(torch.mean(torch.abs(pred_speed - target_speed), dim=1).cpu().numpy())
             teacher_speed_errors.append(torch.mean(torch.abs(pred_speed - teacher_speed), dim=1).cpu().numpy())
             if int(speed_dim) > 1:
@@ -677,8 +698,12 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
             target_speeds.append(target_speed.mean(dim=1).cpu().numpy())
             teacher_speeds.append(teacher_speed.mean(dim=1).cpu().numpy())
             base_speeds.append(base_speed.mean(dim=1).cpu().numpy())
-            if "control" in out and torch.any(control_mask):
-                control_errors.append(torch.abs(out["control"][control_mask] - control_target[control_mask]).cpu().numpy())
+            if "control" in out:
+                if torch.any(control_mask):
+                    control_errors.append(torch.abs(out["control"][control_mask] - control_target[control_mask]).cpu().numpy())
+                decision_control_preds.append(out["control"].cpu().numpy())
+                decision_control_targets.append(control_target.cpu().numpy())
+                decision_control_masks.append(control_mask.cpu().numpy())
             moving = _moving_mask(scalar, target, base_target, int(speed_dim), float(moving_speed_threshold))
             moving_total += int(moving.sum().cpu())
             sample_total += int(moving.numel())
@@ -709,6 +734,102 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
         metrics["moving_ratio_eval"] = float(moving_total / max(sample_total, 1))
     if control_errors:
         metrics["control_mae_steer_throttle_brake"] = np.mean(np.concatenate(control_errors, axis=0), axis=0).astype(float).tolist()
+    if decision_pred_speeds:
+        pred_v = np.concatenate(decision_pred_speeds, axis=0)
+        target_v = np.concatenate(decision_target_speeds, axis=0)
+        target_future_v = np.concatenate(decision_target_future_speeds, axis=0)
+        current_v = np.concatenate(decision_current_speeds, axis=0)
+        stop_prob = np.concatenate(decision_stop_probs, axis=0)
+        stop_target_np = np.concatenate(decision_stop_targets, axis=0).astype(bool)
+        stop_reason_np = np.concatenate(decision_stop_reasons, axis=0).astype(int)
+        stop_reason_mask_np = np.concatenate(decision_stop_reason_masks, axis=0).astype(bool)
+
+        def _condition_metrics(mask) -> Dict:
+            mask = np.asarray(mask, dtype=bool)
+            support = int(mask.sum())
+            if support <= 0:
+                return {"support": 0}
+            pred_sel = pred_v[mask]
+            target_sel = target_v[mask]
+            stop_sel = stop_prob[mask]
+            return {
+                "support": support,
+                "speed_mae_mps": float(np.mean(np.abs(pred_sel - target_sel))),
+                "pred_speed_mean_mps": float(np.mean(pred_sel)),
+                "target_speed_mean_mps": float(np.mean(target_sel)),
+                "pred_zero_rate": float(np.mean(pred_sel < 0.5)),
+                "pred_go_rate": float(np.mean(pred_sel > 2.0)),
+                "stop_prob_mean": float(np.mean(stop_sel)),
+                "stop_prob_positive_rate": float(np.mean(stop_sel >= 0.5)),
+            }
+
+        target_go = target_future_v >= 2.0
+        target_stop = (target_future_v < 0.5) | stop_target_np
+        launch = (current_v <= 0.8) & target_go
+        rolling_go = (current_v > 1.0) & target_go
+        low_speed = current_v <= 1.0
+        traffic_light = stop_reason_mask_np & (stop_reason_np == STOP_REASON_NAMES.index("traffic_light"))
+        stop_sign = stop_reason_mask_np & (stop_reason_np == STOP_REASON_NAMES.index("stop_sign"))
+        front_vehicle = stop_reason_mask_np & (stop_reason_np == STOP_REASON_NAMES.index("front_vehicle"))
+        junction_yield = stop_reason_mask_np & (stop_reason_np == STOP_REASON_NAMES.index("junction_yield"))
+
+        decision_metrics = {
+            "thresholds": {
+                "go_future_speed_mps": 2.0,
+                "stop_future_speed_mps": 0.5,
+                "launch_current_speed_mps": 0.8,
+                "pred_zero_speed_mps": 0.5,
+                "pred_go_speed_mps": 2.0,
+            },
+            "all": _condition_metrics(np.ones_like(target_go, dtype=bool)),
+            "target_go": _condition_metrics(target_go),
+            "target_stop_or_wait": _condition_metrics(target_stop),
+            "launch_from_slow": _condition_metrics(launch),
+            "rolling_go": _condition_metrics(rolling_go),
+            "low_current_speed": _condition_metrics(low_speed),
+            "traffic_light": _condition_metrics(traffic_light),
+            "stop_sign": _condition_metrics(stop_sign),
+            "front_vehicle": _condition_metrics(front_vehicle),
+            "junction_yield": _condition_metrics(junction_yield),
+            "false_stop_rate_on_go": float(np.mean(pred_v[target_go] < 0.5)) if np.any(target_go) else None,
+            "false_go_rate_on_stop": float(np.mean(pred_v[target_stop] > 2.0)) if np.any(target_stop) else None,
+            "false_stop_rate_on_launch": float(np.mean(pred_v[launch] < 0.5)) if np.any(launch) else None,
+            "stop_prob_false_stop_rate_on_go": float(np.mean(stop_prob[target_go] >= 0.5)) if np.any(target_go) else None,
+            "stop_prob_false_go_rate_on_stop": float(np.mean(stop_prob[target_stop] < 0.5)) if np.any(target_stop) else None,
+        }
+        if decision_control_preds:
+            control_pred = np.concatenate(decision_control_preds, axis=0)
+            control_target = np.concatenate(decision_control_targets, axis=0)
+            control_mask = np.concatenate(decision_control_masks, axis=0).astype(bool)
+
+            def _control_metrics(mask) -> Dict:
+                mask = np.asarray(mask, dtype=bool) & control_mask
+                support = int(mask.sum())
+                if support <= 0:
+                    return {"support": 0}
+                pred_sel = control_pred[mask]
+                target_sel = control_target[mask]
+                mae = np.mean(np.abs(pred_sel - target_sel), axis=0)
+                brake_required = target_sel[:, 2] >= 0.5
+                no_brake = target_sel[:, 2] < 0.1
+                throttle_required = target_sel[:, 1] >= 0.1
+                return {
+                    "support": support,
+                    "mae_steer_throttle_brake": mae.astype(float).tolist(),
+                    "brake_miss_rate_given_required": float(np.mean(pred_sel[brake_required, 2] < 0.5)) if np.any(brake_required) else None,
+                    "false_brake_rate_given_no_brake": float(np.mean(pred_sel[no_brake, 2] >= 0.5)) if np.any(no_brake) else None,
+                    "throttle_miss_rate_given_required": float(np.mean(pred_sel[throttle_required, 1] < 0.05)) if np.any(throttle_required) else None,
+                }
+
+            decision_metrics["control"] = {
+                "all": _control_metrics(np.ones_like(target_go, dtype=bool)),
+                "target_go": _control_metrics(target_go),
+                "target_stop_or_wait": _control_metrics(target_stop),
+                "launch_from_slow": _control_metrics(launch),
+                "traffic_light": _control_metrics(traffic_light),
+                "stop_sign": _control_metrics(stop_sign),
+            }
+        metrics["decision_critical"] = decision_metrics
     return metrics
 
 
@@ -777,6 +898,25 @@ def train(args: argparse.Namespace) -> None:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
         model = nn.DataParallel(model)
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    if args.eval_only_checkpoint:
+        checkpoint_path = Path(args.eval_only_checkpoint).expanduser()
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        missing, unexpected = raw_model.load_state_dict(checkpoint["model_state"], strict=False)
+        raw_model.to(device)
+        metrics = _evaluate_predictions(raw_model, val_loader, device, speed_dim=args.speed_dim, moving_speed_threshold=args.moving_speed_threshold)
+        metrics.update(
+            {
+                "mode": "transfuserpp_cached_visual_bev_adapter",
+                "eval_only_checkpoint": str(checkpoint_path),
+                "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
+                "checkpoint_val_loss": float(checkpoint.get("val_loss", float("nan"))),
+                "missing_keys": len(missing),
+                "unexpected_keys": len(unexpected),
+            }
+        )
+        (out_dir / "metrics_eval.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        print(json.dumps(metrics, indent=2), flush=True)
+        return
     optimizer = torch.optim.AdamW([param for param in model.parameters() if param.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     print(
@@ -978,6 +1118,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--step-log-every", type=int, default=50)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--eval-only-checkpoint", default="", help="Load a trained checkpoint, run validation metrics, and exit without training.")
     return parser
 
 
