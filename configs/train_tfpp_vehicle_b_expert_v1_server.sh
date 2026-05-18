@@ -165,8 +165,10 @@ TRAIN_ARGS=()
 if [[ "$DATA_PARALLEL" == "1" ]]; then
   TRAIN_ARGS+=(--data-parallel)
 fi
+TRAIN_LOG=train.log
 if [[ -n "${EVAL_ONLY_CHECKPOINT:-}" ]]; then
   TRAIN_ARGS+=(--eval-only-checkpoint "$EVAL_ONLY_CHECKPOINT")
+  TRAIN_LOG=eval.log
 fi
 
 echo "=== train B-vehicle expert adapter"
@@ -234,4 +236,4 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_cached_visual
   --stop-negative-loss-scale "$STOP_NEGATIVE_LOSS_SCALE" \
   --stop-loss-after-epoch "$STOP_LOSS_AFTER_EPOCH" \
   "${TRAIN_ARGS[@]}" \
-  2>&1 | tee "$OUT/train.log"
+  2>&1 | tee "$OUT/$TRAIN_LOG"
