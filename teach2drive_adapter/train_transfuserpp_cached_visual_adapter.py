@@ -312,6 +312,15 @@ def _launch_mask(scalar: torch.Tensor, speed_target: torch.Tensor, current_thres
     return _per_sample_vector(mask, batch_size, reduce="any").bool()
 
 
+def _release_mask(stop_state: torch.Tensor, speed_target: torch.Tensor, future_threshold: float) -> torch.Tensor:
+    release_id = int(STOP_STATE_NAMES.index("release_go"))
+    batch_size = int(speed_target.shape[0])
+    future_speed = speed_target.clamp_min(0.0).amax(dim=1, keepdim=True)
+    state = stop_state.reshape(-1, 1)
+    mask = ((state == release_id) & (future_speed >= float(future_threshold))).to(dtype=speed_target.dtype)
+    return _per_sample_vector(mask, batch_size, reduce="any").bool()
+
+
 def _target_speed_mask(speed_target: torch.Tensor, threshold: float) -> torch.Tensor:
     batch_size = int(speed_target.shape[0])
     future_speed = speed_target.clamp_min(0.0).amax(dim=1, keepdim=True)
@@ -380,6 +389,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         "speed_distill": 0.0,
         "speed_floor": 0.0,
         "launch_floor": 0.0,
+        "release_floor": 0.0,
         "speed_delta": 0.0,
         "speed_curvature": 0.0,
         "traj_delta": 0.0,
@@ -389,6 +399,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         "control_brake_fp": 0.0,
         "control_launch_brake_fp": 0.0,
         "control_launch_throttle": 0.0,
+        "control_release_brake_fp": 0.0,
+        "control_release_throttle": 0.0,
         "stop": 0.0,
         "state": 0.0,
         "reason": 0.0,
@@ -445,8 +457,14 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             float(args.launch_current_speed_threshold),
             float(args.launch_target_speed_threshold),
         )
-        if int(args.launch_stop_negative) != 0:
-            stop_supervision = torch.where(launch.reshape(-1, 1), torch.zeros_like(stop_supervision), stop_supervision)
+        release = _release_mask(stop_state, speed_supervision, float(args.release_target_speed_threshold))
+        if int(args.launch_stop_negative) != 0 or int(args.release_stop_negative) != 0:
+            non_stop = torch.zeros_like(stop_supervision, dtype=torch.bool)
+            if int(args.launch_stop_negative) != 0:
+                non_stop = non_stop | launch.reshape(-1, 1)
+            if int(args.release_stop_negative) != 0:
+                non_stop = non_stop | release.reshape(-1, 1)
+            stop_supervision = torch.where(non_stop, torch.zeros_like(stop_supervision), stop_supervision)
         supervision_target = torch.cat([target_traj_flat, speed_supervision, stop_supervision], dim=1)
         moving = _moving_mask(scalar, supervision_target, base_target, speed_dim, float(args.moving_speed_threshold))
         effective_weight = _effective_weight(weight, moving, args)
@@ -457,6 +475,13 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 torch.ones_like(effective_weight),
             )
             effective_weight = effective_weight * launch_weight
+        if float(args.release_sample_weight) != 1.0:
+            release_weight = torch.where(
+                release,
+                torch.full_like(effective_weight, float(args.release_sample_weight)),
+                torch.ones_like(effective_weight),
+            )
+            effective_weight = effective_weight * release_weight
         if float(args.hazard_sample_weight) != 1.0:
             hazard_weight = torch.where(
                 hazard,
@@ -511,6 +536,9 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             launch_float = launch.to(dtype=pred_speed.dtype)
             launch_floor_raw = torch.relu(float(args.launch_speed_floor_mps) - pred_speed).mean(dim=1) * launch_float
             launch_floor_loss = _weighted_mean(launch_floor_raw, effective_weight)
+            release_float = release.to(dtype=pred_speed.dtype)
+            release_floor_raw = torch.relu(float(args.release_speed_floor_mps) - pred_speed).mean(dim=1) * release_float
+            release_floor_loss = _weighted_mean(release_floor_raw, effective_weight)
             speed_delta_loss = zero
             speed_curvature_loss = zero
             if speed_dim > 1:
@@ -539,6 +567,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             control_brake_fp_loss = zero
             control_launch_brake_fp_loss = zero
             control_launch_throttle_loss = zero
+            control_release_brake_fp_loss = zero
+            control_release_throttle_loss = zero
             if "control" in out and control_target.shape[1] > 0:
                 control_raw = torch.mean(nn.functional.smooth_l1_loss(out["control"], control_target, reduction="none"), dim=1)
                 control_active = _per_sample_vector(control_mask, int(control_raw.numel())) * effective_weight
@@ -547,6 +577,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 no_brake_target = control_target[:, 2] <= float(args.control_no_brake_target_threshold)
                 go_no_brake = target_go.bool() & control_mask_vec & no_brake_target
                 launch_no_brake = launch.bool() & control_mask_vec & no_brake_target
+                release_no_brake = release.bool() & control_mask_vec & no_brake_target
                 pred_throttle = out["control"][:, 1]
                 pred_brake = out["control"][:, 2]
                 brake_excess = torch.relu(pred_brake - float(args.control_brake_off_max))
@@ -565,6 +596,16 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                     torch.sum(effective_weight * launch_no_brake.to(dtype=effective_weight.dtype)),
                     min=1e-6,
                 )
+                control_release_brake_fp_loss = torch.sum(brake_fp_raw * effective_weight * release_no_brake.to(dtype=effective_weight.dtype)) / torch.clamp(
+                    torch.sum(effective_weight * release_no_brake.to(dtype=effective_weight.dtype)),
+                    min=1e-6,
+                )
+                release_throttle_shortfall = torch.relu(float(args.control_release_throttle_floor) - pred_throttle)
+                release_throttle_raw = release_throttle_shortfall * release_throttle_shortfall
+                control_release_throttle_loss = torch.sum(release_throttle_raw * effective_weight * release_no_brake.to(dtype=effective_weight.dtype)) / torch.clamp(
+                    torch.sum(effective_weight * release_no_brake.to(dtype=effective_weight.dtype)),
+                    min=1e-6,
+                )
             stop_loss_weight = float(args.stop_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             stop_state_loss_weight = float(args.stop_state_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             stop_reason_loss_weight = float(args.stop_reason_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
@@ -575,6 +616,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 + args.speed_distill_loss_weight * speed_distill_loss
                 + args.speed_floor_loss_weight * speed_floor_loss
                 + args.launch_speed_floor_loss_weight * launch_floor_loss
+                + args.release_speed_floor_loss_weight * release_floor_loss
                 + args.speed_delta_loss_weight * speed_delta_loss
                 + args.speed_curvature_loss_weight * speed_curvature_loss
                 + args.traj_delta_loss_weight * traj_delta_loss
@@ -584,6 +626,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 + args.control_brake_false_positive_loss_weight * control_brake_fp_loss
                 + args.control_launch_brake_false_positive_loss_weight * control_launch_brake_fp_loss
                 + args.control_launch_throttle_floor_loss_weight * control_launch_throttle_loss
+                + args.control_release_brake_false_positive_loss_weight * control_release_brake_fp_loss
+                + args.control_release_throttle_floor_loss_weight * control_release_throttle_loss
                 + stop_loss_weight * stop_loss
                 + stop_state_loss_weight * state_loss
                 + stop_reason_loss_weight * reason_loss
@@ -602,6 +646,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         totals["speed_distill"] += float(speed_distill_loss.detach().cpu()) * batch_size
         totals["speed_floor"] += float(speed_floor_loss.detach().cpu()) * batch_size
         totals["launch_floor"] += float(launch_floor_loss.detach().cpu()) * batch_size
+        totals["release_floor"] += float(release_floor_loss.detach().cpu()) * batch_size
         totals["speed_delta"] += float(speed_delta_loss.detach().cpu()) * batch_size
         totals["speed_curvature"] += float(speed_curvature_loss.detach().cpu()) * batch_size
         totals["traj_delta"] += float(traj_delta_loss.detach().cpu()) * batch_size
@@ -611,6 +656,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         totals["control_brake_fp"] += float(control_brake_fp_loss.detach().cpu()) * batch_size
         totals["control_launch_brake_fp"] += float(control_launch_brake_fp_loss.detach().cpu()) * batch_size
         totals["control_launch_throttle"] += float(control_launch_throttle_loss.detach().cpu()) * batch_size
+        totals["control_release_brake_fp"] += float(control_release_brake_fp_loss.detach().cpu()) * batch_size
+        totals["control_release_throttle"] += float(control_release_throttle_loss.detach().cpu()) * batch_size
         totals["stop"] += float(stop_loss.detach().cpu()) * batch_size
         totals["state"] += float(state_loss.detach().cpu()) * batch_size
         totals["reason"] += float(reason_loss.detach().cpu()) * batch_size
@@ -630,6 +677,9 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 f"brakefp={totals['control_brake_fp']/totals['samples']:.6f} "
                 f"launchbrake={totals['control_launch_brake_fp']/totals['samples']:.6f} "
                 f"launchthr={totals['control_launch_throttle']/totals['samples']:.6f} "
+                f"release={totals['release_floor']/totals['samples']:.6f} "
+                f"releasebrake={totals['control_release_brake_fp']/totals['samples']:.6f} "
+                f"releasethr={totals['control_release_throttle']/totals['samples']:.6f} "
                 f"moving={totals['moving_ratio']/totals['samples']:.3f} "
                 f"samples/s={totals['samples']/elapsed:.1f}",
                 flush=True,
@@ -920,6 +970,8 @@ def train(args: argparse.Namespace) -> None:
             args.control_brake_false_positive_loss_weight,
             args.control_launch_brake_false_positive_loss_weight,
             args.control_launch_throttle_floor_loss_weight,
+            args.control_release_brake_false_positive_loss_weight,
+            args.control_release_throttle_floor_loss_weight,
         )
     )
     control_dim = int(train_ds.control_dim) if control_objective_enabled else 0
@@ -944,6 +996,24 @@ def train(args: argparse.Namespace) -> None:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
         model = nn.DataParallel(model)
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    if args.init_checkpoint:
+        init_path = Path(args.init_checkpoint).expanduser()
+        checkpoint = torch.load(init_path, map_location="cpu")
+        missing, unexpected = raw_model.load_state_dict(checkpoint["model_state"], strict=False)
+        raw_model.to(device)
+        print(
+            json.dumps(
+                {
+                    "init_checkpoint": str(init_path),
+                    "init_epoch": int(checkpoint.get("epoch", -1)),
+                    "init_val_loss": float(checkpoint.get("val_loss", float("nan"))),
+                    "missing_keys": len(missing),
+                    "unexpected_keys": len(unexpected),
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
     if args.eval_only_checkpoint:
         checkpoint_path = Path(args.eval_only_checkpoint).expanduser()
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -1004,6 +1074,11 @@ def train(args: argparse.Namespace) -> None:
                     "launch_speed_floor_loss_weight": args.launch_speed_floor_loss_weight,
                     "launch_speed_floor_mps": args.launch_speed_floor_mps,
                     "launch_stop_negative": bool(args.launch_stop_negative),
+                    "release_target_speed_threshold": args.release_target_speed_threshold,
+                    "release_sample_weight": args.release_sample_weight,
+                    "release_speed_floor_loss_weight": args.release_speed_floor_loss_weight,
+                    "release_speed_floor_mps": args.release_speed_floor_mps,
+                    "release_stop_negative": bool(args.release_stop_negative),
                     "speed_delta_loss_weight": args.speed_delta_loss_weight,
                     "speed_curvature_loss_weight": args.speed_curvature_loss_weight,
                     "traj_delta_loss_weight": args.traj_delta_loss_weight,
@@ -1013,8 +1088,11 @@ def train(args: argparse.Namespace) -> None:
                     "control_brake_false_positive_loss_weight": args.control_brake_false_positive_loss_weight,
                     "control_launch_brake_false_positive_loss_weight": args.control_launch_brake_false_positive_loss_weight,
                     "control_launch_throttle_floor_loss_weight": args.control_launch_throttle_floor_loss_weight,
+                    "control_release_brake_false_positive_loss_weight": args.control_release_brake_false_positive_loss_weight,
+                    "control_release_throttle_floor_loss_weight": args.control_release_throttle_floor_loss_weight,
                     "control_brake_off_max": args.control_brake_off_max,
                     "control_launch_throttle_floor": args.control_launch_throttle_floor,
+                    "control_release_throttle_floor": args.control_release_throttle_floor,
                     "control_no_brake_target_threshold": args.control_no_brake_target_threshold,
                     "stop_loss_after_epoch": args.stop_loss_after_epoch,
                     "camera_dropout_prob": args.camera_dropout_prob,
@@ -1155,6 +1233,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--launch-speed-floor-loss-weight", type=float, default=0.0, help="Loss weight that prevents zero-speed predictions on launch/recovery samples.")
     parser.add_argument("--launch-speed-floor-mps", type=float, default=2.0)
     parser.add_argument("--launch-stop-negative", type=int, default=0, help="When nonzero, train launch/recovery samples as non-stop even if pseudo stop labels say stop.")
+    parser.add_argument("--release-target-speed-threshold", type=float, default=1.0, help="Future speed threshold for stop_state=release_go recovery samples.")
+    parser.add_argument("--release-sample-weight", type=float, default=1.0, help="Extra sample weight multiplier for stop_state=release_go samples.")
+    parser.add_argument("--release-speed-floor-loss-weight", type=float, default=0.0, help="Loss weight that prevents zero-speed predictions on stop_state=release_go samples.")
+    parser.add_argument("--release-speed-floor-mps", type=float, default=2.0)
+    parser.add_argument("--release-stop-negative", type=int, default=0, help="When nonzero, train stop_state=release_go samples as non-stop.")
     parser.add_argument("--speed-delta-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-curvature-loss-weight", type=float, default=0.0)
     parser.add_argument("--traj-delta-loss-weight", type=float, default=0.0)
@@ -1164,8 +1247,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-brake-false-positive-loss-weight", type=float, default=0.0, help="One-sided penalty for predicting brake on expert go/no-brake samples.")
     parser.add_argument("--control-launch-brake-false-positive-loss-weight", type=float, default=0.0, help="Extra one-sided brake false-positive penalty on launch/no-brake samples.")
     parser.add_argument("--control-launch-throttle-floor-loss-weight", type=float, default=0.0, help="Penalty for too little throttle on launch/no-brake samples.")
+    parser.add_argument("--control-release-brake-false-positive-loss-weight", type=float, default=0.0, help="Extra one-sided brake false-positive penalty on release_go/no-brake samples.")
+    parser.add_argument("--control-release-throttle-floor-loss-weight", type=float, default=0.0, help="Penalty for too little throttle on release_go/no-brake samples.")
     parser.add_argument("--control-brake-off-max", type=float, default=0.10, help="Predicted brake value allowed on go/no-brake samples before false-positive loss activates.")
     parser.add_argument("--control-launch-throttle-floor", type=float, default=0.20, help="Minimum predicted throttle encouraged on launch/no-brake samples.")
+    parser.add_argument("--control-release-throttle-floor", type=float, default=0.20, help="Minimum predicted throttle encouraged on release_go/no-brake samples.")
     parser.add_argument("--control-no-brake-target-threshold", type=float, default=0.10, help="Expert brake target threshold for selecting no-brake samples.")
     parser.add_argument("--stop-loss-weight", type=float, default=0.05)
     parser.add_argument("--stop-state-loss-weight", type=float, default=0.10)
@@ -1176,6 +1262,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--step-log-every", type=int, default=50)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--init-checkpoint", default="", help="Optional checkpoint used to initialize training before optimizer setup.")
     parser.add_argument("--eval-only-checkpoint", default="", help="Load a trained checkpoint, run validation metrics, and exit without training.")
     return parser
 
