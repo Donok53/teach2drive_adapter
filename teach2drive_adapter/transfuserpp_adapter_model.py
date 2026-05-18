@@ -14,7 +14,15 @@ from .transfuserpp_bridge import (
 
 
 class TransFuserPPResidualHeads(nn.Module):
-    def __init__(self, input_dim: int, target_dim: int, hidden_dim: int = 512, stop_state_classes: int = 4, stop_reason_classes: int = 8) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        target_dim: int,
+        hidden_dim: int = 512,
+        stop_state_classes: int = 4,
+        stop_reason_classes: int = 8,
+        control_dim: int = 0,
+    ) -> None:
         super().__init__()
         self.residual = nn.Sequential(
             nn.LayerNorm(input_dim),
@@ -26,15 +34,23 @@ class TransFuserPPResidualHeads(nn.Module):
         )
         self.stop_state = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, stop_state_classes))
         self.stop_reason = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, stop_reason_classes))
+        self.control = (
+            nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, int(control_dim)))
+            if int(control_dim) > 0
+            else None
+        )
         nn.init.zeros_(self.residual[-1].weight)
         nn.init.zeros_(self.residual[-1].bias)
 
     def forward(self, features: torch.Tensor, base_target: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return {
+        out = {
             "target": base_target + self.residual(features),
             "stop_state": self.stop_state(features),
             "stop_reason": self.stop_reason(features),
         }
+        if self.control is not None:
+            out["control"] = self.control(features)
+        return out
 
 
 class TransFuserPPResidualAdapterPolicy(nn.Module):
@@ -167,4 +183,3 @@ class TransFuserPPResidualAdapterPolicy(nn.Module):
 
     def extra_state(self) -> Dict:
         return {"transfuserpp_load_info": self.load_info}
-

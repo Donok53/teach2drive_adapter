@@ -130,6 +130,10 @@ class CachedVisualPriorDataset(Dataset):
             return 1
         return int(self.raw[0]["lidar"].shape[0])
 
+    @property
+    def control_dim(self) -> int:
+        return int(getattr(self.raw, "control_dim", 0))
+
     def __len__(self) -> int:
         return int(len(self.indices))
 
@@ -146,6 +150,8 @@ class CachedVisualPriorDataset(Dataset):
             "stop_state": raw["stop_state"],
             "stop_reason": raw["stop_reason"],
             "stop_reason_mask": raw["stop_reason_mask"],
+            "control_target": raw["control_target"],
+            "control_mask": raw["control_mask"],
             "sample_weight": raw["sample_weight"],
             "base_target": torch.from_numpy(self.base_target[cache_idx]),
             "checkpoint_flat": torch.from_numpy(self.checkpoint_flat[cache_idx]),
@@ -250,6 +256,7 @@ class CachedVisualTransFuserPPAdapterPolicy(nn.Module):
         visual_token_dim: int = 192,
         visual_layers: int = 2,
         visual_heads: int = 4,
+        control_dim: int = 0,
     ) -> None:
         super().__init__()
         self.visual = MultiSensorVisualEncoder(
@@ -262,7 +269,7 @@ class CachedVisualTransFuserPPAdapterPolicy(nn.Module):
         )
         self.feature_dim = scalar_dim + layout_dim + target_dim + checkpoint_dim + speed_classes + 1 + visual_dim
         self.layout_adapter = FiLMLayoutAdapter(feature_dim=self.feature_dim, layout_dim=layout_dim, hidden_dim=layout_hidden_dim)
-        self.heads = TransFuserPPResidualHeads(self.feature_dim, target_dim, hidden_dim=hidden_dim)
+        self.heads = TransFuserPPResidualHeads(self.feature_dim, target_dim, hidden_dim=hidden_dim, control_dim=control_dim)
 
     def forward(
         self,
@@ -378,6 +385,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         "traj_delta": 0.0,
         "traj_curvature": 0.0,
         "prior": 0.0,
+        "control": 0.0,
         "stop": 0.0,
         "state": 0.0,
         "reason": 0.0,
@@ -401,6 +409,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         stop_state = batch["stop_state"].to(device, non_blocking=True)
         stop_reason = batch["stop_reason"].to(device, non_blocking=True)
         stop_reason_mask = batch["stop_reason_mask"].to(device, non_blocking=True)
+        control_target = batch["control_target"].to(device, non_blocking=True)
+        control_mask = batch["control_mask"].to(device, non_blocking=True)
         weight = batch["sample_weight"].to(device, non_blocking=True)
         speed_dim = int(args.speed_dim)
         traj_dim = target.shape[1] - speed_dim - 1
@@ -522,6 +532,11 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 torch.mean(nn.functional.smooth_l1_loss(pred[:, : traj_dim + speed_dim], base_target[:, : traj_dim + speed_dim], reduction="none"), dim=1),
                 effective_weight,
             )
+            control_loss = zero
+            if "control" in out and control_target.shape[1] > 0:
+                control_raw = torch.mean(nn.functional.smooth_l1_loss(out["control"], control_target, reduction="none"), dim=1)
+                control_active = _per_sample_vector(control_mask, int(control_raw.numel())) * effective_weight
+                control_loss = torch.sum(control_raw * control_active) / torch.clamp(torch.sum(control_active), min=1e-6)
             stop_loss_weight = float(args.stop_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             stop_state_loss_weight = float(args.stop_state_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             stop_reason_loss_weight = float(args.stop_reason_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
@@ -537,6 +552,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 + args.traj_delta_loss_weight * traj_delta_loss
                 + args.traj_curvature_loss_weight * traj_curvature_loss
                 + args.prior_loss_weight * prior_loss
+                + args.control_loss_weight * control_loss
                 + stop_loss_weight * stop_loss
                 + stop_state_loss_weight * state_loss
                 + stop_reason_loss_weight * reason_loss
@@ -560,6 +576,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         totals["traj_delta"] += float(traj_delta_loss.detach().cpu()) * batch_size
         totals["traj_curvature"] += float(traj_curvature_loss.detach().cpu()) * batch_size
         totals["prior"] += float(prior_loss.detach().cpu()) * batch_size
+        totals["control"] += float(control_loss.detach().cpu()) * batch_size
         totals["stop"] += float(stop_loss.detach().cpu()) * batch_size
         totals["state"] += float(state_loss.detach().cpu()) * batch_size
         totals["reason"] += float(reason_loss.detach().cpu()) * batch_size
@@ -575,6 +592,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 f"floor={totals['speed_floor']/totals['samples']:.6f} "
                 f"launch={totals['launch_floor']/totals['samples']:.6f} "
                 f"sd={totals['speed_delta']/totals['samples']:.6f} "
+                f"control={totals['control']/totals['samples']:.6f} "
                 f"moving={totals['moving_ratio']/totals['samples']:.3f} "
                 f"samples/s={totals['samples']/elapsed:.1f}",
                 flush=True,
@@ -601,6 +619,7 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
     target_speeds = []
     teacher_speeds = []
     base_speeds = []
+    control_errors = []
     moving_total = 0
     sample_total = 0
     with torch.no_grad():
@@ -618,6 +637,8 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
             stop_state = batch["stop_state"].to(device, non_blocking=True)
             stop_reason = batch["stop_reason"].to(device, non_blocking=True)
             stop_reason_mask = batch["stop_reason_mask"].to(device, non_blocking=True).reshape(-1).bool()
+            control_target = batch["control_target"].to(device, non_blocking=True)
+            control_mask = batch["control_mask"].to(device, non_blocking=True).reshape(-1).bool()
             out = model(scalar, layout, base_target, checkpoint_flat, speed_logits, expected_speed, camera, lidar)
             pred = out["target"]
             stop_pred = (torch.sigmoid(pred[:, -1]) >= 0.5).long()
@@ -656,6 +677,8 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
             target_speeds.append(target_speed.mean(dim=1).cpu().numpy())
             teacher_speeds.append(teacher_speed.mean(dim=1).cpu().numpy())
             base_speeds.append(base_speed.mean(dim=1).cpu().numpy())
+            if "control" in out and torch.any(control_mask):
+                control_errors.append(torch.abs(out["control"][control_mask] - control_target[control_mask]).cpu().numpy())
             moving = _moving_mask(scalar, target, base_target, int(speed_dim), float(moving_speed_threshold))
             moving_total += int(moving.sum().cpu())
             sample_total += int(moving.numel())
@@ -684,6 +707,8 @@ def _evaluate_predictions(model, loader, device, speed_dim: int = 4, moving_spee
         metrics["teacher_speed_mean_mps"] = float(np.mean(np.concatenate(teacher_speeds, axis=0)))
         metrics["base_speed_mean_mps"] = float(np.mean(np.concatenate(base_speeds, axis=0)))
         metrics["moving_ratio_eval"] = float(moving_total / max(sample_total, 1))
+    if control_errors:
+        metrics["control_mae_steer_throttle_brake"] = np.mean(np.concatenate(control_errors, axis=0), axis=0).astype(float).tolist()
     return metrics
 
 
@@ -730,6 +755,7 @@ def train(args: argparse.Namespace) -> None:
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    control_dim = int(train_ds.control_dim) if float(args.control_loss_weight) > 0.0 else 0
     model = CachedVisualTransFuserPPAdapterPolicy(
         scalar_dim=train_ds.scalar_dim,
         layout_dim=train_ds.layout_dim,
@@ -744,6 +770,7 @@ def train(args: argparse.Namespace) -> None:
         visual_token_dim=args.visual_token_dim,
         visual_layers=args.visual_layers,
         visual_heads=args.visual_heads,
+        control_dim=control_dim,
     )
     model.to(device)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -766,6 +793,7 @@ def train(args: argparse.Namespace) -> None:
                 "cameras": cameras,
                 "image_size": list(args.image_size),
                 "lidar_size": args.lidar_size,
+                "control_dim": control_dim,
                 "use_raw_layout": bool(args.use_raw_layout),
                 "training_strategy": {
                     "moving_speed_threshold": args.moving_speed_threshold,
@@ -795,6 +823,7 @@ def train(args: argparse.Namespace) -> None:
                     "traj_delta_loss_weight": args.traj_delta_loss_weight,
                     "traj_curvature_loss_weight": args.traj_curvature_loss_weight,
                     "prior_loss_weight": args.prior_loss_weight,
+                    "control_loss_weight": args.control_loss_weight,
                     "stop_loss_after_epoch": args.stop_loss_after_epoch,
                     "camera_dropout_prob": args.camera_dropout_prob,
                     "front_camera_dropout_prob": args.front_camera_dropout_prob,
@@ -841,6 +870,7 @@ def train(args: argparse.Namespace) -> None:
                     "checkpoint_dim": int(train_ds.checkpoint_flat.shape[1]),
                     "speed_classes": int(train_ds.speed_logits.shape[1]),
                     "lidar_channels": train_ds.lidar_channels,
+                    "control_dim": control_dim,
                     "cameras": cameras,
                     "epoch": epoch,
                     "val_loss": best_val,
@@ -938,6 +968,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--traj-delta-loss-weight", type=float, default=0.0)
     parser.add_argument("--traj-curvature-loss-weight", type=float, default=0.0)
     parser.add_argument("--prior-loss-weight", type=float, default=0.0, help="Small regularizer toward the input prior from --cache.")
+    parser.add_argument("--control-loss-weight", type=float, default=0.0, help="Auxiliary SmoothL1 loss for expert [steer, throttle, brake] labels when present.")
     parser.add_argument("--stop-loss-weight", type=float, default=0.05)
     parser.add_argument("--stop-state-loss-weight", type=float, default=0.10)
     parser.add_argument("--stop-reason-loss-weight", type=float, default=0.02)

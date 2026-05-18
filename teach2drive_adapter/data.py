@@ -95,6 +95,8 @@ class Teach2DriveIndexDataset(Dataset):
         self.stop_state = arrays["stop_state_targets"].astype(np.int64) if "stop_state_targets" in arrays.files else np.zeros(sample_count, dtype=np.int64)
         self.stop_reason = arrays["stop_reason_targets"].astype(np.int64) if "stop_reason_targets" in arrays.files else np.zeros(sample_count, dtype=np.int64)
         self.stop_reason_mask = arrays["stop_reason_masks"].astype(np.float32).reshape(-1, 1) if "stop_reason_masks" in arrays.files else np.zeros((sample_count, 1), dtype=np.float32)
+        self.control = arrays["control_targets"].astype(np.float32) if "control_targets" in arrays.files else np.zeros((sample_count, 3), dtype=np.float32)
+        self.control_mask = arrays["control_masks"].astype(np.float32).reshape(-1, 1) if "control_masks" in arrays.files else np.zeros((sample_count, 1), dtype=np.float32)
         self.sample_weight = arrays["sample_weights"].astype(np.float32).reshape(-1, 1) if "sample_weights" in arrays.files else np.ones((sample_count, 1), dtype=np.float32)
 
         self.sample_episode = arrays["sample_episode_indices"].astype(np.int64)
@@ -123,6 +125,10 @@ class Teach2DriveIndexDataset(Dataset):
     @property
     def speed_dim(self) -> int:
         return int(self.speed.shape[1])
+
+    @property
+    def control_dim(self) -> int:
+        return int(self.control.shape[1])
 
     @property
     def target_dim(self) -> int:
@@ -166,6 +172,8 @@ class Teach2DriveIndexDataset(Dataset):
             "stop_state": torch.tensor(self.stop_state[idx], dtype=torch.long),
             "stop_reason": torch.tensor(self.stop_reason[idx], dtype=torch.long),
             "stop_reason_mask": torch.from_numpy(self.stop_reason_mask[idx]),
+            "control_target": torch.from_numpy(self.control[idx]),
+            "control_mask": torch.from_numpy(self.control_mask[idx]),
             "sample_weight": torch.from_numpy(self.sample_weight[idx]),
             "layout": torch.from_numpy(self.layouts[episode_idx]),
         }
