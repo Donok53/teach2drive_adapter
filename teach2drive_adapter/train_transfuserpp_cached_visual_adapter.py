@@ -390,6 +390,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         "speed_floor": 0.0,
         "launch_floor": 0.0,
         "release_floor": 0.0,
+        "stop_ceiling": 0.0,
+        "hazard_stop_ceiling": 0.0,
         "speed_delta": 0.0,
         "speed_curvature": 0.0,
         "traj_delta": 0.0,
@@ -401,6 +403,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         "control_launch_throttle": 0.0,
         "control_release_brake_fp": 0.0,
         "control_release_throttle": 0.0,
+        "control_brake_tp": 0.0,
+        "control_hazard_brake_tp": 0.0,
         "stop": 0.0,
         "state": 0.0,
         "reason": 0.0,
@@ -526,6 +530,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 effective_weight,
             )
             target_go = _target_speed_mask(speed_target, float(args.speed_floor_target_threshold))
+            target_stop = ~_target_speed_mask(speed_target, float(args.stop_speed_target_threshold))
+            hazard_stop = hazard & target_stop
             if args.speed_floor_mask == "target":
                 speed_floor_mask = target_go
             else:
@@ -533,6 +539,12 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             speed_floor_mask_float = speed_floor_mask.to(dtype=pred_speed.dtype)
             speed_floor_raw = torch.relu(float(args.speed_floor_mps) - pred_speed).mean(dim=1) * speed_floor_mask_float
             speed_floor_loss = _weighted_mean(speed_floor_raw, effective_weight)
+            stop_float = target_stop.to(dtype=pred_speed.dtype)
+            stop_ceiling_raw = torch.relu(pred_speed - float(args.stop_speed_ceiling_mps)).mean(dim=1) * stop_float
+            stop_ceiling_loss = _weighted_mean(stop_ceiling_raw, effective_weight)
+            hazard_stop_float = hazard_stop.to(dtype=pred_speed.dtype)
+            hazard_stop_ceiling_raw = torch.relu(pred_speed - float(args.stop_speed_ceiling_mps)).mean(dim=1) * hazard_stop_float
+            hazard_stop_ceiling_loss = _weighted_mean(hazard_stop_ceiling_raw, effective_weight)
             launch_float = launch.to(dtype=pred_speed.dtype)
             launch_floor_raw = torch.relu(float(args.launch_speed_floor_mps) - pred_speed).mean(dim=1) * launch_float
             launch_floor_loss = _weighted_mean(launch_floor_raw, effective_weight)
@@ -569,15 +581,20 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
             control_launch_throttle_loss = zero
             control_release_brake_fp_loss = zero
             control_release_throttle_loss = zero
+            control_brake_tp_loss = zero
+            control_hazard_brake_tp_loss = zero
             if "control" in out and control_target.shape[1] > 0:
                 control_raw = torch.mean(nn.functional.smooth_l1_loss(out["control"], control_target, reduction="none"), dim=1)
                 control_active = _per_sample_vector(control_mask, int(control_raw.numel())) * effective_weight
                 control_loss = torch.sum(control_raw * control_active) / torch.clamp(torch.sum(control_active), min=1e-6)
                 control_mask_vec = _per_sample_vector(control_mask, int(control_raw.numel())).bool()
                 no_brake_target = control_target[:, 2] <= float(args.control_no_brake_target_threshold)
+                brake_target = control_target[:, 2] >= float(args.control_brake_on_target_threshold)
                 go_no_brake = target_go.bool() & control_mask_vec & no_brake_target
                 launch_no_brake = launch.bool() & control_mask_vec & no_brake_target
                 release_no_brake = release.bool() & control_mask_vec & no_brake_target
+                stop_brake = target_stop.bool() & control_mask_vec & brake_target
+                hazard_stop_brake = hazard_stop.bool() & control_mask_vec & brake_target
                 pred_throttle = out["control"][:, 1]
                 pred_brake = out["control"][:, 2]
                 brake_excess = torch.relu(pred_brake - float(args.control_brake_off_max))
@@ -606,6 +623,16 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                     torch.sum(effective_weight * release_no_brake.to(dtype=effective_weight.dtype)),
                     min=1e-6,
                 )
+                brake_shortfall = torch.relu(float(args.control_brake_on_min) - pred_brake)
+                brake_tp_raw = brake_shortfall * brake_shortfall
+                control_brake_tp_loss = torch.sum(brake_tp_raw * effective_weight * stop_brake.to(dtype=effective_weight.dtype)) / torch.clamp(
+                    torch.sum(effective_weight * stop_brake.to(dtype=effective_weight.dtype)),
+                    min=1e-6,
+                )
+                control_hazard_brake_tp_loss = torch.sum(brake_tp_raw * effective_weight * hazard_stop_brake.to(dtype=effective_weight.dtype)) / torch.clamp(
+                    torch.sum(effective_weight * hazard_stop_brake.to(dtype=effective_weight.dtype)),
+                    min=1e-6,
+                )
             stop_loss_weight = float(args.stop_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             stop_state_loss_weight = float(args.stop_state_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
             stop_reason_loss_weight = float(args.stop_reason_loss_weight) if int(epoch) >= int(args.stop_loss_after_epoch) else 0.0
@@ -617,6 +644,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 + args.speed_floor_loss_weight * speed_floor_loss
                 + args.launch_speed_floor_loss_weight * launch_floor_loss
                 + args.release_speed_floor_loss_weight * release_floor_loss
+                + args.stop_speed_ceiling_loss_weight * stop_ceiling_loss
+                + args.hazard_stop_speed_ceiling_loss_weight * hazard_stop_ceiling_loss
                 + args.speed_delta_loss_weight * speed_delta_loss
                 + args.speed_curvature_loss_weight * speed_curvature_loss
                 + args.traj_delta_loss_weight * traj_delta_loss
@@ -628,6 +657,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 + args.control_launch_throttle_floor_loss_weight * control_launch_throttle_loss
                 + args.control_release_brake_false_positive_loss_weight * control_release_brake_fp_loss
                 + args.control_release_throttle_floor_loss_weight * control_release_throttle_loss
+                + args.control_brake_true_positive_loss_weight * control_brake_tp_loss
+                + args.control_hazard_brake_true_positive_loss_weight * control_hazard_brake_tp_loss
                 + stop_loss_weight * stop_loss
                 + stop_state_loss_weight * state_loss
                 + stop_reason_loss_weight * reason_loss
@@ -647,6 +678,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         totals["speed_floor"] += float(speed_floor_loss.detach().cpu()) * batch_size
         totals["launch_floor"] += float(launch_floor_loss.detach().cpu()) * batch_size
         totals["release_floor"] += float(release_floor_loss.detach().cpu()) * batch_size
+        totals["stop_ceiling"] += float(stop_ceiling_loss.detach().cpu()) * batch_size
+        totals["hazard_stop_ceiling"] += float(hazard_stop_ceiling_loss.detach().cpu()) * batch_size
         totals["speed_delta"] += float(speed_delta_loss.detach().cpu()) * batch_size
         totals["speed_curvature"] += float(speed_curvature_loss.detach().cpu()) * batch_size
         totals["traj_delta"] += float(traj_delta_loss.detach().cpu()) * batch_size
@@ -658,6 +691,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
         totals["control_launch_throttle"] += float(control_launch_throttle_loss.detach().cpu()) * batch_size
         totals["control_release_brake_fp"] += float(control_release_brake_fp_loss.detach().cpu()) * batch_size
         totals["control_release_throttle"] += float(control_release_throttle_loss.detach().cpu()) * batch_size
+        totals["control_brake_tp"] += float(control_brake_tp_loss.detach().cpu()) * batch_size
+        totals["control_hazard_brake_tp"] += float(control_hazard_brake_tp_loss.detach().cpu()) * batch_size
         totals["stop"] += float(stop_loss.detach().cpu()) * batch_size
         totals["state"] += float(state_loss.detach().cpu()) * batch_size
         totals["reason"] += float(reason_loss.detach().cpu()) * batch_size
@@ -678,8 +713,12 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int =
                 f"launchbrake={totals['control_launch_brake_fp']/totals['samples']:.6f} "
                 f"launchthr={totals['control_launch_throttle']/totals['samples']:.6f} "
                 f"release={totals['release_floor']/totals['samples']:.6f} "
+                f"stopceil={totals['stop_ceiling']/totals['samples']:.6f} "
+                f"hstopceil={totals['hazard_stop_ceiling']/totals['samples']:.6f} "
                 f"releasebrake={totals['control_release_brake_fp']/totals['samples']:.6f} "
                 f"releasethr={totals['control_release_throttle']/totals['samples']:.6f} "
+                f"braketp={totals['control_brake_tp']/totals['samples']:.6f} "
+                f"hbraketp={totals['control_hazard_brake_tp']/totals['samples']:.6f} "
                 f"moving={totals['moving_ratio']/totals['samples']:.3f} "
                 f"samples/s={totals['samples']/elapsed:.1f}",
                 flush=True,
@@ -972,6 +1011,8 @@ def train(args: argparse.Namespace) -> None:
             args.control_launch_throttle_floor_loss_weight,
             args.control_release_brake_false_positive_loss_weight,
             args.control_release_throttle_floor_loss_weight,
+            args.control_brake_true_positive_loss_weight,
+            args.control_hazard_brake_true_positive_loss_weight,
         )
     )
     control_dim = int(train_ds.control_dim) if control_objective_enabled else 0
@@ -1068,6 +1109,10 @@ def train(args: argparse.Namespace) -> None:
                     "speed_floor_mps": args.speed_floor_mps,
                     "speed_floor_mask": args.speed_floor_mask,
                     "speed_floor_target_threshold": args.speed_floor_target_threshold,
+                    "stop_speed_ceiling_loss_weight": args.stop_speed_ceiling_loss_weight,
+                    "hazard_stop_speed_ceiling_loss_weight": args.hazard_stop_speed_ceiling_loss_weight,
+                    "stop_speed_ceiling_mps": args.stop_speed_ceiling_mps,
+                    "stop_speed_target_threshold": args.stop_speed_target_threshold,
                     "launch_current_speed_threshold": args.launch_current_speed_threshold,
                     "launch_target_speed_threshold": args.launch_target_speed_threshold,
                     "launch_sample_weight": args.launch_sample_weight,
@@ -1090,7 +1135,11 @@ def train(args: argparse.Namespace) -> None:
                     "control_launch_throttle_floor_loss_weight": args.control_launch_throttle_floor_loss_weight,
                     "control_release_brake_false_positive_loss_weight": args.control_release_brake_false_positive_loss_weight,
                     "control_release_throttle_floor_loss_weight": args.control_release_throttle_floor_loss_weight,
+                    "control_brake_true_positive_loss_weight": args.control_brake_true_positive_loss_weight,
+                    "control_hazard_brake_true_positive_loss_weight": args.control_hazard_brake_true_positive_loss_weight,
                     "control_brake_off_max": args.control_brake_off_max,
+                    "control_brake_on_min": args.control_brake_on_min,
+                    "control_brake_on_target_threshold": args.control_brake_on_target_threshold,
                     "control_launch_throttle_floor": args.control_launch_throttle_floor,
                     "control_release_throttle_floor": args.control_release_throttle_floor,
                     "control_no_brake_target_threshold": args.control_no_brake_target_threshold,
@@ -1227,6 +1276,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speed-floor-mps", type=float, default=1.0)
     parser.add_argument("--speed-floor-mask", choices=("moving", "target"), default="moving", help="Use base-aware moving mask or expert target-speed mask for speed floor loss.")
     parser.add_argument("--speed-floor-target-threshold", type=float, default=2.0, help="Future speed threshold used when --speed-floor-mask=target.")
+    parser.add_argument("--stop-speed-ceiling-loss-weight", type=float, default=0.0, help="Penalty for predicting nonzero speed on stop/wait samples.")
+    parser.add_argument("--hazard-stop-speed-ceiling-loss-weight", type=float, default=0.0, help="Extra speed ceiling penalty on hazard stop/wait samples.")
+    parser.add_argument("--stop-speed-ceiling-mps", type=float, default=0.5)
+    parser.add_argument("--stop-speed-target-threshold", type=float, default=0.5, help="Future speed threshold below which samples are treated as stop/wait for speed ceiling.")
     parser.add_argument("--launch-current-speed-threshold", type=float, default=0.5, help="Current-speed upper bound for launch/recovery samples.")
     parser.add_argument("--launch-target-speed-threshold", type=float, default=2.0, help="Future expert speed lower bound for launch/recovery samples.")
     parser.add_argument("--launch-sample-weight", type=float, default=1.0, help="Extra sample weight multiplier for launch/recovery samples.")
@@ -1249,7 +1302,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-launch-throttle-floor-loss-weight", type=float, default=0.0, help="Penalty for too little throttle on launch/no-brake samples.")
     parser.add_argument("--control-release-brake-false-positive-loss-weight", type=float, default=0.0, help="Extra one-sided brake false-positive penalty on release_go/no-brake samples.")
     parser.add_argument("--control-release-throttle-floor-loss-weight", type=float, default=0.0, help="Penalty for too little throttle on release_go/no-brake samples.")
+    parser.add_argument("--control-brake-true-positive-loss-weight", type=float, default=0.0, help="Penalty for too little brake on expert brake-required stop samples.")
+    parser.add_argument("--control-hazard-brake-true-positive-loss-weight", type=float, default=0.0, help="Extra brake true-positive penalty on hazard stop samples.")
     parser.add_argument("--control-brake-off-max", type=float, default=0.10, help="Predicted brake value allowed on go/no-brake samples before false-positive loss activates.")
+    parser.add_argument("--control-brake-on-min", type=float, default=0.30, help="Minimum predicted brake encouraged on expert brake-required samples.")
+    parser.add_argument("--control-brake-on-target-threshold", type=float, default=0.20, help="Expert brake target threshold for selecting brake-required samples.")
     parser.add_argument("--control-launch-throttle-floor", type=float, default=0.20, help="Minimum predicted throttle encouraged on launch/no-brake samples.")
     parser.add_argument("--control-release-throttle-floor", type=float, default=0.20, help="Minimum predicted throttle encouraged on release_go/no-brake samples.")
     parser.add_argument("--control-no-brake-target-threshold", type=float, default=0.10, help="Expert brake target threshold for selecting no-brake samples.")
