@@ -60,6 +60,8 @@ DROPOUT=${DROPOUT:-0.0}
 FEATURE_LOSS_WEIGHT=${FEATURE_LOSS_WEIGHT:-1.0}
 COSINE_LOSS_WEIGHT=${COSINE_LOSS_WEIGHT:-0.05}
 RESIDUAL_LOSS_WEIGHT=${RESIDUAL_LOSS_WEIGHT:-0.01}
+DATA_PARALLEL=${DATA_PARALLEL:-0}
+TRAIN_ADAPTER=${TRAIN_ADAPTER:-1}
 
 mkdir -p "$WORK_ROOT" "$INDEX_DIR" "$FEATURE_CACHE_DIR" "$OUT"
 
@@ -173,7 +175,16 @@ else
     "${FEATURE_CACHE_ARGS[@]}"
 fi
 
+if [[ "$TRAIN_ADAPTER" != "1" && "$TRAIN_ADAPTER" != "true" && "$TRAIN_ADAPTER" != "TRUE" ]]; then
+  echo "=== skip fused feature adapter training; caches prepared"
+  exit 0
+fi
+
 echo "=== train fused feature adapter v1"
+TRAIN_ARGS=()
+if [[ "$DATA_PARALLEL" == "1" || "$DATA_PARALLEL" == "true" || "$DATA_PARALLEL" == "TRUE" ]]; then
+  TRAIN_ARGS+=(--data-parallel)
+fi
 PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_fused_feature_adapter \
   --source-cache "$SHIFT_FEATURE_CACHE" \
   --target-cache "$TFPP_FEATURE_CACHE" \
@@ -193,4 +204,5 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_fused_feature
   --feature-loss-weight "$FEATURE_LOSS_WEIGHT" \
   --cosine-loss-weight "$COSINE_LOSS_WEIGHT" \
   --residual-loss-weight "$RESIDUAL_LOSS_WEIGHT" \
+  "${TRAIN_ARGS[@]}" \
   2>&1 | tee "$OUT/train.log"

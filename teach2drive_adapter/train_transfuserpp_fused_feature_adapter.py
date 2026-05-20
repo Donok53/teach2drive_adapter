@@ -202,6 +202,9 @@ def train(args: argparse.Namespace) -> None:
         blocks=int(args.blocks),
         dropout=float(args.dropout),
     ).to(device)
+    if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
+        model = nn.DataParallel(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     best_val = float("inf")
     best_epoch = 0
@@ -235,9 +238,10 @@ def train(args: argparse.Namespace) -> None:
             best_val = val_loss
             best_epoch = epoch
             stale = 0
+            raw_model = model.module if isinstance(model, nn.DataParallel) else model
             torch.save(
                 {
-                    "model_state": model.state_dict(),
+                    "model_state": raw_model.state_dict(),
                     "feature_shape": feature_shape,
                     "metadata": metadata,
                     "epoch": epoch,
@@ -283,6 +287,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int, default=0)
     parser.add_argument("--step-log-every", type=int, default=50)
+    parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     return parser
 
