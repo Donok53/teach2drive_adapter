@@ -300,14 +300,31 @@ def _move_feature_dict(batch: Dict[str, torch.Tensor], device: torch.device) -> 
     return {name: value.to(device, non_blocking=True).float() for name, value in batch.items()}
 
 
-def _map_losses(pred: torch.Tensor, source: torch.Tensor, target: torch.Tensor, feature_weight: float, cosine_weight: float, residual_weight: float):
+def _map_losses(
+    pred: torch.Tensor,
+    source: torch.Tensor,
+    target: torch.Tensor,
+    feature_weight: float,
+    cosine_weight: float,
+    residual_weight: float,
+    base_reference: torch.Tensor | None = None,
+    base_consistency_weight: float = 0.0,
+):
     feature_loss = nn.functional.smooth_l1_loss(pred, target)
     cosine_loss = _feature_cosine_loss(pred, target)
     residual_loss = torch.mean(torch.abs(pred - source))
-    loss = feature_weight * feature_loss + cosine_weight * cosine_loss + residual_weight * residual_loss
+    base_consistency_loss = pred.new_tensor(0.0)
+    if base_reference is not None and float(base_consistency_weight) > 0.0:
+        base_consistency_loss = nn.functional.smooth_l1_loss(pred, base_reference)
+    loss = (
+        feature_weight * feature_loss
+        + cosine_weight * cosine_loss
+        + residual_weight * residual_loss
+        + float(base_consistency_weight) * base_consistency_loss
+    )
     input_l1 = torch.mean(torch.abs(source - target))
     adapted_l1 = torch.mean(torch.abs(pred.detach() - target))
-    return loss, feature_loss, cosine_loss, residual_loss, input_l1, adapted_l1
+    return loss, feature_loss, cosine_loss, residual_loss, base_consistency_loss, input_l1, adapted_l1
 
 
 def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str, float]:
@@ -317,11 +334,13 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
         "stage_feature",
         "stage_cosine",
         "stage_residual",
+        "stage_base_consistency",
         "stage_input_l1",
         "stage_adapted_l1",
         "fused_feature",
         "fused_cosine",
         "fused_residual",
+        "fused_base_consistency",
         "fused_input_l1",
         "fused_adapted_l1",
     )
@@ -336,10 +355,24 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
         target = _move_feature_dict(batch["target"], device)
         with torch.set_grad_enabled(train):
             pred = model(source)
+            base_reference = None
+            if (
+                isinstance(raw_model, ExtrinsicAwareFeatureThenFusionAdapter)
+                and (
+                    float(args.stage_base_consistency_loss_weight) > 0.0
+                    or float(args.fused_base_consistency_loss_weight) > 0.0
+                )
+            ):
+                with torch.no_grad():
+                    base_reference = {
+                        name: value.detach()
+                        for name, value in raw_model.base(source).items()
+                    }
             stage_losses = []
             stage_feature = []
             stage_cosine = []
             stage_residual = []
+            stage_base_consistency = []
             stage_input_l1 = []
             stage_adapted_l1 = []
             for name in stage_names:
@@ -350,13 +383,16 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
                     float(args.stage_feature_loss_weight),
                     float(args.stage_cosine_loss_weight),
                     float(args.stage_residual_loss_weight),
+                    base_reference[name] if base_reference is not None else None,
+                    float(args.stage_base_consistency_loss_weight),
                 )
                 stage_losses.append(values[0])
                 stage_feature.append(values[1])
                 stage_cosine.append(values[2])
                 stage_residual.append(values[3])
-                stage_input_l1.append(values[4])
-                stage_adapted_l1.append(values[5])
+                stage_base_consistency.append(values[4])
+                stage_input_l1.append(values[5])
+                stage_adapted_l1.append(values[6])
             stage_loss = torch.stack(stage_losses).mean()
             fused_values = _map_losses(
                 pred[FUSED_FEATURE_NAME],
@@ -365,6 +401,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
                 float(args.fused_feature_loss_weight),
                 float(args.fused_cosine_loss_weight),
                 float(args.fused_residual_loss_weight),
+                base_reference[FUSED_FEATURE_NAME] if base_reference is not None else None,
+                float(args.fused_base_consistency_loss_weight),
             )
             loss = float(args.stage_loss_weight) * stage_loss + float(args.fused_loss_weight) * fused_values[0]
             if train:
@@ -378,6 +416,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
         stage_feature_value = torch.stack(stage_feature).mean()
         stage_cosine_value = torch.stack(stage_cosine).mean()
         stage_residual_value = torch.stack(stage_residual).mean()
+        stage_base_consistency_value = torch.stack(stage_base_consistency).mean()
         stage_input_l1_value = torch.stack(stage_input_l1).mean()
         stage_adapted_l1_value = torch.stack(stage_adapted_l1).mean()
         values = {
@@ -385,13 +424,15 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
             "stage_feature": stage_feature_value,
             "stage_cosine": stage_cosine_value,
             "stage_residual": stage_residual_value,
+            "stage_base_consistency": stage_base_consistency_value,
             "stage_input_l1": stage_input_l1_value,
             "stage_adapted_l1": stage_adapted_l1_value,
             "fused_feature": fused_values[1],
             "fused_cosine": fused_values[2],
             "fused_residual": fused_values[3],
-            "fused_input_l1": fused_values[4],
-            "fused_adapted_l1": fused_values[5],
+            "fused_base_consistency": fused_values[4],
+            "fused_input_l1": fused_values[5],
+            "fused_adapted_l1": fused_values[6],
         }
         for name, value in values.items():
             totals[name] += float(value.detach().cpu()) * batch_size
@@ -585,9 +626,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-feature-loss-weight", type=float, default=1.0)
     parser.add_argument("--stage-cosine-loss-weight", type=float, default=0.05)
     parser.add_argument("--stage-residual-loss-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--stage-base-consistency-loss-weight",
+        type=float,
+        default=0.0,
+        help="For extrinsic-aware adapters, keep stage-gated features close to the frozen base adapter output.",
+    )
     parser.add_argument("--fused-feature-loss-weight", type=float, default=1.0)
     parser.add_argument("--fused-cosine-loss-weight", type=float, default=0.05)
     parser.add_argument("--fused-residual-loss-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--fused-base-consistency-loss-weight",
+        type=float,
+        default=0.0,
+        help="For extrinsic-aware adapters, keep fused gated features close to the frozen base adapter output.",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int, default=0)
