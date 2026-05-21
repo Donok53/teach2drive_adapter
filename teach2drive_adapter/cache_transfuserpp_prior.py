@@ -23,6 +23,124 @@ def _flatten_checkpoint(pred_checkpoint: torch.Tensor, width: int) -> torch.Tens
     return flat
 
 
+def _load_feature_then_fusion_adapter(checkpoint_path: str, device: torch.device):
+    if not checkpoint_path:
+        return None, None
+    from .train_transfuserpp_feature_then_fusion_adapter import FeatureThenFusionAdapter
+
+    checkpoint = torch.load(Path(checkpoint_path).expanduser(), map_location=device)
+    metadata = checkpoint.get("metadata", {})
+    ckpt_args = metadata.get("args", {})
+    stage_shapes = {
+        str(name): tuple(int(v) for v in shape)
+        for name, shape in checkpoint.get("stage_feature_shapes", metadata.get("stage_feature_shapes", {})).items()
+    }
+    fused_shape = tuple(int(v) for v in checkpoint.get("fused_feature_shape", metadata.get("fused_feature_shape", [])))
+    if not stage_shapes or len(fused_shape) != 3:
+        raise ValueError(f"Invalid feature-then-fusion adapter checkpoint shapes: {checkpoint_path}")
+    adapter = FeatureThenFusionAdapter(
+        stage_feature_shapes=stage_shapes,
+        fused_feature_shape=fused_shape,
+        hidden_channels=int(ckpt_args.get("hidden_channels", 0)),
+        blocks=int(ckpt_args.get("blocks", 2)),
+        dropout=float(ckpt_args.get("dropout", 0.0)),
+    ).to(device)
+    adapter._stage_feature_shapes = stage_shapes  # type: ignore[attr-defined]  # pylint: disable=protected-access
+    adapter._fused_feature_shape = fused_shape  # type: ignore[attr-defined]  # pylint: disable=protected-access
+    missing, unexpected = adapter.load_state_dict(checkpoint["model_state"], strict=False)
+    adapter.eval()
+    info = {
+        "checkpoint": str(Path(checkpoint_path).expanduser()),
+        "stage_feature_shapes": {key: list(value) for key, value in stage_shapes.items()},
+        "fused_feature_shape": list(fused_shape),
+        "missing": len(missing),
+        "unexpected": len(unexpected),
+    }
+    return adapter, info
+
+
+def _patch_feature_then_fusion_backbone(net, adapter, stage_blend: float, fusion_blend: float):
+    if adapter is None:
+        return
+    backbone = net.backbone
+    original_forward = backbone.forward
+
+    def adapt_stage_pair(layer_idx: int, image_embd_layer: torch.Tensor, lidar_embd_layer: torch.Tensor):
+        image_name = f"layer_{int(layer_idx)}_image"
+        lidar_name = f"layer_{int(layer_idx)}_lidar"
+        expected_image = tuple(int(v) for v in adapter._stage_feature_shapes[image_name])  # pylint: disable=protected-access
+        expected_lidar = tuple(int(v) for v in adapter._stage_feature_shapes[lidar_name])  # pylint: disable=protected-access
+        got_image = tuple(int(v) for v in image_embd_layer.shape[1:])
+        got_lidar = tuple(int(v) for v in lidar_embd_layer.shape[1:])
+        if got_image != expected_image or got_lidar != expected_lidar:
+            raise ValueError(
+                f"feature-then-fusion stage shape mismatch layer={layer_idx}: "
+                f"image {got_image} != {expected_image}, lidar {got_lidar} != {expected_lidar}"
+            )
+        adapted_image, adapted_lidar = adapter.adapt_layer(
+            int(layer_idx),
+            image_embd_layer.float(),
+            lidar_embd_layer.float(),
+        )
+        adapted_image = adapted_image.to(dtype=image_embd_layer.dtype)
+        adapted_lidar = adapted_lidar.to(dtype=lidar_embd_layer.dtype)
+        if float(stage_blend) < 1.0:
+            adapted_image = image_embd_layer + float(stage_blend) * (adapted_image - image_embd_layer)
+            adapted_lidar = lidar_embd_layer + float(stage_blend) * (adapted_lidar - lidar_embd_layer)
+        return adapted_image, adapted_lidar
+
+    def adapted_fuse_features(image_features, lidar_features, layer_idx):
+        idx = int(layer_idx)
+        image_embd_layer = backbone.avgpool_img(image_features)
+        lidar_embd_layer = backbone.avgpool_lidar(lidar_features)
+        lidar_embd_layer = backbone.lidar_channel_to_img[idx](lidar_embd_layer)
+        image_embd_layer, lidar_embd_layer = adapt_stage_pair(idx, image_embd_layer, lidar_embd_layer)
+        image_features_layer, lidar_features_layer = backbone.transformers[idx](image_embd_layer, lidar_embd_layer)
+        lidar_features_layer = backbone.img_channel_to_lidar[idx](lidar_features_layer)
+        image_features_layer = torch.nn.functional.interpolate(
+            image_features_layer,
+            size=(image_features.shape[2], image_features.shape[3]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        if backbone.lidar_video:
+            lidar_features_layer = torch.nn.functional.interpolate(
+                lidar_features_layer,
+                size=(lidar_features.shape[2], lidar_features.shape[3], lidar_features.shape[4]),
+                mode="trilinear",
+                align_corners=False,
+            )
+        else:
+            lidar_features_layer = torch.nn.functional.interpolate(
+                lidar_features_layer,
+                size=(lidar_features.shape[2], lidar_features.shape[3]),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return image_features + image_features_layer, lidar_features + lidar_features_layer
+
+    def adapted_forward(*args, **kwargs):
+        output = original_forward(*args, **kwargs)
+        if not isinstance(output, (tuple, list)) or len(output) < 2:
+            return output
+        fused = output[1]
+        expected = tuple(int(v) for v in adapter._fused_feature_shape)  # pylint: disable=protected-access
+        got = tuple(int(v) for v in fused.shape[1:])
+        if got != expected:
+            raise ValueError(f"feature-then-fusion fused shape mismatch: {got} != {expected}")
+        adapted = adapter.adapt_fused(fused.float()).to(dtype=fused.dtype)
+        if float(fusion_blend) < 1.0:
+            adapted = fused + float(fusion_blend) * (adapted - fused)
+        if isinstance(output, tuple):
+            return (output[0], adapted, *output[2:])
+        out = list(output)
+        out[1] = adapted
+        return out
+
+    backbone.fuse_features = adapted_fuse_features
+    backbone.forward = adapted_forward
+
+
 def build_cache(args: argparse.Namespace) -> None:
     out_path = Path(args.output).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,6 +159,29 @@ def build_cache(args: argparse.Namespace) -> None:
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     net, config, load_info = load_transfuserpp(args.garage_root, args.team_config, device=device, checkpoint=args.checkpoint)
+    feature_then_fusion_adapter, feature_then_fusion_info = _load_feature_then_fusion_adapter(
+        args.feature_then_fusion_adapter_checkpoint,
+        device,
+    )
+    if feature_then_fusion_adapter is not None:
+        _patch_feature_then_fusion_backbone(
+            net,
+            feature_then_fusion_adapter,
+            stage_blend=float(args.stage_feature_adapter_blend),
+            fusion_blend=float(args.fusion_adapter_blend),
+        )
+        print(
+            json.dumps(
+                {
+                    "feature_then_fusion_prior": True,
+                    "stage_feature_adapter_blend": float(args.stage_feature_adapter_blend),
+                    "fusion_adapter_blend": float(args.fusion_adapter_blend),
+                    "adapter": feature_then_fusion_info,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs for prior caching", flush=True)
         net = nn.DataParallel(net)
@@ -132,6 +273,9 @@ def build_cache(args: argparse.Namespace) -> None:
         "command_mode": args.command_mode,
         "samples": int(len(arrays["sample_index"])),
         "load_info": load_info,
+        "feature_then_fusion_adapter": feature_then_fusion_info,
+        "stage_feature_adapter_blend": float(args.stage_feature_adapter_blend),
+        "fusion_adapter_blend": float(args.fusion_adapter_blend),
         "target_speeds": list(getattr(config, "target_speeds", [])),
     }
     arrays["metadata"] = np.asarray(json.dumps(metadata), dtype=object)
@@ -147,6 +291,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--garage-root", required=True)
     parser.add_argument("--team-config", required=True)
     parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--feature-then-fusion-adapter-checkpoint", default="")
+    parser.add_argument("--stage-feature-adapter-blend", type=float, default=1.0)
+    parser.add_argument("--fusion-adapter-blend", type=float, default=1.0)
     parser.add_argument("--episode-root-override", default="")
     parser.add_argument("--cameras", default="front,left,right")
     parser.add_argument("--tfpp-camera", default="front")
@@ -169,4 +316,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

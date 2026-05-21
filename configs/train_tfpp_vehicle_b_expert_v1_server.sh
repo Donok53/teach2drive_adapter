@@ -15,6 +15,9 @@ BOOTSTRAP_ROOT=${BOOTSTRAP_ROOT:-"$HOME/teach2drive/workspace/teach2drive_bootst
 GARAGE_ROOT=${GARAGE_ROOT:-"$HOME/teach2drive/workspace/carla_garage"}
 TEAM_CONFIG=${TEAM_CONFIG:-"$HOME/teach2drive/checkpoints/transfuserpp/pretrained_models/all_towns"}
 TFPP_CHECKPOINT=${TFPP_CHECKPOINT:-""}
+FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT=${FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT:-""}
+STAGE_FEATURE_ADAPTER_BLEND=${STAGE_FEATURE_ADAPTER_BLEND:-1.0}
+FUSION_ADAPTER_BLEND=${FUSION_ADAPTER_BLEND:-1.0}
 
 PROFILE=${PROFILE:-front_triplet_shifted}
 CAMERAS=${CAMERAS:-left,front,right}
@@ -41,6 +44,8 @@ OVERWRITE=${OVERWRITE:-0}
 EXPORT_OVERWRITE=${EXPORT_OVERWRITE:-$OVERWRITE}
 INDEX_OVERWRITE=${INDEX_OVERWRITE:-$OVERWRITE}
 DATA_PARALLEL=${DATA_PARALLEL:-1}
+CACHE_DATA_PARALLEL=${CACHE_DATA_PARALLEL:-$DATA_PARALLEL}
+TRAIN_DATA_PARALLEL=${TRAIN_DATA_PARALLEL:-$DATA_PARALLEL}
 SKIP_INVALID_MOTION=${SKIP_INVALID_MOTION:-1}
 
 # Capacity: larger than v3, but still small enough for the 3-hour dataset.
@@ -156,17 +161,28 @@ else
 fi
 
 CACHE_ARGS=()
-if [[ "$DATA_PARALLEL" == "1" ]]; then
+if [[ "$CACHE_DATA_PARALLEL" == "1" ]]; then
   CACHE_ARGS+=(--data-parallel)
 fi
 if [[ -n "$TFPP_CHECKPOINT" ]]; then
   CACHE_ARGS+=(--checkpoint "$TFPP_CHECKPOINT")
 fi
+if [[ -n "$FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT" ]]; then
+  CACHE_ARGS+=(
+    --feature-then-fusion-adapter-checkpoint "$FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT"
+    --stage-feature-adapter-blend "$STAGE_FEATURE_ADAPTER_BLEND"
+    --fusion-adapter-blend "$FUSION_ADAPTER_BLEND"
+  )
+fi
 
 if [[ -f "$CACHE" && "$OVERWRITE" != "1" ]]; then
   echo "=== reuse B-rig TransFuser++ prior cache $CACHE"
 else
-  echo "=== cache B-rig TransFuser++ prior"
+  if [[ -n "$FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT" ]]; then
+    echo "=== cache B-rig TransFuser++ prior with feature-then-fusion adapter"
+  else
+    echo "=== cache B-rig TransFuser++ prior"
+  fi
   "$PY" -m teach2drive_adapter.cache_transfuserpp_prior \
     --index "$INDEX" \
     --output "$CACHE" \
@@ -184,7 +200,7 @@ else
 fi
 
 TRAIN_ARGS=()
-if [[ "$DATA_PARALLEL" == "1" ]]; then
+if [[ "$TRAIN_DATA_PARALLEL" == "1" ]]; then
   TRAIN_ARGS+=(--data-parallel)
 fi
 if [[ -n "${INIT_CHECKPOINT:-}" ]]; then
