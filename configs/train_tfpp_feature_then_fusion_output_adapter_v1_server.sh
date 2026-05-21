@@ -27,10 +27,9 @@ export CACHE_BATCH_SIZE=${CACHE_BATCH_SIZE:-128}
 export DATA_PARALLEL=${DATA_PARALLEL:-1}
 
 # The feature-then-fusion adapter is patched into the frozen TransFuser++
-# backbone during prior caching. Keep caching on one CUDA device to avoid
-# DataParallel closure/device mismatch; use multi-GPU for output adapter
-# training after the cache is built.
-export CACHE_DATA_PARALLEL=${CACHE_DATA_PARALLEL:-0}
+# backbone during prior caching. The patch is DataParallel-safe, so cache and
+# output-adapter training can both use the visible GPUs.
+export CACHE_DATA_PARALLEL=${CACHE_DATA_PARALLEL:-$DATA_PARALLEL}
 export TRAIN_DATA_PARALLEL=${TRAIN_DATA_PARALLEL:-$DATA_PARALLEL}
 export OVERWRITE=${OVERWRITE:-0}
 

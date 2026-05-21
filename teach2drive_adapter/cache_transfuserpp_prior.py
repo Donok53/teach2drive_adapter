@@ -63,13 +63,26 @@ def _patch_feature_then_fusion_backbone(net, adapter, stage_blend: float, fusion
     if adapter is None:
         return
     backbone = net.backbone
-    original_forward = backbone.forward
+    backbone.t2d_feature_then_fusion_adapter = adapter
+    backbone.t2d_stage_feature_shapes = {
+        key: tuple(int(v) for v in value)
+        for key, value in adapter._stage_feature_shapes.items()  # pylint: disable=protected-access
+    }
+    backbone.t2d_fused_feature_shape = tuple(int(v) for v in adapter._fused_feature_shape)  # pylint: disable=protected-access
+    backbone.t2d_stage_feature_adapter_blend = float(stage_blend)
+    backbone.t2d_fusion_adapter_blend = float(fusion_blend)
 
-    def adapt_stage_pair(layer_idx: int, image_embd_layer: torch.Tensor, lidar_embd_layer: torch.Tensor):
+    backbone_class = backbone.__class__
+    if getattr(backbone_class, "_t2d_feature_then_fusion_patched", False):
+        return
+    backbone_class._t2d_original_forward = backbone_class.forward
+
+    def adapt_stage_pair(self, layer_idx: int, image_embd_layer: torch.Tensor, lidar_embd_layer: torch.Tensor):
+        adapter_module = self.t2d_feature_then_fusion_adapter
         image_name = f"layer_{int(layer_idx)}_image"
         lidar_name = f"layer_{int(layer_idx)}_lidar"
-        expected_image = tuple(int(v) for v in adapter._stage_feature_shapes[image_name])  # pylint: disable=protected-access
-        expected_lidar = tuple(int(v) for v in adapter._stage_feature_shapes[lidar_name])  # pylint: disable=protected-access
+        expected_image = self.t2d_stage_feature_shapes[image_name]
+        expected_lidar = self.t2d_stage_feature_shapes[lidar_name]
         got_image = tuple(int(v) for v in image_embd_layer.shape[1:])
         got_lidar = tuple(int(v) for v in lidar_embd_layer.shape[1:])
         if got_image != expected_image or got_lidar != expected_lidar:
@@ -77,33 +90,34 @@ def _patch_feature_then_fusion_backbone(net, adapter, stage_blend: float, fusion
                 f"feature-then-fusion stage shape mismatch layer={layer_idx}: "
                 f"image {got_image} != {expected_image}, lidar {got_lidar} != {expected_lidar}"
             )
-        adapted_image, adapted_lidar = adapter.adapt_layer(
+        adapted_image, adapted_lidar = adapter_module.adapt_layer(
             int(layer_idx),
             image_embd_layer.float(),
             lidar_embd_layer.float(),
         )
         adapted_image = adapted_image.to(dtype=image_embd_layer.dtype)
         adapted_lidar = adapted_lidar.to(dtype=lidar_embd_layer.dtype)
-        if float(stage_blend) < 1.0:
-            adapted_image = image_embd_layer + float(stage_blend) * (adapted_image - image_embd_layer)
-            adapted_lidar = lidar_embd_layer + float(stage_blend) * (adapted_lidar - lidar_embd_layer)
+        blend = float(self.t2d_stage_feature_adapter_blend)
+        if blend < 1.0:
+            adapted_image = image_embd_layer + blend * (adapted_image - image_embd_layer)
+            adapted_lidar = lidar_embd_layer + blend * (adapted_lidar - lidar_embd_layer)
         return adapted_image, adapted_lidar
 
-    def adapted_fuse_features(image_features, lidar_features, layer_idx):
+    def adapted_fuse_features(self, image_features, lidar_features, layer_idx):
         idx = int(layer_idx)
-        image_embd_layer = backbone.avgpool_img(image_features)
-        lidar_embd_layer = backbone.avgpool_lidar(lidar_features)
-        lidar_embd_layer = backbone.lidar_channel_to_img[idx](lidar_embd_layer)
-        image_embd_layer, lidar_embd_layer = adapt_stage_pair(idx, image_embd_layer, lidar_embd_layer)
-        image_features_layer, lidar_features_layer = backbone.transformers[idx](image_embd_layer, lidar_embd_layer)
-        lidar_features_layer = backbone.img_channel_to_lidar[idx](lidar_features_layer)
+        image_embd_layer = self.avgpool_img(image_features)
+        lidar_embd_layer = self.avgpool_lidar(lidar_features)
+        lidar_embd_layer = self.lidar_channel_to_img[idx](lidar_embd_layer)
+        image_embd_layer, lidar_embd_layer = adapt_stage_pair(self, idx, image_embd_layer, lidar_embd_layer)
+        image_features_layer, lidar_features_layer = self.transformers[idx](image_embd_layer, lidar_embd_layer)
+        lidar_features_layer = self.img_channel_to_lidar[idx](lidar_features_layer)
         image_features_layer = torch.nn.functional.interpolate(
             image_features_layer,
             size=(image_features.shape[2], image_features.shape[3]),
             mode="bilinear",
             align_corners=False,
         )
-        if backbone.lidar_video:
+        if self.lidar_video:
             lidar_features_layer = torch.nn.functional.interpolate(
                 lidar_features_layer,
                 size=(lidar_features.shape[2], lidar_features.shape[3], lidar_features.shape[4]),
@@ -119,26 +133,28 @@ def _patch_feature_then_fusion_backbone(net, adapter, stage_blend: float, fusion
             )
         return image_features + image_features_layer, lidar_features + lidar_features_layer
 
-    def adapted_forward(*args, **kwargs):
-        output = original_forward(*args, **kwargs)
+    def adapted_forward(self, *args, **kwargs):
+        output = self.__class__._t2d_original_forward(self, *args, **kwargs)
         if not isinstance(output, (tuple, list)) or len(output) < 2:
             return output
         fused = output[1]
-        expected = tuple(int(v) for v in adapter._fused_feature_shape)  # pylint: disable=protected-access
+        expected = self.t2d_fused_feature_shape
         got = tuple(int(v) for v in fused.shape[1:])
         if got != expected:
             raise ValueError(f"feature-then-fusion fused shape mismatch: {got} != {expected}")
-        adapted = adapter.adapt_fused(fused.float()).to(dtype=fused.dtype)
-        if float(fusion_blend) < 1.0:
-            adapted = fused + float(fusion_blend) * (adapted - fused)
+        adapted = self.t2d_feature_then_fusion_adapter.adapt_fused(fused.float()).to(dtype=fused.dtype)
+        blend = float(self.t2d_fusion_adapter_blend)
+        if blend < 1.0:
+            adapted = fused + blend * (adapted - fused)
         if isinstance(output, tuple):
             return (output[0], adapted, *output[2:])
         out = list(output)
         out[1] = adapted
         return out
 
-    backbone.fuse_features = adapted_fuse_features
-    backbone.forward = adapted_forward
+    backbone_class.fuse_features = adapted_fuse_features
+    backbone_class.forward = adapted_forward
+    backbone_class._t2d_feature_then_fusion_patched = True
 
 
 def build_cache(args: argparse.Namespace) -> None:
