@@ -128,7 +128,11 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         if not checkpoint_path:
             raise ValueError("TFPP_FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT or TFPP_ADAPTER_CHECKPOINT is required")
         _ensure_adapter_import_path()
-        from teach2drive_adapter.train_transfuserpp_feature_then_fusion_adapter import FeatureThenFusionAdapter
+        from teach2drive_adapter.train_transfuserpp_feature_then_fusion_adapter import (
+            ExtrinsicAwareFeatureThenFusionAdapter,
+            FeatureThenFusionAdapter,
+            build_extrinsic_vector,
+        )
 
         checkpoint = torch.load(Path(checkpoint_path).expanduser(), map_location=self.device)
         metadata = checkpoint.get("metadata", {})
@@ -139,13 +143,29 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         self._fused_feature_shape = tuple(int(v) for v in fused_shape_raw)
         if not self._stage_feature_shapes or len(self._fused_feature_shape) != 3:
             raise ValueError("Invalid feature-then-fusion adapter shapes in checkpoint")
-        self._adapter = FeatureThenFusionAdapter(
-            stage_feature_shapes=self._stage_feature_shapes,
-            fused_feature_shape=self._fused_feature_shape,
-            hidden_channels=int(args.get("hidden_channels", 0)),
-            blocks=int(args.get("blocks", 2)),
-            dropout=float(args.get("dropout", 0.0)),
-        ).to(self.device)
+        self._extrinsic_aware = bool(metadata.get("extrinsic_aware", False)) or metadata.get("mode") == "transfuserpp_extrinsic_feature_then_fusion_adapter"
+        if self._extrinsic_aware:
+            extrinsic_vector = metadata.get("extrinsic_vector")
+            if not extrinsic_vector:
+                extrinsic_vector = build_extrinsic_vector(str(metadata.get("source_profile", "front_triplet_shifted")))
+            self._adapter = ExtrinsicAwareFeatureThenFusionAdapter(
+                stage_feature_shapes=self._stage_feature_shapes,
+                fused_feature_shape=self._fused_feature_shape,
+                extrinsic_vector=extrinsic_vector,
+                hidden_channels=int(args.get("hidden_channels", 0)),
+                blocks=int(args.get("blocks", 2)),
+                dropout=float(args.get("dropout", 0.0)),
+                extrinsic_hidden_dim=int(args.get("extrinsic_hidden_dim", 64)),
+                extrinsic_dropout=float(args.get("extrinsic_dropout", 0.0)),
+            ).to(self.device)
+        else:
+            self._adapter = FeatureThenFusionAdapter(
+                stage_feature_shapes=self._stage_feature_shapes,
+                fused_feature_shape=self._fused_feature_shape,
+                hidden_channels=int(args.get("hidden_channels", 0)),
+                blocks=int(args.get("blocks", 2)),
+                dropout=float(args.get("dropout", 0.0)),
+            ).to(self.device)
         missing, unexpected = self._adapter.load_state_dict(checkpoint["model_state"], strict=False)
         self._adapter.eval()
         shared_blend = _env_float("TFPP_FEATURE_ADAPTER_BLEND", 1.0)
@@ -154,6 +174,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         print(
             "[FeatureThenFusionAdapterSensorRigAgent] loaded adapter "
             f"checkpoint={Path(checkpoint_path).expanduser()} "
+            f"extrinsic_aware={self._extrinsic_aware} "
             f"stage_blend={self._stage_blend:.3f} fusion_blend={self._fusion_blend:.3f} "
             f"missing={len(missing)} unexpected={len(unexpected)}",
             flush=True,

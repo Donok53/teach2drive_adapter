@@ -58,6 +58,12 @@ VAL_RATIO=${VAL_RATIO:-0.15}
 HIDDEN_CHANNELS=${HIDDEN_CHANNELS:-0}
 BLOCKS=${BLOCKS:-2}
 DROPOUT=${DROPOUT:-0.0}
+INIT_CHECKPOINT=${INIT_CHECKPOINT:-""}
+EXTRINSIC_AWARE=${EXTRINSIC_AWARE:-0}
+SOURCE_PROFILE=${SOURCE_PROFILE:-front_triplet_shifted}
+EXTRINSIC_HIDDEN_DIM=${EXTRINSIC_HIDDEN_DIM:-64}
+EXTRINSIC_DROPOUT=${EXTRINSIC_DROPOUT:-0.0}
+FREEZE_BASE=${FREEZE_BASE:-0}
 STAGE_LOSS_WEIGHT=${STAGE_LOSS_WEIGHT:-1.0}
 FUSED_LOSS_WEIGHT=${FUSED_LOSS_WEIGHT:-1.0}
 STAGE_FEATURE_LOSS_WEIGHT=${STAGE_FEATURE_LOSS_WEIGHT:-1.0}
@@ -191,10 +197,22 @@ TRAIN_ARGS=()
 if [[ "$DATA_PARALLEL" == "1" || "$DATA_PARALLEL" == "true" || "$DATA_PARALLEL" == "TRUE" ]]; then
   TRAIN_ARGS+=(--data-parallel)
 fi
+if [[ -n "$INIT_CHECKPOINT" ]]; then
+  TRAIN_ARGS+=(--init-checkpoint "$INIT_CHECKPOINT")
+fi
+if [[ "$EXTRINSIC_AWARE" == "1" || "$EXTRINSIC_AWARE" == "true" || "$EXTRINSIC_AWARE" == "TRUE" ]]; then
+  TRAIN_ARGS+=(--extrinsic-aware)
+fi
+if [[ "$FREEZE_BASE" == "1" || "$FREEZE_BASE" == "true" || "$FREEZE_BASE" == "TRUE" ]]; then
+  TRAIN_ARGS+=(--freeze-base)
+fi
 PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_feature_then_fusion_adapter \
   --source-cache "$SHIFT_FEATURE_CACHE" \
   --target-cache "$TFPP_FEATURE_CACHE" \
   --out-dir "$OUT" \
+  --source-profile "$SOURCE_PROFILE" \
+  --extrinsic-hidden-dim "$EXTRINSIC_HIDDEN_DIM" \
+  --extrinsic-dropout "$EXTRINSIC_DROPOUT" \
   --epochs "$EPOCHS" \
   --early-stop-patience "$EARLY_STOP_PATIENCE" \
   --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \

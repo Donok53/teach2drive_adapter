@@ -26,7 +26,11 @@ def _flatten_checkpoint(pred_checkpoint: torch.Tensor, width: int) -> torch.Tens
 def _load_feature_then_fusion_adapter(checkpoint_path: str, device: torch.device):
     if not checkpoint_path:
         return None, None
-    from .train_transfuserpp_feature_then_fusion_adapter import FeatureThenFusionAdapter
+    from .train_transfuserpp_feature_then_fusion_adapter import (
+        ExtrinsicAwareFeatureThenFusionAdapter,
+        FeatureThenFusionAdapter,
+        build_extrinsic_vector,
+    )
 
     checkpoint = torch.load(Path(checkpoint_path).expanduser(), map_location=device)
     metadata = checkpoint.get("metadata", {})
@@ -38,13 +42,27 @@ def _load_feature_then_fusion_adapter(checkpoint_path: str, device: torch.device
     fused_shape = tuple(int(v) for v in checkpoint.get("fused_feature_shape", metadata.get("fused_feature_shape", [])))
     if not stage_shapes or len(fused_shape) != 3:
         raise ValueError(f"Invalid feature-then-fusion adapter checkpoint shapes: {checkpoint_path}")
-    adapter = FeatureThenFusionAdapter(
-        stage_feature_shapes=stage_shapes,
-        fused_feature_shape=fused_shape,
-        hidden_channels=int(ckpt_args.get("hidden_channels", 0)),
-        blocks=int(ckpt_args.get("blocks", 2)),
-        dropout=float(ckpt_args.get("dropout", 0.0)),
-    ).to(device)
+    extrinsic_aware = bool(metadata.get("extrinsic_aware", False)) or metadata.get("mode") == "transfuserpp_extrinsic_feature_then_fusion_adapter"
+    if extrinsic_aware:
+        extrinsic_vector = metadata.get("extrinsic_vector") or build_extrinsic_vector(str(metadata.get("source_profile", "front_triplet_shifted")))
+        adapter = ExtrinsicAwareFeatureThenFusionAdapter(
+            stage_feature_shapes=stage_shapes,
+            fused_feature_shape=fused_shape,
+            extrinsic_vector=extrinsic_vector,
+            hidden_channels=int(ckpt_args.get("hidden_channels", 0)),
+            blocks=int(ckpt_args.get("blocks", 2)),
+            dropout=float(ckpt_args.get("dropout", 0.0)),
+            extrinsic_hidden_dim=int(ckpt_args.get("extrinsic_hidden_dim", 64)),
+            extrinsic_dropout=float(ckpt_args.get("extrinsic_dropout", 0.0)),
+        ).to(device)
+    else:
+        adapter = FeatureThenFusionAdapter(
+            stage_feature_shapes=stage_shapes,
+            fused_feature_shape=fused_shape,
+            hidden_channels=int(ckpt_args.get("hidden_channels", 0)),
+            blocks=int(ckpt_args.get("blocks", 2)),
+            dropout=float(ckpt_args.get("dropout", 0.0)),
+        ).to(device)
     adapter._stage_feature_shapes = stage_shapes  # type: ignore[attr-defined]  # pylint: disable=protected-access
     adapter._fused_feature_shape = fused_shape  # type: ignore[attr-defined]  # pylint: disable=protected-access
     missing, unexpected = adapter.load_state_dict(checkpoint["model_state"], strict=False)
@@ -53,6 +71,7 @@ def _load_feature_then_fusion_adapter(checkpoint_path: str, device: torch.device
         "checkpoint": str(Path(checkpoint_path).expanduser()),
         "stage_feature_shapes": {key: list(value) for key, value in stage_shapes.items()},
         "fused_feature_shape": list(fused_shape),
+        "extrinsic_aware": extrinsic_aware,
         "missing": len(missing),
         "unexpected": len(unexpected),
     }

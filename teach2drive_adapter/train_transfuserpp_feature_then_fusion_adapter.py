@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import argparse
 import json
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterable, Mapping, Optional
 
 import numpy as np
 import torch
@@ -11,6 +13,60 @@ from torch.utils.data import DataLoader, Dataset
 
 from .cache_transfuserpp_feature_fusion_features import FUSED_FEATURE_NAME, STAGE_FEATURE_NAMES
 from .train_transfuserpp_fused_feature_adapter import ResidualFusedFeatureAdapter, _feature_cosine_loss, _split_by_episode
+
+
+_BUILTIN_RIGS: dict[str, dict[str, object]] = {
+    "tfpp_ego": {
+        "cameras": {
+            "front": {"x": -1.5, "y": 0.0, "z": 2.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+        },
+        "lidars": {
+            "top": {"x": 0.0, "y": 0.0, "z": 2.5, "roll": 0.0, "pitch": 0.0, "yaw": -90.0},
+        },
+    },
+    "front_triplet_shifted": {
+        "cameras": {
+            "left": {"x": 1.20, "y": -0.38, "z": 1.95, "roll": 0.0, "pitch": 0.0, "yaw": -12.0},
+            "front": {"x": 1.25, "y": 0.0, "z": 1.95, "roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+            "right": {"x": 1.20, "y": 0.38, "z": 1.95, "roll": 0.0, "pitch": 0.0, "yaw": 12.0},
+        },
+        "lidars": {
+            "top": {"x": 0.20, "y": 0.0, "z": 2.35, "roll": 0.0, "pitch": 0.0, "yaw": -90.0},
+        },
+    },
+}
+
+
+def _pose_values(pose: Mapping[str, object]) -> list[float]:
+    values = [float(pose[key]) for key in ("x", "y", "z", "roll", "pitch", "yaw")]
+    values[:3] = [value / 10.0 for value in values[:3]]
+    values[3:] = [value / 180.0 for value in values[3:]]
+    return values
+
+
+def build_extrinsic_vector(profile: str, cameras: Iterable[str] = ("left", "front", "right"), lidar: str = "top") -> list[float]:
+    """Return a normalized, fixed-size source rig extrinsic vector."""
+
+    if profile not in _BUILTIN_RIGS:
+        raise ValueError(f"Unknown profile={profile!r}; available={sorted(_BUILTIN_RIGS)}")
+    rig = _BUILTIN_RIGS[profile]
+    rig_cameras = rig.get("cameras", {})
+    rig_lidars = rig.get("lidars", {})
+    if not isinstance(rig_cameras, Mapping) or not isinstance(rig_lidars, Mapping):
+        raise ValueError(f"Invalid rig layout for profile={profile!r}")
+    vector: list[float] = []
+    for camera in cameras:
+        pose = rig_cameras.get(camera)
+        if not isinstance(pose, Mapping):
+            vector.extend([0.0] * 6)
+        else:
+            vector.extend(_pose_values(pose))
+    lidar_pose = rig_lidars.get(lidar)
+    if not isinstance(lidar_pose, Mapping):
+        vector.extend([0.0] * 6)
+    else:
+        vector.extend(_pose_values(lidar_pose))
+    return vector
 
 
 def _load_metadata(cache_dir: Path) -> Dict:
@@ -121,6 +177,123 @@ class FeatureThenFusionAdapter(nn.Module):
         output = {name: self.stage_adapters[name](source[name]) for name in self.stage_names}
         output[FUSED_FEATURE_NAME] = self.fused_adapter(source[FUSED_FEATURE_NAME])
         return output
+
+
+class _ExtrinsicFeatureGate(nn.Module):
+    def __init__(self, channels: int, extrinsic_dim: int, hidden_dim: int = 64, dropout: float = 0.0) -> None:
+        super().__init__()
+        layers: list[nn.Module] = [
+            nn.Linear(int(extrinsic_dim), int(hidden_dim)),
+            nn.GELU(),
+        ]
+        if float(dropout) > 0.0:
+            layers.append(nn.Dropout(float(dropout)))
+        final = nn.Linear(int(hidden_dim), int(channels) * 2)
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+        layers.append(final)
+        self.net = nn.Sequential(*layers)
+        self.channels = int(channels)
+
+    def forward(self, x: torch.Tensor, extrinsic: torch.Tensor) -> torch.Tensor:
+        params = self.net(extrinsic.to(dtype=x.dtype, device=x.device))
+        scale, bias = torch.chunk(params, 2, dim=1)
+        scale = scale.view(x.shape[0], self.channels, 1, 1)
+        bias = bias.view(x.shape[0], self.channels, 1, 1)
+        return x + x * scale + bias
+
+
+class ExtrinsicAwareFeatureThenFusionAdapter(nn.Module):
+    """Feature+fusion adapter with zero-initialized extrinsic-conditioned gates."""
+
+    def __init__(
+        self,
+        stage_feature_shapes: Dict[str, tuple[int, int, int]],
+        fused_feature_shape: tuple[int, int, int],
+        extrinsic_vector: Iterable[float],
+        hidden_channels: int = 0,
+        blocks: int = 2,
+        dropout: float = 0.0,
+        extrinsic_hidden_dim: int = 64,
+        extrinsic_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.base = FeatureThenFusionAdapter(
+            stage_feature_shapes=stage_feature_shapes,
+            fused_feature_shape=fused_feature_shape,
+            hidden_channels=hidden_channels,
+            blocks=blocks,
+            dropout=dropout,
+        )
+        self.stage_names = self.base.stage_names
+        vector = torch.tensor(list(float(v) for v in extrinsic_vector), dtype=torch.float32).view(1, -1)
+        self.register_buffer("default_extrinsic", vector)
+        extrinsic_dim = int(vector.shape[1])
+        self.stage_gates = nn.ModuleDict(
+            {
+                name: _ExtrinsicFeatureGate(
+                    channels=int(shape[0]),
+                    extrinsic_dim=extrinsic_dim,
+                    hidden_dim=int(extrinsic_hidden_dim),
+                    dropout=float(extrinsic_dropout),
+                )
+                for name, shape in stage_feature_shapes.items()
+            }
+        )
+        self.fused_gate = _ExtrinsicFeatureGate(
+            channels=int(fused_feature_shape[0]),
+            extrinsic_dim=extrinsic_dim,
+            hidden_dim=int(extrinsic_hidden_dim),
+            dropout=float(extrinsic_dropout),
+        )
+
+    def _extrinsic_for(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return self.default_extrinsic.to(device=device).expand(int(batch_size), -1)
+
+    def adapt_stage(self, name: str, x: torch.Tensor, extrinsic: torch.Tensor | None = None) -> torch.Tensor:
+        adapted = self.base.adapt_stage(name, x)
+        if extrinsic is None:
+            extrinsic = self._extrinsic_for(int(x.shape[0]), x.device)
+        return self.stage_gates[name](adapted, extrinsic)
+
+    def adapt_layer(self, layer_idx: int, image_features: torch.Tensor, lidar_features: torch.Tensor, extrinsic: torch.Tensor | None = None):
+        image_name = f"layer_{int(layer_idx)}_image"
+        lidar_name = f"layer_{int(layer_idx)}_lidar"
+        image, lidar = self.base.adapt_layer(int(layer_idx), image_features, lidar_features)
+        if extrinsic is None:
+            extrinsic = self._extrinsic_for(int(image_features.shape[0]), image_features.device)
+        return self.stage_gates[image_name](image, extrinsic), self.stage_gates[lidar_name](lidar, extrinsic)
+
+    def adapt_fused(self, fused_features: torch.Tensor, extrinsic: torch.Tensor | None = None) -> torch.Tensor:
+        adapted = self.base.adapt_fused(fused_features)
+        if extrinsic is None:
+            extrinsic = self._extrinsic_for(int(fused_features.shape[0]), fused_features.device)
+        return self.fused_gate(adapted, extrinsic)
+
+    def forward(self, source: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        batch_size = int(source[FUSED_FEATURE_NAME].shape[0])
+        device = source[FUSED_FEATURE_NAME].device
+        extrinsic = self._extrinsic_for(batch_size, device)
+        output = {name: self.adapt_stage(name, source[name], extrinsic) for name in self.stage_names}
+        output[FUSED_FEATURE_NAME] = self.adapt_fused(source[FUSED_FEATURE_NAME], extrinsic)
+        return output
+
+
+def load_feature_then_fusion_checkpoint(model: nn.Module, checkpoint_path: str, strict: bool = False) -> dict[str, int]:
+    if not checkpoint_path:
+        return {"missing": 0, "unexpected": 0}
+    checkpoint = torch.load(Path(checkpoint_path).expanduser(), map_location="cpu")
+    state = checkpoint["model_state"]
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    if isinstance(raw_model, ExtrinsicAwareFeatureThenFusionAdapter):
+        base_state = state
+        if all(key.startswith("base.") or key.startswith("stage_gates.") or key.startswith("fused_gate.") or key == "default_extrinsic" for key in state):
+            missing, unexpected = raw_model.load_state_dict(state, strict=strict)
+            return {"missing": len(missing), "unexpected": len(unexpected)}
+        missing, unexpected = raw_model.base.load_state_dict(base_state, strict=strict)
+        return {"missing": len(missing), "unexpected": len(unexpected)}
+    missing, unexpected = raw_model.load_state_dict(state, strict=strict)
+    return {"missing": len(missing), "unexpected": len(unexpected)}
 
 
 def _move_feature_dict(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -275,29 +448,53 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     stage_feature_shapes = _shape_dict(source_cache)
     fused_feature_shape = tuple(int(v) for v in source_cache.features[source_cache.fused_name].shape[1:])
-    model = FeatureThenFusionAdapter(
-        stage_feature_shapes=stage_feature_shapes,
-        fused_feature_shape=fused_feature_shape,
-        hidden_channels=int(args.hidden_channels),
-        blocks=int(args.blocks),
-        dropout=float(args.dropout),
-    ).to(device)
+    extrinsic_vector = build_extrinsic_vector(args.source_profile)
+    if args.extrinsic_aware:
+        model = ExtrinsicAwareFeatureThenFusionAdapter(
+            stage_feature_shapes=stage_feature_shapes,
+            fused_feature_shape=fused_feature_shape,
+            extrinsic_vector=extrinsic_vector,
+            hidden_channels=int(args.hidden_channels),
+            blocks=int(args.blocks),
+            dropout=float(args.dropout),
+            extrinsic_hidden_dim=int(args.extrinsic_hidden_dim),
+            extrinsic_dropout=float(args.extrinsic_dropout),
+        ).to(device)
+    else:
+        model = FeatureThenFusionAdapter(
+            stage_feature_shapes=stage_feature_shapes,
+            fused_feature_shape=fused_feature_shape,
+            hidden_channels=int(args.hidden_channels),
+            blocks=int(args.blocks),
+            dropout=float(args.dropout),
+        ).to(device)
+    load_info = load_feature_then_fusion_checkpoint(model, args.init_checkpoint, strict=False)
+    if args.freeze_base:
+        raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        if isinstance(raw_model, ExtrinsicAwareFeatureThenFusionAdapter):
+            for param in raw_model.base.parameters():
+                param.requires_grad_(False)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
         model = nn.DataParallel(model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=float(args.lr), weight_decay=float(args.weight_decay))
     best_val = float("inf")
     best_epoch = 0
     stale = 0
     history = []
     metadata = {
-        "mode": "transfuserpp_feature_then_fusion_adapter",
+        "mode": "transfuserpp_extrinsic_feature_then_fusion_adapter" if args.extrinsic_aware else "transfuserpp_feature_then_fusion_adapter",
         "source_cache": str(Path(args.source_cache).expanduser()),
         "target_cache": str(Path(args.target_cache).expanduser()),
         "source_metadata": source_cache.metadata,
         "target_metadata": target_cache.metadata,
         "stage_feature_shapes": {key: list(value) for key, value in stage_feature_shapes.items()},
         "fused_feature_shape": list(fused_feature_shape),
+        "extrinsic_aware": bool(args.extrinsic_aware),
+        "source_profile": args.source_profile,
+        "extrinsic_vector": list(float(v) for v in extrinsic_vector),
+        "init_checkpoint": str(Path(args.init_checkpoint).expanduser()) if args.init_checkpoint else "",
+        "init_load_info": load_info,
         "train_samples": int(len(train_ds)),
         "val_samples": int(len(val_ds)),
         "args": vars(args),
@@ -310,6 +507,9 @@ def train(args: argparse.Namespace) -> None:
                 "val_samples": len(val_ds),
                 "stage_feature_shapes": metadata["stage_feature_shapes"],
                 "fused_feature_shape": list(fused_feature_shape),
+                "extrinsic_aware": bool(args.extrinsic_aware),
+                "source_profile": args.source_profile,
+                "init_load_info": load_info,
             },
             indent=2,
         ),
@@ -350,7 +550,7 @@ def train(args: argparse.Namespace) -> None:
                 print(f"early_stop: no val improvement for {stale} epochs (patience={args.early_stop_patience}, best={best_val:.6f})", flush=True)
                 break
     (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    summary = {"best_epoch": int(best_epoch), "best_val_loss": float(best_val), "mode": "transfuserpp_feature_then_fusion_adapter"}
+    summary = {"best_epoch": int(best_epoch), "best_val_loss": float(best_val), "mode": metadata["mode"]}
     if (out_dir / "best_model.pt").exists():
         best = torch.load(out_dir / "best_model.pt", map_location="cpu")
         summary.update(best.get("val_metrics", {}))
@@ -362,6 +562,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-cache", required=True, help="Shifted feature-fusion cache directory.")
     parser.add_argument("--target-cache", required=True, help="Canonical feature-fusion cache directory.")
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--init-checkpoint", default="", help="Optional feature-then-fusion checkpoint to fine-tune from.")
+    parser.add_argument("--extrinsic-aware", action="store_true", help="Add zero-initialized extrinsic-conditioned gates on top of the feature+fusion adapter.")
+    parser.add_argument("--source-profile", default="front_triplet_shifted", choices=sorted(_BUILTIN_RIGS), help="Source sensor profile used for the extrinsic vector.")
+    parser.add_argument("--extrinsic-hidden-dim", type=int, default=64)
+    parser.add_argument("--extrinsic-dropout", type=float, default=0.0)
+    parser.add_argument("--freeze-base", action="store_true", help="Train only the extrinsic gates when --extrinsic-aware is enabled.")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
