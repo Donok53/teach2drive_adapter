@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from sensor_agent import SensorAgent
+import transfuser_utils as t_u
 
 
 def get_entry_point() -> str:
@@ -94,6 +96,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         self._load_adapter()
         self._patch_backbones()
         self._setup_recording()
+        self._setup_side_lidar_guard()
 
     def _apply_sensor_rig(self) -> None:
         camera_name = os.environ.get("TFPP_SENSOR_CAMERA", "front")
@@ -338,9 +341,226 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         self._record_writer.write(frame)
         self._record_frames += 1
 
+    def _setup_side_lidar_guard(self) -> None:
+        self._side_guard_enabled = _truthy(os.environ.get("TFPP_SIDE_LIDAR_GUARD"), default=False)
+        self._side_guard_x_min = _env_float("TFPP_SIDE_GUARD_X_MIN_M", -0.75)
+        self._side_guard_x_max = _env_float("TFPP_SIDE_GUARD_X_MAX_M", 9.0)
+        self._side_guard_y_min = _env_float("TFPP_SIDE_GUARD_Y_MIN_M", 0.95)
+        self._side_guard_y_max = _env_float("TFPP_SIDE_GUARD_Y_MAX_M", 4.80)
+        self._side_guard_z_min = _env_float("TFPP_SIDE_GUARD_Z_MIN_M", 0.45)
+        self._side_guard_z_max = _env_float("TFPP_SIDE_GUARD_Z_MAX_M", 2.10)
+        self._side_guard_cell_size = _env_float("TFPP_SIDE_GUARD_CELL_SIZE_M", 0.60)
+        self._side_guard_min_points = _env_int("TFPP_SIDE_GUARD_MIN_POINTS", 10)
+        self._side_guard_min_cells = _env_int("TFPP_SIDE_GUARD_MIN_CELLS", 3)
+        self._side_guard_cluster_max_x_span = _env_float("TFPP_SIDE_GUARD_CLUSTER_MAX_X_SPAN_M", 6.50)
+        self._side_guard_cluster_max_y_span = _env_float("TFPP_SIDE_GUARD_CLUSTER_MAX_Y_SPAN_M", 3.40)
+        self._side_guard_steer_threshold = _env_float("TFPP_SIDE_GUARD_STEER_THRESHOLD", 0.08)
+        self._side_guard_min_speed = _env_float("TFPP_SIDE_GUARD_MIN_SPEED_MPS", 0.15)
+        self._side_guard_hard_y = _env_float("TFPP_SIDE_GUARD_HARD_Y_M", 1.85)
+        self._side_guard_soft_y = _env_float("TFPP_SIDE_GUARD_SOFT_Y_M", 3.35)
+        self._side_guard_hard_x = _env_float("TFPP_SIDE_GUARD_HARD_X_M", 7.0)
+        self._side_guard_soft_x = _env_float("TFPP_SIDE_GUARD_SOFT_X_M", 9.0)
+        self._side_guard_immediate_x = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_X_M", 2.40)
+        self._side_guard_immediate_y = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_Y_M", 3.80)
+        self._side_guard_soft_brake = _env_float("TFPP_SIDE_GUARD_SOFT_BRAKE", 0.35)
+        self._side_guard_hard_brake = _env_float("TFPP_SIDE_GUARD_HARD_BRAKE", 0.70)
+        self._side_guard_soft_throttle = _env_float("TFPP_SIDE_GUARD_SOFT_THROTTLE", 0.05)
+        self._side_guard_hard_throttle = _env_float("TFPP_SIDE_GUARD_HARD_THROTTLE", 0.0)
+        self._side_guard_hold_steps = _env_int("TFPP_SIDE_GUARD_HOLD_STEPS", 6)
+        self._side_guard_debug_every = _env_int("TFPP_SIDE_GUARD_DEBUG_EVERY", 10)
+        self._side_guard_hold_until_step = -1
+        self._side_guard_last_level = ""
+        self._side_guard_last_info: dict[str, Any] = {}
+        self._side_guard_last_log_step = -10**9
+        if self._side_guard_enabled:
+            print(
+                "[FeatureThenFusionAdapterSensorRigAgent] side_lidar_guard=on "
+                f"roi=x[{self._side_guard_x_min:.2f},{self._side_guard_x_max:.2f}] "
+                f"abs_y[{self._side_guard_y_min:.2f},{self._side_guard_y_max:.2f}] "
+                f"z[{self._side_guard_z_min:.2f},{self._side_guard_z_max:.2f}] "
+                f"points/cells={self._side_guard_min_points}/{self._side_guard_min_cells}",
+                flush=True,
+            )
+
+    def _side_guard_speed(self) -> float:
+        try:
+            if len(getattr(self, "state_log", [])) > 0:
+                return float(self.state_log[-1][3])
+        except Exception:
+            pass
+        return 0.0
+
+    def _side_guard_clusters(self, points: np.ndarray) -> list[dict[str, float]]:
+        if points.shape[0] < self._side_guard_min_points:
+            return []
+
+        cell_size = max(0.10, float(self._side_guard_cell_size))
+        cells = np.floor(points[:, :2] / cell_size).astype(np.int32)
+        unique_cells, inverse = np.unique(cells, axis=0, return_inverse=True)
+        cell_to_idx = {tuple(map(int, cell)): idx for idx, cell in enumerate(unique_cells)}
+        visited: set[int] = set()
+        clusters: list[dict[str, float]] = []
+
+        for start_idx in range(unique_cells.shape[0]):
+            if start_idx in visited:
+                continue
+            stack = [start_idx]
+            component: list[int] = []
+            visited.add(start_idx)
+            while stack:
+                idx = stack.pop()
+                component.append(idx)
+                cx, cy = unique_cells[idx]
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        next_idx = cell_to_idx.get((int(cx + dx), int(cy + dy)))
+                        if next_idx is not None and next_idx not in visited:
+                            visited.add(next_idx)
+                            stack.append(next_idx)
+
+            component_mask = np.isin(inverse, component)
+            cluster_points = points[component_mask]
+            point_count = int(cluster_points.shape[0])
+            cell_count = int(len(component))
+            if point_count < self._side_guard_min_points or cell_count < self._side_guard_min_cells:
+                continue
+            x_min = float(np.min(cluster_points[:, 0]))
+            x_max = float(np.max(cluster_points[:, 0]))
+            y_min = float(np.min(cluster_points[:, 1]))
+            y_max = float(np.max(cluster_points[:, 1]))
+            x_span = x_max - x_min
+            y_span = y_max - y_min
+            if x_span > self._side_guard_cluster_max_x_span:
+                continue
+            if y_span > self._side_guard_cluster_max_y_span:
+                continue
+            clusters.append(
+                {
+                    "points": float(point_count),
+                    "cells": float(cell_count),
+                    "min_x": x_min,
+                    "max_x": x_max,
+                    "min_abs_y": float(np.min(np.abs(cluster_points[:, 1]))),
+                    "mean_y": float(np.mean(cluster_points[:, 1])),
+                    "x_span": float(x_span),
+                    "y_span": float(y_span),
+                }
+            )
+        return clusters
+
+    def _side_lidar_guard_decision(self, input_data: Mapping[str, Any], control) -> tuple[str, dict[str, Any]]:
+        if not self._side_guard_enabled:
+            return "", {}
+        if "lidar" not in input_data or not getattr(self, "initialized", False):
+            return "", {}
+        speed = self._side_guard_speed()
+        moving_intent = speed >= self._side_guard_min_speed or float(getattr(control, "throttle", 0.0)) > 0.03
+        if not moving_intent:
+            return "", {}
+
+        try:
+            points = t_u.lidar_to_ego_coordinate(self.config, input_data["lidar"])
+        except Exception as exc:
+            step = int(getattr(self, "step", 0))
+            if step - self._side_guard_last_log_step >= max(1, self._side_guard_debug_every):
+                self._side_guard_last_log_step = step
+                print(f"[side_lidar_guard] lidar transform failed: {exc}", flush=True)
+            return "", {}
+
+        if points is None or points.size == 0:
+            return "", {}
+        points = np.asarray(points, dtype=np.float32)
+        finite_mask = np.isfinite(points).all(axis=1)
+        points = points[finite_mask]
+        if points.shape[0] == 0:
+            return "", {}
+
+        abs_y = np.abs(points[:, 1])
+        roi_mask = (
+            (points[:, 0] >= self._side_guard_x_min)
+            & (points[:, 0] <= self._side_guard_x_max)
+            & (abs_y >= self._side_guard_y_min)
+            & (abs_y <= self._side_guard_y_max)
+            & (points[:, 2] >= self._side_guard_z_min)
+            & (points[:, 2] <= self._side_guard_z_max)
+        )
+        side_points = points[roi_mask]
+        clusters = self._side_guard_clusters(side_points)
+        turning = abs(float(getattr(control, "steer", 0.0))) >= self._side_guard_steer_threshold
+
+        best_level = ""
+        best_info: dict[str, Any] = {}
+        for cluster in clusters:
+            min_x = float(cluster["min_x"])
+            min_abs_y = float(cluster["min_abs_y"])
+            immediate = min_x <= self._side_guard_immediate_x and min_abs_y <= self._side_guard_immediate_y
+            hard = min_x <= self._side_guard_hard_x and min_abs_y <= self._side_guard_hard_y
+            soft = turning and min_x <= self._side_guard_soft_x and min_abs_y <= self._side_guard_soft_y
+            if not (immediate or hard or soft):
+                continue
+            level = "hard" if (immediate or hard) else "soft"
+            if best_level != "hard" or level == "hard":
+                best_level = level
+                best_info = {
+                    **cluster,
+                    "speed": float(speed),
+                    "steer": float(getattr(control, "steer", 0.0)),
+                    "turning": bool(turning),
+                    "reason": "immediate" if immediate else ("hard" if hard else "turning_soft"),
+                }
+            if best_level == "hard":
+                break
+
+        step = int(getattr(self, "step", 0))
+        if best_level:
+            self._side_guard_hold_until_step = step + max(0, int(self._side_guard_hold_steps))
+            self._side_guard_last_level = best_level
+            self._side_guard_last_info = best_info
+            return best_level, best_info
+
+        if step <= self._side_guard_hold_until_step and self._side_guard_last_level:
+            held = dict(self._side_guard_last_info)
+            held["reason"] = "hold_" + str(held.get("reason", self._side_guard_last_level))
+            return self._side_guard_last_level, held
+
+        self._side_guard_last_level = ""
+        self._side_guard_last_info = {}
+        return "", {}
+
+    def _apply_side_lidar_guard(self, input_data: Mapping[str, Any], control):
+        level, info = self._side_lidar_guard_decision(input_data, control)
+        if not level:
+            return control
+
+        if level == "hard":
+            control.throttle = min(float(control.throttle), self._side_guard_hard_throttle)
+            control.brake = max(float(control.brake), self._side_guard_hard_brake)
+        else:
+            control.throttle = min(float(control.throttle), self._side_guard_soft_throttle)
+            control.brake = max(float(control.brake), self._side_guard_soft_brake)
+        self.control = control
+
+        step = int(getattr(self, "step", 0))
+        if step - self._side_guard_last_log_step >= max(1, self._side_guard_debug_every):
+            self._side_guard_last_log_step = step
+            print(
+                "[side_lidar_guard] "
+                f"step={step} level={level} reason={info.get('reason', '-')} "
+                f"speed={float(info.get('speed', 0.0)):.2f} steer={float(info.get('steer', 0.0)):.2f} "
+                f"x=[{float(info.get('min_x', 0.0)):.2f},{float(info.get('max_x', 0.0)):.2f}] "
+                f"min_abs_y={float(info.get('min_abs_y', 0.0)):.2f} "
+                f"pts/cells={int(float(info.get('points', 0.0)))}/{int(float(info.get('cells', 0.0)))} "
+                f"cmd=({control.steer:.3f},{control.throttle:.3f},{control.brake:.3f})",
+                flush=True,
+            )
+        return control
+
     def run_step(self, input_data, timestamp, sensors=None):  # pylint: disable=unused-argument
         self._write_record_frame(input_data)
-        return super().run_step(input_data, timestamp, sensors=sensors)
+        control = super().run_step(input_data, timestamp, sensors=sensors)
+        return self._apply_side_lidar_guard(input_data, control)
 
     def destroy(self, results=None):
         try:
