@@ -343,7 +343,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
 
     def _setup_side_lidar_guard(self) -> None:
         self._side_guard_enabled = _truthy(os.environ.get("TFPP_SIDE_LIDAR_GUARD"), default=False)
-        self._side_guard_x_min = _env_float("TFPP_SIDE_GUARD_X_MIN_M", -0.75)
+        self._side_guard_x_min = _env_float("TFPP_SIDE_GUARD_X_MIN_M", 1.00)
         self._side_guard_x_max = _env_float("TFPP_SIDE_GUARD_X_MAX_M", 9.0)
         self._side_guard_y_min = _env_float("TFPP_SIDE_GUARD_Y_MIN_M", 0.95)
         self._side_guard_y_max = _env_float("TFPP_SIDE_GUARD_Y_MAX_M", 4.80)
@@ -356,12 +356,13 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         self._side_guard_cluster_max_y_span = _env_float("TFPP_SIDE_GUARD_CLUSTER_MAX_Y_SPAN_M", 3.40)
         self._side_guard_steer_threshold = _env_float("TFPP_SIDE_GUARD_STEER_THRESHOLD", 0.08)
         self._side_guard_min_speed = _env_float("TFPP_SIDE_GUARD_MIN_SPEED_MPS", 0.15)
-        self._side_guard_hard_y = _env_float("TFPP_SIDE_GUARD_HARD_Y_M", 1.85)
-        self._side_guard_soft_y = _env_float("TFPP_SIDE_GUARD_SOFT_Y_M", 3.35)
+        self._side_guard_hard_y = _env_float("TFPP_SIDE_GUARD_HARD_Y_M", 1.65)
+        self._side_guard_soft_y = _env_float("TFPP_SIDE_GUARD_SOFT_Y_M", 3.20)
         self._side_guard_hard_x = _env_float("TFPP_SIDE_GUARD_HARD_X_M", 7.0)
+        self._side_guard_soft_x_min = _env_float("TFPP_SIDE_GUARD_SOFT_X_MIN_M", 2.00)
         self._side_guard_soft_x = _env_float("TFPP_SIDE_GUARD_SOFT_X_M", 9.0)
-        self._side_guard_immediate_x = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_X_M", 2.40)
-        self._side_guard_immediate_y = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_Y_M", 3.80)
+        self._side_guard_immediate_x = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_X_M", 3.00)
+        self._side_guard_immediate_y = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_Y_M", 1.45)
         self._side_guard_soft_brake = _env_float("TFPP_SIDE_GUARD_SOFT_BRAKE", 0.35)
         self._side_guard_hard_brake = _env_float("TFPP_SIDE_GUARD_HARD_BRAKE", 0.70)
         self._side_guard_soft_throttle = _env_float("TFPP_SIDE_GUARD_SOFT_THROTTLE", 0.05)
@@ -378,6 +379,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
                 f"roi=x[{self._side_guard_x_min:.2f},{self._side_guard_x_max:.2f}] "
                 f"abs_y[{self._side_guard_y_min:.2f},{self._side_guard_y_max:.2f}] "
                 f"z[{self._side_guard_z_min:.2f},{self._side_guard_z_max:.2f}] "
+                f"hard_y={self._side_guard_hard_y:.2f} soft_x_min={self._side_guard_soft_x_min:.2f} "
                 f"points/cells={self._side_guard_min_points}/{self._side_guard_min_cells}",
                 flush=True,
             )
@@ -497,7 +499,12 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             min_abs_y = float(cluster["min_abs_y"])
             immediate = min_x <= self._side_guard_immediate_x and min_abs_y <= self._side_guard_immediate_y
             hard = min_x <= self._side_guard_hard_x and min_abs_y <= self._side_guard_hard_y
-            soft = turning and min_x <= self._side_guard_soft_x and min_abs_y <= self._side_guard_soft_y
+            soft = (
+                turning
+                and min_x >= self._side_guard_soft_x_min
+                and min_x <= self._side_guard_soft_x
+                and min_abs_y <= self._side_guard_soft_y
+            )
             if not (immediate or hard or soft):
                 continue
             level = "hard" if (immediate or hard) else "soft"
