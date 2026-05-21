@@ -9,12 +9,12 @@ cd "$(dirname "$0")/.."
 #   shifted sensor features -> canonical-like fusion features
 #
 # This preset freezes that adapter while caching the TransFuser++ prior, then
-# trains a fresh conservative output-level policy adapter on the Town13 Vehicle
-# B expert dataset. This is intentionally separate from output-adapter v6/v7:
-# the goal is to make a small behavior correction on top of the improved
-# feature/fusion prior, not to force stop-go behavior through large loss terms.
+# trains a fresh conservative output-level policy adapter on the same paired
+# dataset used by the feature/fusion adapters. This keeps the experiment family
+# comparable to Feature Adapter v1 / Fusion Adapter v1, instead of mixing in the
+# later Town13 Vehicle-B output-adapter dataset from v1-v7.
 
-export DATA_ROOT=${DATA_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_vehicle_b_front_triplet_town13_target_3h"}
+export DATA_ROOT=${DATA_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_transfuserpp_paired_24ep_motion_safe"}
 export WORK_ROOT=${WORK_ROOT:-"$HOME/teach2drive/runs/tfpp_feature_then_fusion_output_adapter_v1"}
 export OUT=${OUT:-"$WORK_ROOT/train_front_triplet_shifted_feature_then_fusion_output_adapter_v1"}
 export FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT=${FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT:-"$HOME/dataset/byeongjae/runs/tfpp_feature_then_fusion_adapter_v1/train_feature_then_fusion_adapter_v1/best_model.pt"}
