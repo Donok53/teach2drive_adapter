@@ -529,6 +529,7 @@ def train(args: argparse.Namespace) -> None:
             best_epoch = epoch
             stale = 0
             raw_model = model.module if isinstance(model, nn.DataParallel) else model
+            out_dir.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
                     "model_state": raw_model.state_dict(),
@@ -547,11 +548,31 @@ def train(args: argparse.Namespace) -> None:
             if stale >= int(args.early_stop_patience):
                 print(f"early_stop: no val improvement for {stale} epochs (patience={args.early_stop_patience}, best={best_val:.6f})", flush=True)
                 break
+    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     summary = {"best_epoch": int(best_epoch), "best_val_loss": float(best_val), "mode": metadata["mode"]}
+    if history and not (out_dir / "best_model.pt").exists():
+        raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        last = history[-1]
+        torch.save(
+            {
+                "model_state": raw_model.state_dict(),
+                "aux_model_state": aux_head.state_dict(),
+                "stage_feature_shapes": stage_feature_shapes,
+                "fused_feature_shape": fused_feature_shape,
+                "metadata": metadata,
+                "epoch": int(last["epoch"]),
+                "val_metrics": last["val"],
+                "train_metrics": last["train"],
+                "recovered_missing_best": True,
+            },
+            out_dir / "best_model.pt",
+        )
+        print("warning: best_model.pt was missing at shutdown; saved final epoch checkpoint instead", flush=True)
     if (out_dir / "best_model.pt").exists():
         best = torch.load(out_dir / "best_model.pt", map_location="cpu")
         summary.update(best.get("val_metrics", {}))
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
 
 
