@@ -259,7 +259,11 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool) -> Dict[str,
             (1.0 - float(args.teacher_speed_target_blend)) * target[:, traj_dim : traj_dim + speed_dim]
             + float(args.teacher_speed_target_blend) * teacher_target[:, traj_dim : traj_dim + speed_dim]
         )
-        stop_target = (1.0 - float(args.teacher_stop_target_blend)) * target[:, -1:] + float(args.teacher_stop_target_blend) * teacher_target[:, -1:]
+        teacher_stop_target = torch.sigmoid(teacher_target[:, -1:])
+        stop_target = (
+            (1.0 - float(args.teacher_stop_target_blend)) * target[:, -1:]
+            + float(args.teacher_stop_target_blend) * teacher_stop_target
+        ).clamp(0.0, 1.0)
         supervision_target = torch.cat([target_traj, speed_target, stop_target], dim=1)
         moving = _moving_mask(scalar, supervision_target, speed_dim, float(args.moving_speed_threshold))
         launch = _launch_mask(scalar, speed_target, float(args.launch_current_speed_threshold), float(args.launch_target_speed_threshold))

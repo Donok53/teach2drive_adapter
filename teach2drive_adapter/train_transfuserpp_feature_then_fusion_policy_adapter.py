@@ -173,10 +173,14 @@ def _policy_losses(out: Dict[str, torch.Tensor], batch: Dict, device: torch.devi
         (1.0 - float(args.teacher_speed_target_blend)) * target[:, traj_dim : traj_dim + speed_dim]
         + float(args.teacher_speed_target_blend) * teacher_target[:, traj_dim : traj_dim + speed_dim]
     )
+    # The cached teacher stores a TF++ stop proxy/logit in the last target slot,
+    # not a BCE probability. Convert it before blending so BCE cannot become
+    # negative and drive the feature adapter to explode.
+    teacher_stop_target = torch.sigmoid(teacher_target[:, -1:])
     stop_target = (
         (1.0 - float(args.teacher_stop_target_blend)) * target[:, -1:]
-        + float(args.teacher_stop_target_blend) * teacher_target[:, -1:]
-    )
+        + float(args.teacher_stop_target_blend) * teacher_stop_target
+    ).clamp(0.0, 1.0)
     supervision_target = torch.cat([target_traj, speed_target, stop_target], dim=1)
 
     moving = _moving_mask(scalar, supervision_target, speed_dim, float(args.moving_speed_threshold))
@@ -598,7 +602,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-reason-loss-weight", type=float, default=0.02)
     parser.add_argument("--teacher-traj-blend", type=float, default=0.75)
     parser.add_argument("--teacher-speed-target-blend", type=float, default=0.45)
-    parser.add_argument("--teacher-stop-target-blend", type=float, default=0.25)
+    parser.add_argument("--teacher-stop-target-blend", type=float, default=0.0)
     parser.add_argument("--speed-dim", type=int, default=4)
     parser.add_argument("--moving-speed-threshold", type=float, default=1.0)
     parser.add_argument("--moving-sample-weight", type=float, default=1.35)
