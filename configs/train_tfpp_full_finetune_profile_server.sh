@@ -19,6 +19,7 @@ DATA_ROOT=${DATA_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_transfuserpp_paired
 WORK_ROOT=${WORK_ROOT:-"$HOME/dataset/byeongjae/runs/tfpp_full_finetune_front_triplet_shifted_v1"}
 GARAGE_ROOT=${GARAGE_ROOT:-"$HOME/teach2drive/workspace/carla_garage"}
 TEAM_CONFIG=${TEAM_CONFIG:-"$HOME/teach2drive/checkpoints/transfuserpp/pretrained_models/all_towns"}
+CARLA_ROOT=${CARLA_ROOT:-"$HOME/dataset/byeongjae/carla-simulator"}
 
 if [[ ! -d "$GARAGE_ROOT" && -d "$HOME/code/carla_garage" ]]; then
   GARAGE_ROOT="$HOME/code/carla_garage"
@@ -52,6 +53,161 @@ WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
 SETTING=${SETTING:-all}
 
 mkdir -p "$WORK_ROOT" "$GARAGE_DATA_ROOT" "$LOGDIR"
+
+PYTHON_SHIM_DIR=${PYTHON_SHIM_DIR:-"$WORK_ROOT/python_shims"}
+mkdir -p "$PYTHON_SHIM_DIR"
+
+if [[ -d "$CARLA_ROOT/PythonAPI/carla" ]]; then
+  export PYTHONPATH="$CARLA_ROOT/PythonAPI/carla:$CARLA_ROOT/PythonAPI/carla/dist/carla-*.egg:${PYTHONPATH:-}"
+fi
+
+if ! "$PY" -c "import carla" >/dev/null 2>&1; then
+  cat > "$PYTHON_SHIM_DIR/carla.py" <<'PY'
+"""Small offline CARLA shim for CARLA Garage training imports.
+
+CARLA Garage's train.py imports carla for configuration constants and helper
+classes even when no simulator is used.  Some server environments only ship a
+Python 3.7 CARLA egg, while training runs in Python 3.10.  This shim is enough
+for offline supervised training and intentionally does not implement simulator
+client behavior.
+"""
+
+import math
+
+
+class _EnumValue:
+    def __init__(self, name, value=0):
+        self.name = name
+        self.value = int(value)
+
+    def __int__(self):
+        return self.value
+
+    def __or__(self, other):
+        return _EnumValue(f"{self.name}|{getattr(other, 'name', other)}", self.value | int(other))
+
+    def __repr__(self):
+        return f"carla.{self.name}"
+
+
+class _EnumNamespace:
+    def __init__(self, **values):
+        self._values = values
+
+    def __getattr__(self, name):
+        value = self._values.setdefault(name, _EnumValue(name, len(self._values) + 1))
+        return value
+
+
+LaneType = _EnumNamespace(Driving=_EnumValue("Driving", 1), Shoulder=_EnumValue("Shoulder", 2), Parking=_EnumValue("Parking", 4), Sidewalk=_EnumValue("Sidewalk", 8), Biking=_EnumValue("Biking", 16))
+LaneChange = _EnumNamespace(None_=_EnumValue("None", 0), Right=_EnumValue("Right", 1), Left=_EnumValue("Left", 2), Both=_EnumValue("Both", 3))
+LaneMarkingType = _EnumNamespace(NONE=_EnumValue("NONE", 0), Broken=_EnumValue("Broken", 1), Solid=_EnumValue("Solid", 2), SolidBroken=_EnumValue("SolidBroken", 3), BrokenSolid=_EnumValue("BrokenSolid", 4), BrokenBroken=_EnumValue("BrokenBroken", 5), SolidSolid=_EnumValue("SolidSolid", 6))
+LaneMarkingColor = _EnumNamespace(Other=_EnumValue("Other", 0), White=_EnumValue("White", 1), Yellow=_EnumValue("Yellow", 2))
+TrafficLightState = _EnumNamespace(Red=_EnumValue("Red", 0), Yellow=_EnumValue("Yellow", 1), Green=_EnumValue("Green", 2), Off=_EnumValue("Off", 3), Unknown=_EnumValue("Unknown", 4))
+LandmarkType = _EnumNamespace(MaximumSpeed=_EnumValue("MaximumSpeed", 0))
+
+
+class libcarla:
+    TrafficLightState = TrafficLightState
+
+
+class Color:
+    def __init__(self, r=0, g=0, b=0, a=255):
+        self.r = r
+        self.g = g
+        self.b = b
+        self.a = a
+
+
+class Vector3D:
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        if hasattr(x, "x") and y == 0.0 and z == 0.0:
+            self.x = float(x.x)
+            self.y = float(x.y)
+            self.z = float(getattr(x, "z", 0.0))
+        else:
+            self.x = float(x)
+            self.y = float(y)
+            self.z = float(z)
+
+    def __add__(self, other):
+        return self.__class__(self.x + other.x, self.y + other.y, self.z + getattr(other, "z", 0.0))
+
+    def __sub__(self, other):
+        return self.__class__(self.x - other.x, self.y - other.y, self.z - getattr(other, "z", 0.0))
+
+    def __mul__(self, value):
+        return self.__class__(self.x * value, self.y * value, self.z * value)
+
+    def length(self):
+        return math.sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+
+
+class Vector2D:
+    def __init__(self, x=0.0, y=0.0):
+        if hasattr(x, "x") and y == 0.0:
+            self.x = float(x.x)
+            self.y = float(x.y)
+        else:
+            self.x = float(x)
+            self.y = float(y)
+
+
+class Location(Vector3D):
+    def distance(self, other):
+        return (self - other).length()
+
+
+class Rotation:
+    def __init__(self, pitch=0.0, yaw=0.0, roll=0.0):
+        self.pitch = float(pitch)
+        self.yaw = float(yaw)
+        self.roll = float(roll)
+
+
+class Transform:
+    def __init__(self, location=None, rotation=None):
+        self.location = location if location is not None else Location()
+        self.rotation = rotation if rotation is not None else Rotation()
+
+    def transform(self, point):
+        return self.location + point
+
+
+class BoundingBox:
+    def __init__(self, location=None, extent=None):
+        self.location = location if location is not None else Location()
+        self.extent = extent if extent is not None else Vector3D()
+        self.rotation = Rotation()
+
+    def get_world_vertices(self, transform):
+        return []
+
+
+class VehicleControl:
+    def __init__(self):
+        self.steer = 0.0
+        self.throttle = 0.0
+        self.brake = 0.0
+
+
+class VehicleLightState:
+    Position = _EnumValue("Position", 1)
+    LowBeam = _EnumValue("LowBeam", 2)
+
+
+class WorldSettings:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class Client:
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError("The offline CARLA shim cannot create simulator clients.")
+PY
+  export PYTHONPATH="$PYTHON_SHIM_DIR:${PYTHONPATH:-}"
+  echo "=== using offline carla shim: $PYTHON_SHIM_DIR/carla.py"
+fi
 
 EXPORT_ARGS=()
 if [[ "$OVERWRITE_EXPORT" == "1" || "$OVERWRITE_EXPORT" == "true" || "$OVERWRITE_EXPORT" == "TRUE" ]]; then
