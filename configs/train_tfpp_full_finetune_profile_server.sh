@@ -54,6 +54,7 @@ ZERO_REDUNDANCY_OPTIMIZER=${ZERO_REDUNDANCY_OPTIMIZER:-1}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
 SETTING=${SETTING:-all}
 DISABLE_TIMM_PRETRAIN_DOWNLOAD=${DISABLE_TIMM_PRETRAIN_DOWNLOAD:-1}
+PATCH_TORCH_AMP_COMPAT=${PATCH_TORCH_AMP_COMPAT:-1}
 
 mkdir -p "$WORK_ROOT" "$GARAGE_DATA_ROOT" "$LOGDIR"
 
@@ -246,6 +247,43 @@ print({"patched": changed}, flush=True)
 PY
   export HF_HUB_OFFLINE=1
   export TRANSFORMERS_OFFLINE=1
+fi
+
+if [[ "$PATCH_TORCH_AMP_COMPAT" == "1" || "$PATCH_TORCH_AMP_COMPAT" == "true" || "$PATCH_TORCH_AMP_COMPAT" == "TRUE" ]]; then
+  echo "=== patch CARLA Garage torch AMP compatibility"
+  GARAGE_ROOT="$GARAGE_ROOT" "$PY" - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["GARAGE_ROOT"]).expanduser() / "team_code" / "train.py"
+text = path.read_text(encoding="utf-8")
+replacements = (
+    (
+        "torch.amp.GradScaler(device, enabled=bool(config.use_amp))",
+        "torch.cuda.amp.GradScaler(enabled=bool(config.use_amp))",
+    ),
+    (
+        "torch.amp.GradScaler('cuda', enabled=bool(config.use_amp))",
+        "torch.cuda.amp.GradScaler(enabled=bool(config.use_amp))",
+    ),
+    (
+        'torch.amp.GradScaler("cuda", enabled=bool(config.use_amp))',
+        "torch.cuda.amp.GradScaler(enabled=bool(config.use_amp))",
+    ),
+)
+new_text = text
+for old, new in replacements:
+    new_text = new_text.replace(old, new)
+
+changed = []
+if new_text != text:
+    backup = path.with_suffix(path.suffix + ".torch_amp_compat.bak")
+    if not backup.exists():
+        backup.write_text(text, encoding="utf-8")
+    path.write_text(new_text, encoding="utf-8")
+    changed.append(str(path))
+print({"patched": changed}, flush=True)
+PY
 fi
 
 EXPORT_ARGS=()
