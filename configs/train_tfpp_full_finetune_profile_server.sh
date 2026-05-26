@@ -286,6 +286,7 @@ fi
 echo "=== full fine-tune TransFuser++"
 echo "garage_root=$GARAGE_ROOT"
 echo "train_root=$FILTERED_TRAIN_ROOT"
+echo "root_dir=$FILTERED_DATA_ROOT"
 echo "logdir=$LOGDIR/$RUN_ID"
 echo "load_file=$LOAD_FILE"
 
@@ -304,7 +305,7 @@ export PYTHONUNBUFFERED=1
     --rdzv_backend=c10d \
     train.py \
       --logdir "$LOGDIR" \
-      --root_dir "$FILTERED_TRAIN_ROOT" \
+      --root_dir "$FILTERED_DATA_ROOT" \
       --id "$RUN_ID" \
       --load_file "$LOAD_FILE" \
       --continue_epoch 0 \
