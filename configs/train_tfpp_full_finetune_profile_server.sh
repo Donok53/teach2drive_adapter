@@ -34,6 +34,8 @@ TOWN=${TOWN:-Town13}
 SCENARIO_NAME=${SCENARIO_NAME:-"${PROFILE}_minimal_tfpp_train"}
 GARAGE_DATA_ROOT=${GARAGE_DATA_ROOT:-"$WORK_ROOT/carla_garage_dataset"}
 TRAIN_ROOT=${TRAIN_ROOT:-"$GARAGE_DATA_ROOT/$SCENARIO_NAME"}
+FILTERED_DATA_ROOT=${FILTERED_DATA_ROOT:-"$WORK_ROOT/carla_garage_dataset_filtered"}
+FILTERED_TRAIN_ROOT=${FILTERED_TRAIN_ROOT:-"$FILTERED_DATA_ROOT/$SCENARIO_NAME"}
 RUN_ID=${RUN_ID:-"tfpp_full_finetune_${PROFILE}_v1"}
 LOGDIR=${LOGDIR:-"$WORK_ROOT/models"}
 
@@ -235,6 +237,47 @@ if [[ ! -d "$TRAIN_ROOT" ]]; then
   echo "Missing exported train root: $TRAIN_ROOT" >&2
   exit 1
 fi
+
+echo "=== build filtered CARLA Garage train root"
+FILTERED_SOURCE_ROOT="$TRAIN_ROOT" FILTERED_TARGET_ROOT="$FILTERED_TRAIN_ROOT" "$PY" - <<'PY'
+import os
+import re
+import shutil
+from pathlib import Path
+
+source = Path(os.environ["FILTERED_SOURCE_ROOT"]).expanduser()
+target = Path(os.environ["FILTERED_TARGET_ROOT"]).expanduser()
+if target.exists() or target.is_symlink():
+    shutil.rmtree(target)
+target.mkdir(parents=True, exist_ok=True)
+
+route_names = []
+skipped = []
+for child in sorted(source.iterdir()):
+    if not child.is_dir():
+        continue
+    if re.search(r"_Rep\d+$", child.name) is None:
+        skipped.append(child.name)
+        continue
+    if not (child / "results.json.gz").is_file():
+        skipped.append(child.name)
+        continue
+    os.symlink(child, target / child.name, target_is_directory=True)
+    route_names.append(child.name)
+
+if not route_names:
+    raise RuntimeError(f"No CARLA Garage route directories found in {source}")
+print(
+    {
+        "source": str(source),
+        "target": str(target),
+        "routes": len(route_names),
+        "skipped_dirs": skipped,
+    },
+    flush=True,
+)
+PY
+
 if [[ ! -f "$LOAD_FILE" ]]; then
   echo "Missing pretrained/load checkpoint: $LOAD_FILE" >&2
   exit 1
@@ -242,7 +285,7 @@ fi
 
 echo "=== full fine-tune TransFuser++"
 echo "garage_root=$GARAGE_ROOT"
-echo "train_root=$TRAIN_ROOT"
+echo "train_root=$FILTERED_TRAIN_ROOT"
 echo "logdir=$LOGDIR/$RUN_ID"
 echo "load_file=$LOAD_FILE"
 
@@ -261,7 +304,7 @@ export PYTHONUNBUFFERED=1
     --rdzv_backend=c10d \
     train.py \
       --logdir "$LOGDIR" \
-      --root_dir "$TRAIN_ROOT" \
+      --root_dir "$FILTERED_TRAIN_ROOT" \
       --id "$RUN_ID" \
       --load_file "$LOAD_FILE" \
       --continue_epoch 0 \
