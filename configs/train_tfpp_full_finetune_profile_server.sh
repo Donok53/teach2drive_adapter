@@ -53,6 +53,7 @@ CONVERT_NPZ_LIDAR=${CONVERT_NPZ_LIDAR:-1}
 ZERO_REDUNDANCY_OPTIMIZER=${ZERO_REDUNDANCY_OPTIMIZER:-1}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
 SETTING=${SETTING:-all}
+DISABLE_TIMM_PRETRAIN_DOWNLOAD=${DISABLE_TIMM_PRETRAIN_DOWNLOAD:-1}
 
 mkdir -p "$WORK_ROOT" "$GARAGE_DATA_ROOT" "$LOGDIR"
 
@@ -209,6 +210,42 @@ class Client:
 PY
   export PYTHONPATH="$PYTHON_SHIM_DIR:${PYTHONPATH:-}"
   echo "=== using offline carla shim: $PYTHON_SHIM_DIR/carla.py"
+fi
+
+if [[ "$DISABLE_TIMM_PRETRAIN_DOWNLOAD" == "1" || "$DISABLE_TIMM_PRETRAIN_DOWNLOAD" == "true" || "$DISABLE_TIMM_PRETRAIN_DOWNLOAD" == "TRUE" ]]; then
+  echo "=== disable timm ImageNet pretrain downloads"
+  GARAGE_ROOT="$GARAGE_ROOT" "$PY" - <<'PY'
+import os
+from pathlib import Path
+
+garage = Path(os.environ["GARAGE_ROOT"]).expanduser()
+files = [
+    garage / "team_code" / "transfuser.py",
+    garage / "team_code" / "aim.py",
+    garage / "team_code" / "bev_encoder.py",
+]
+patterns = (
+    ("pretrained=True, features_only=True", "pretrained=False, features_only=True"),
+    ("pretrained=True,\n", "pretrained=False,\n"),
+)
+changed = []
+for path in files:
+    if not path.exists():
+        continue
+    text = path.read_text(encoding="utf-8")
+    new_text = text
+    for old, new in patterns:
+        new_text = new_text.replace(old, new)
+    if new_text != text:
+        backup = path.with_suffix(path.suffix + ".pretrain_download.bak")
+        if not backup.exists():
+            backup.write_text(text, encoding="utf-8")
+        path.write_text(new_text, encoding="utf-8")
+        changed.append(str(path))
+print({"patched": changed}, flush=True)
+PY
+  export HF_HUB_OFFLINE=1
+  export TRANSFORMERS_OFFLINE=1
 fi
 
 EXPORT_ARGS=()
