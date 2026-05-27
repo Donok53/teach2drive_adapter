@@ -9,6 +9,7 @@ set -euo pipefail
 
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-2000}
+PY=${PY:-python}
 CARLA_ROOT=${CARLA_ROOT:-"$HOME/dataset/byeongjae/carla-simulator"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"$HOME/dataset/byeongjae/t2d_transfuserpp_2h"}
 MAP=${MAP:-Town10HD_Opt}
@@ -52,7 +53,7 @@ if [[ -n "$TRAFFIC_SCHEDULE_SPEC" ]]; then
   EXTRA_ARGS+=(--traffic-schedule-spec "$TRAFFIC_SCHEDULE_SPEC")
 fi
 
-python -m teach2drive_adapter.collect_transfuserpp_dataset \
+"$PY" -m teach2drive_adapter.collect_transfuserpp_dataset \
   --host "$HOST" \
   --port "$PORT" \
   --carla-root "$CARLA_ROOT" \
