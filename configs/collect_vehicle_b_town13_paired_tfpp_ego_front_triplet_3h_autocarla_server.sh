@@ -14,6 +14,7 @@ export PORT=${PORT:-2000}
 export CARLA_ROOT=${CARLA_ROOT:-"$HOME/dataset/byeongjae/carla-simulator"}
 export CARLA_LOG=${CARLA_LOG:-"$HOME/teach2drive/logs/carla_town13_collect.log"}
 export CARLA_READY_TIMEOUT_SEC=${CARLA_READY_TIMEOUT_SEC:-180}
+export CARLA_EXTRA_ARGS=${CARLA_EXTRA_ARGS:-"-stdout -FullStdOutLogOutput"}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export PYTHON_EGG_CACHE=${PYTHON_EGG_CACHE:-"$HOME/.cache/python-eggs-carla37"}
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-"/tmp/runtime-$USER"}
@@ -59,7 +60,7 @@ else
   (
     cd "$CARLA_ROOT"
     nohup env PATH="$PATH" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" SDL_VIDEODRIVER=offscreen \
-      ./CarlaUE4.sh -RenderOffScreen -nosound -quality-level=Low -carla-rpc-port="$PORT" > "$CARLA_LOG" 2>&1 &
+      ./CarlaUE4.sh -RenderOffScreen -nosound -quality-level=Low -carla-rpc-port="$PORT" $CARLA_EXTRA_ARGS > "$CARLA_LOG" 2>&1 &
     echo "$!" > "$CARLA_LOG.pid"
   )
   CARLA_PID=$(cat "$CARLA_LOG.pid")
