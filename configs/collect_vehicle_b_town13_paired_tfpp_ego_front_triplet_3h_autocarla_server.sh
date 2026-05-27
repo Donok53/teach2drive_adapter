@@ -19,12 +19,17 @@ export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export PYTHON_EGG_CACHE=${PYTHON_EGG_CACHE:-"$HOME/.cache/python-eggs-carla37"}
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-"/tmp/runtime-$USER"}
 export NVIDIA_DEB_DIR=${NVIDIA_DEB_DIR:-"$HOME/nvidia-debs"}
-export NVIDIA_RUNTIME_ROOT=${NVIDIA_RUNTIME_ROOT:-"$HOME/.local/nvidia-runtime"}
+export NVIDIA_RUNTIME_ROOT=${NVIDIA_RUNTIME_ROOT:-"/"}
+export CARLA_SDL_VIDEODRIVER=${CARLA_SDL_VIDEODRIVER:-x11}
+export CARLA_DISPLAY=${CARLA_DISPLAY:-:1}
+export CARLA_GLX_VENDOR=${CARLA_GLX_VENDOR:-}
+export CARLA_NV_PRIME_RENDER_OFFLOAD=${CARLA_NV_PRIME_RENDER_OFFLOAD:-}
 export PATH="$HOME/.local/bin:$PATH"
 
 mkdir -p "$(dirname "$CARLA_LOG")" "$PYTHON_EGG_CACHE" "$XDG_RUNTIME_DIR" "$HOME/.local/bin"
 chmod 700 "$PYTHON_EGG_CACHE" 2>/dev/null || true
 chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+mkdir -p "$HOME/Desktop" "$HOME/Downloads" "$HOME/Documents" "$HOME/Music" "$HOME/Pictures" "$HOME/Videos"
 
 if ! command -v xdg-user-dir >/dev/null 2>&1; then
   cat > "$HOME/.local/bin/xdg-user-dir" <<'SH'
@@ -74,8 +79,16 @@ setup_nvidia_runtime() {
     if [[ -d "$layers" ]]; then
       export VK_LAYER_PATH="$layers"
     fi
-    export __GLX_VENDOR_LIBRARY_NAME=${__GLX_VENDOR_LIBRARY_NAME:-nvidia}
-    export __NV_PRIME_RENDER_OFFLOAD=${__NV_PRIME_RENDER_OFFLOAD:-1}
+    if [[ -n "$CARLA_GLX_VENDOR" ]]; then
+      export __GLX_VENDOR_LIBRARY_NAME="$CARLA_GLX_VENDOR"
+    else
+      unset __GLX_VENDOR_LIBRARY_NAME || true
+    fi
+    if [[ -n "$CARLA_NV_PRIME_RENDER_OFFLOAD" ]]; then
+      export __NV_PRIME_RENDER_OFFLOAD="$CARLA_NV_PRIME_RENDER_OFFLOAD"
+    else
+      unset __NV_PRIME_RENDER_OFFLOAD || true
+    fi
     echo "=== NVIDIA runtime configured"
     echo "LD_LIBRARY_PATH=$libdir:..."
     echo "VK_ICD_FILENAMES=$VK_ICD_FILENAMES"
@@ -110,8 +123,9 @@ else
     carla_env=(
       "PATH=$PATH"
       "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
-      "SDL_VIDEODRIVER=offscreen"
     )
+    [[ -n "${CARLA_SDL_VIDEODRIVER:-}" ]] && carla_env+=("SDL_VIDEODRIVER=$CARLA_SDL_VIDEODRIVER")
+    [[ -n "${CARLA_DISPLAY:-}" ]] && carla_env+=("DISPLAY=$CARLA_DISPLAY")
     [[ -n "${LD_LIBRARY_PATH:-}" ]] && carla_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
     [[ -n "${VK_ICD_FILENAMES:-}" ]] && carla_env+=("VK_ICD_FILENAMES=$VK_ICD_FILENAMES")
     [[ -n "${VK_LAYER_PATH:-}" ]] && carla_env+=("VK_LAYER_PATH=$VK_LAYER_PATH")

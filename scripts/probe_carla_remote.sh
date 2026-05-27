@@ -6,12 +6,14 @@ HOST=${HOST:-127.0.0.1}
 CARLA_ROOT=${CARLA_ROOT:-"$HOME/dataset/byeongjae/carla-simulator"}
 CARLA_LOG=${CARLA_LOG:-"$HOME/teach2drive/logs/carla_probe.log"}
 PY=${PY:-"$HOME/.venv/carla37/bin/python"}
-RUNTIME=${NVIDIA_RUNTIME_ROOT:-"$HOME/.local/nvidia-runtime"}
+RUNTIME=${NVIDIA_RUNTIME_ROOT:-"/"}
 READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-90}
 CARLA_RENDER_ARGS=${CARLA_RENDER_ARGS:-"-RenderOffScreen"}
-CARLA_SDL_VIDEODRIVER=${CARLA_SDL_VIDEODRIVER:-offscreen}
-CARLA_DISPLAY=${CARLA_DISPLAY:-}
+CARLA_SDL_VIDEODRIVER=${CARLA_SDL_VIDEODRIVER:-x11}
+CARLA_DISPLAY=${CARLA_DISPLAY:-:1}
 CARLA_EXTRA_ARGS=${CARLA_EXTRA_ARGS:-"-stdout -FullStdOutLogOutput"}
+CARLA_GLX_VENDOR=${CARLA_GLX_VENDOR:-}
+CARLA_NV_PRIME_RENDER_OFFLOAD=${CARLA_NV_PRIME_RENDER_OFFLOAD:-}
 
 LIBDIR="$RUNTIME/usr/lib/x86_64-linux-gnu"
 ICD="$RUNTIME/usr/share/vulkan/icd.d/nvidia_icd.json"
@@ -20,6 +22,7 @@ XDG_DIR=${XDG_RUNTIME_DIR:-"/tmp/runtime-$USER"}
 
 mkdir -p "$(dirname "$CARLA_LOG")" "$HOME/.local/bin" "$XDG_DIR" "$HOME/.cache/python-eggs-carla37"
 chmod 700 "$XDG_DIR" "$HOME/.cache/python-eggs-carla37" 2>/dev/null || true
+mkdir -p "$HOME/Desktop" "$HOME/Downloads" "$HOME/Documents" "$HOME/Music" "$HOME/Pictures" "$HOME/Videos"
 
 if ! command -v xdg-user-dir >/dev/null 2>&1; then
   {
@@ -65,9 +68,13 @@ carla_env=(
   "LD_LIBRARY_PATH=$LIBDIR:${LD_LIBRARY_PATH:-}"
   "VK_ICD_FILENAMES=$ICD"
   "VK_LAYER_PATH=$LAYERS"
-  "__GLX_VENDOR_LIBRARY_NAME=nvidia"
-  "__NV_PRIME_RENDER_OFFLOAD=1"
 )
+if [[ -n "$CARLA_GLX_VENDOR" ]]; then
+  carla_env+=("__GLX_VENDOR_LIBRARY_NAME=$CARLA_GLX_VENDOR")
+fi
+if [[ -n "$CARLA_NV_PRIME_RENDER_OFFLOAD" ]]; then
+  carla_env+=("__NV_PRIME_RENDER_OFFLOAD=$CARLA_NV_PRIME_RENDER_OFFLOAD")
+fi
 if [[ -n "$CARLA_SDL_VIDEODRIVER" ]]; then
   carla_env+=("SDL_VIDEODRIVER=$CARLA_SDL_VIDEODRIVER")
 fi
