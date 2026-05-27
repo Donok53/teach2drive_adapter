@@ -18,6 +18,8 @@ export CARLA_EXTRA_ARGS=${CARLA_EXTRA_ARGS:-"-stdout -FullStdOutLogOutput"}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export PYTHON_EGG_CACHE=${PYTHON_EGG_CACHE:-"$HOME/.cache/python-eggs-carla37"}
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-"/tmp/runtime-$USER"}
+export NVIDIA_DEB_DIR=${NVIDIA_DEB_DIR:-"$HOME/nvidia-debs"}
+export NVIDIA_RUNTIME_ROOT=${NVIDIA_RUNTIME_ROOT:-"$HOME/.local/nvidia-runtime"}
 export PATH="$HOME/.local/bin:$PATH"
 
 mkdir -p "$(dirname "$CARLA_LOG")" "$PYTHON_EGG_CACHE" "$XDG_RUNTIME_DIR" "$HOME/.local/bin"
@@ -40,6 +42,52 @@ SH
   chmod +x "$HOME/.local/bin/xdg-user-dir"
 fi
 
+setup_nvidia_runtime() {
+  local libdir="$NVIDIA_RUNTIME_ROOT/usr/lib/x86_64-linux-gnu"
+  local icd="$NVIDIA_RUNTIME_ROOT/usr/share/vulkan/icd.d/nvidia_icd.json"
+  local layers="$NVIDIA_RUNTIME_ROOT/usr/share/vulkan/implicit_layer.d"
+  local marker="$NVIDIA_RUNTIME_ROOT/.teach2drive_nvidia_runtime_unpacked"
+  local found_deb=0
+
+  if [[ ! -f "$marker" && -d "$NVIDIA_DEB_DIR" ]]; then
+    mkdir -p "$NVIDIA_RUNTIME_ROOT"
+    echo "=== unpack NVIDIA runtime from $NVIDIA_DEB_DIR -> $NVIDIA_RUNTIME_ROOT"
+    for deb in \
+      "$NVIDIA_DEB_DIR"/libnvidia-compute-*.deb \
+      "$NVIDIA_DEB_DIR"/libnvidia-gpucomp-*.deb \
+      "$NVIDIA_DEB_DIR"/libnvidia-gl-*.deb
+    do
+      if [[ -f "$deb" ]]; then
+        found_deb=1
+        echo "unpack $(basename "$deb")"
+        dpkg-deb -x "$deb" "$NVIDIA_RUNTIME_ROOT"
+      fi
+    done
+    if [[ "$found_deb" == 1 ]]; then
+      touch "$marker"
+    fi
+  fi
+
+  if [[ -f "$icd" && -d "$libdir" ]]; then
+    export LD_LIBRARY_PATH="$libdir:${LD_LIBRARY_PATH:-}"
+    export VK_ICD_FILENAMES="$icd"
+    if [[ -d "$layers" ]]; then
+      export VK_LAYER_PATH="$layers"
+    fi
+    export __GLX_VENDOR_LIBRARY_NAME=${__GLX_VENDOR_LIBRARY_NAME:-nvidia}
+    export __NV_PRIME_RENDER_OFFLOAD=${__NV_PRIME_RENDER_OFFLOAD:-1}
+    echo "=== NVIDIA runtime configured"
+    echo "LD_LIBRARY_PATH=$libdir:..."
+    echo "VK_ICD_FILENAMES=$VK_ICD_FILENAMES"
+  else
+    echo "=== WARNING: NVIDIA Vulkan runtime not configured"
+    echo "NVIDIA_DEB_DIR=$NVIDIA_DEB_DIR"
+    echo "expected_icd=$icd"
+  fi
+}
+
+setup_nvidia_runtime
+
 check_carla() {
   "$PY" - "$HOST" "$PORT" <<'PY'
 import sys
@@ -59,7 +107,17 @@ else
   echo "=== start CARLA host=$HOST port=$PORT"
   (
     cd "$CARLA_ROOT"
-    nohup env PATH="$PATH" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" SDL_VIDEODRIVER=offscreen \
+    carla_env=(
+      "PATH=$PATH"
+      "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+      "SDL_VIDEODRIVER=offscreen"
+    )
+    [[ -n "${LD_LIBRARY_PATH:-}" ]] && carla_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+    [[ -n "${VK_ICD_FILENAMES:-}" ]] && carla_env+=("VK_ICD_FILENAMES=$VK_ICD_FILENAMES")
+    [[ -n "${VK_LAYER_PATH:-}" ]] && carla_env+=("VK_LAYER_PATH=$VK_LAYER_PATH")
+    [[ -n "${__GLX_VENDOR_LIBRARY_NAME:-}" ]] && carla_env+=("__GLX_VENDOR_LIBRARY_NAME=$__GLX_VENDOR_LIBRARY_NAME")
+    [[ -n "${__NV_PRIME_RENDER_OFFLOAD:-}" ]] && carla_env+=("__NV_PRIME_RENDER_OFFLOAD=$__NV_PRIME_RENDER_OFFLOAD")
+    nohup env "${carla_env[@]}" \
       ./CarlaUE4.sh -RenderOffScreen -nosound -quality-level=Low -carla-rpc-port="$PORT" $CARLA_EXTRA_ARGS > "$CARLA_LOG" 2>&1 &
     echo "$!" > "$CARLA_LOG.pid"
   )
