@@ -35,6 +35,8 @@ EPISODES=${EPISODES:-0}
 START_EPISODE_INDEX=${START_EPISODE_INDEX:-0}
 LIDAR_FORMAT=${LIDAR_FORMAT:-npz}
 OVERWRITE=${OVERWRITE:-0}
+TIMEOUT=${TIMEOUT:-30.0}
+SENSOR_TIMEOUT=${SENSOR_TIMEOUT:-10.0}
 
 EXTRA_ARGS=()
 if [[ "$OVERWRITE" == "1" || "$OVERWRITE" == "true" || "$OVERWRITE" == "TRUE" ]]; then
@@ -72,6 +74,8 @@ fi
   --global-distance-to-leading-vehicle "$GLOBAL_DISTANCE_TO_LEADING_VEHICLE" \
   --global-speed-difference "$GLOBAL_SPEED_DIFFERENCE" \
   --ignore-lights-percent "$IGNORE_LIGHTS_PERCENT" \
+  --timeout "$TIMEOUT" \
+  --sensor-timeout "$SENSOR_TIMEOUT" \
   --traffic-schedule "$TRAFFIC_SCHEDULE" \
   --traffic-schedule-seed "$TRAFFIC_SCHEDULE_SEED" \
   --min-moving-speed-mps "$MIN_MOVING_SPEED_MPS" \
