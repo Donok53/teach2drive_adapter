@@ -146,8 +146,6 @@ def _install_carla_python_path(carla_root: str) -> None:
         root / "PythonAPI" / "carla",
         *wheels,
         *eggs,
-        *sorted(dist.glob("carla-*.egg")),
-        *sorted(dist.glob("carla-*.whl")),
     ]
     seen = set()
     for path in reversed(candidates):
