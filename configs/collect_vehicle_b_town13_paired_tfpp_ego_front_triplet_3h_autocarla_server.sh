@@ -54,7 +54,7 @@ setup_nvidia_runtime() {
   local marker="$NVIDIA_RUNTIME_ROOT/.teach2drive_nvidia_runtime_unpacked"
   local found_deb=0
 
-  if [[ ! -f "$marker" && -d "$NVIDIA_DEB_DIR" ]]; then
+  if [[ "$NVIDIA_RUNTIME_ROOT" != "/" && ! -f "$marker" && -d "$NVIDIA_DEB_DIR" ]]; then
     mkdir -p "$NVIDIA_RUNTIME_ROOT"
     echo "=== unpack NVIDIA runtime from $NVIDIA_DEB_DIR -> $NVIDIA_RUNTIME_ROOT"
     for deb in \
