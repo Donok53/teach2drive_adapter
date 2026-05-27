@@ -19,7 +19,12 @@ if [[ ! -x "$MICROMAMBA_BIN" ]]; then
   echo "=== install micromamba -> $MICROMAMBA_BIN"
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT
-  curl -Ls "$MICROMAMBA_URL" | tar -xvj -C "$tmpdir" bin/micromamba
+  archive="$tmpdir/micromamba.tar.bz2"
+  curl --fail --location --show-error --retry 8 --retry-delay 2 --connect-timeout 30 \
+    --output "$archive" \
+    "$MICROMAMBA_URL"
+  tar -tjf "$archive" >/dev/null
+  tar -xjf "$archive" -C "$tmpdir" bin/micromamba
   install -m 755 "$tmpdir/bin/micromamba" "$MICROMAMBA_BIN"
 fi
 
