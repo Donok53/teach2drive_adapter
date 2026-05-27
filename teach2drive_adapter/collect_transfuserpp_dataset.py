@@ -132,12 +132,28 @@ def _install_carla_python_path(carla_root: str) -> None:
     dist = root / "PythonAPI" / "carla" / "dist"
     py_major = sys.version_info.major
     py_minor = sys.version_info.minor
+    wheels = [
+        path
+        for path in sorted(dist.glob("carla-*.whl"))
+        if f"cp{py_major}{py_minor}" in path.name or "py3" in path.name
+    ]
+    eggs = [
+        path
+        for path in sorted(dist.glob("carla-*.egg"))
+        if f"py{py_major}.{py_minor}" in path.name or f"py{py_major}" in path.name
+    ]
     candidates = [
         root / "PythonAPI" / "carla",
-        *[path for path in sorted(dist.glob("carla-*.whl")) if f"cp{py_major}{py_minor}" in path.name],
-        *[path for path in sorted(dist.glob("carla-*.egg")) if f"py{py_major}.{py_minor}" in path.name],
+        *wheels,
+        *eggs,
+        *sorted(dist.glob("carla-*.egg")),
+        *sorted(dist.glob("carla-*.whl")),
     ]
+    seen = set()
     for path in reversed(candidates):
+        if path in seen:
+            continue
+        seen.add(path)
         if path.exists() and str(path) not in sys.path:
             sys.path.insert(0, str(path))
 
