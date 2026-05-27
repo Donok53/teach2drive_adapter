@@ -8,6 +8,10 @@ CARLA_LOG=${CARLA_LOG:-"$HOME/teach2drive/logs/carla_probe.log"}
 PY=${PY:-"$HOME/.venv/carla37/bin/python"}
 RUNTIME=${NVIDIA_RUNTIME_ROOT:-"$HOME/.local/nvidia-runtime"}
 READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-90}
+CARLA_RENDER_ARGS=${CARLA_RENDER_ARGS:-"-RenderOffScreen"}
+CARLA_SDL_VIDEODRIVER=${CARLA_SDL_VIDEODRIVER:-offscreen}
+CARLA_DISPLAY=${CARLA_DISPLAY:-}
+CARLA_EXTRA_ARGS=${CARLA_EXTRA_ARGS:-"-stdout -FullStdOutLogOutput"}
 
 LIBDIR="$RUNTIME/usr/lib/x86_64-linux-gnu"
 ICD="$RUNTIME/usr/share/vulkan/icd.d/nvidia_icd.json"
@@ -55,22 +59,30 @@ rm -f "$CARLA_LOG" "$CARLA_LOG.pid"
 cd "$CARLA_ROOT"
 
 echo "start CARLA port=$PORT log=$CARLA_LOG"
+carla_env=(
+  "PATH=$HOME/.local/bin:$PATH"
+  "XDG_RUNTIME_DIR=$XDG_DIR"
+  "LD_LIBRARY_PATH=$LIBDIR:${LD_LIBRARY_PATH:-}"
+  "VK_ICD_FILENAMES=$ICD"
+  "VK_LAYER_PATH=$LAYERS"
+  "__GLX_VENDOR_LIBRARY_NAME=nvidia"
+  "__NV_PRIME_RENDER_OFFLOAD=1"
+)
+if [[ -n "$CARLA_SDL_VIDEODRIVER" ]]; then
+  carla_env+=("SDL_VIDEODRIVER=$CARLA_SDL_VIDEODRIVER")
+fi
+if [[ -n "$CARLA_DISPLAY" ]]; then
+  carla_env+=("DISPLAY=$CARLA_DISPLAY")
+fi
+
 setsid env \
-  PATH="$HOME/.local/bin:$PATH" \
-  XDG_RUNTIME_DIR="$XDG_DIR" \
-  SDL_VIDEODRIVER=offscreen \
-  LD_LIBRARY_PATH="$LIBDIR:${LD_LIBRARY_PATH:-}" \
-  VK_ICD_FILENAMES="$ICD" \
-  VK_LAYER_PATH="$LAYERS" \
-  __GLX_VENDOR_LIBRARY_NAME=nvidia \
-  __NV_PRIME_RENDER_OFFLOAD=1 \
+  "${carla_env[@]}" \
   ./CarlaUE4.sh \
-    -RenderOffScreen \
+    $CARLA_RENDER_ARGS \
     -nosound \
     -quality-level=Low \
     -carla-rpc-port="$PORT" \
-    -stdout \
-    -FullStdOutLogOutput \
+    $CARLA_EXTRA_ARGS \
   > "$CARLA_LOG" 2>&1 < /dev/null &
 carla_pid=$!
 echo "$carla_pid" > "$CARLA_LOG.pid"
