@@ -3,10 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# One-command target-domain paired collection:
+# One-command paired collection:
 #   1. reuse CARLA on HOST:PORT if it is already ready
 #   2. otherwise start CARLA from CARLA_ROOT
-#   3. collect Town13 vehicle-B paired tfpp_ego/front_triplet_shifted data
+#   3. run COLLECT_CONFIG
 
 export PY=${PY:-"$HOME/.venv/carla37/bin/python"}
 export HOST=${HOST:-127.0.0.1}
@@ -24,6 +24,7 @@ export CARLA_SDL_VIDEODRIVER=${CARLA_SDL_VIDEODRIVER:-x11}
 export CARLA_DISPLAY=${CARLA_DISPLAY:-:1}
 export CARLA_GLX_VENDOR=${CARLA_GLX_VENDOR:-}
 export CARLA_NV_PRIME_RENDER_OFFLOAD=${CARLA_NV_PRIME_RENDER_OFFLOAD:-}
+export COLLECT_CONFIG=${COLLECT_CONFIG:-configs/collect_vehicle_b_town13_paired_tfpp_ego_front_triplet_3h.sh}
 export PATH="$HOME/.local/bin:$PATH"
 
 mkdir -p "$(dirname "$CARLA_LOG")" "$PYTHON_EGG_CACHE" "$XDG_RUNTIME_DIR" "$HOME/.local/bin"
@@ -157,4 +158,4 @@ else
   done
 fi
 
-exec bash configs/collect_vehicle_b_town13_paired_tfpp_ego_front_triplet_3h.sh
+exec bash "$COLLECT_CONFIG"
