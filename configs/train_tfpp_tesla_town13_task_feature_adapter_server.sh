@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# Target-only task-driven feature adapter for the Tesla Town13 dataset.
+#
+# This script intentionally trains from only the target vehicle/sensor rig:
+#
+#   front_triplet_shifted sensors -> frozen TransFuser++ with inserted
+#   feature-then-fusion adapter -> TransFuser++ waypoint/speed outputs
+#   -> expert trajectory/speed/stop losses.
+#
+# It does not export, cache, or train against tfpp_ego/canonical sensor views.
+
+export PY=${PY:-python}
+export SOURCE_DATA_ROOT=${SOURCE_DATA_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_tesla_town13_paired_tfpp_ego_front_triplet_3h"}
+export SNAPSHOT_ROOT=${SNAPSHOT_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_tesla_town13_front_triplet_target_only_snapshot_complete"}
+export SNAPSHOT_COMPLETE_EPISODES=${SNAPSHOT_COMPLETE_EPISODES:-1}
+export REFRESH_SNAPSHOT=${REFRESH_SNAPSHOT:-1}
+export SNAPSHOT_MIN_FRAMES=${SNAPSHOT_MIN_FRAMES:-1150}
+export SNAPSHOT_REQUIRED_PROFILES=${SNAPSHOT_REQUIRED_PROFILES:-"front_triplet_shifted"}
+
+export WORK_ROOT=${WORK_ROOT:-"$HOME/dataset/byeongjae/runs/tfpp_tesla_town13_task_feature_adapter"}
+export BOOTSTRAP_ROOT=${BOOTSTRAP_ROOT:-"$HOME/teach2drive/workspace/teach2drive_bootstrap"}
+export GARAGE_ROOT=${GARAGE_ROOT:-"$HOME/teach2drive/workspace/carla_garage"}
+export TEAM_CONFIG=${TEAM_CONFIG:-"$HOME/teach2drive/checkpoints/transfuserpp/pretrained_models/all_towns"}
+export TFPP_CHECKPOINT=${TFPP_CHECKPOINT:-""}
+
+export PROFILE=${PROFILE:-front_triplet_shifted}
+export CAMERAS=${CAMERAS:-left,front,right}
+export VIEW_ROOT=${VIEW_ROOT:-"$WORK_ROOT/profile_views"}
+export TARGET_VIEW=${TARGET_VIEW:-"$VIEW_ROOT/$PROFILE"}
+export INDEX_DIR=${INDEX_DIR:-"$WORK_ROOT/indexes"}
+export TARGET_INDEX=${TARGET_INDEX:-"$INDEX_DIR/${PROFILE}_index.npz"}
+export OUT=${OUT:-"$WORK_ROOT/train_${PROFILE}_task_feature_adapter"}
+
+export EXPORT_OVERWRITE=${EXPORT_OVERWRITE:-0}
+export INDEX_OVERWRITE=${INDEX_OVERWRITE:-0}
+export OVERWRITE=${OVERWRITE:-0}
+export SKIP_INVALID_MOTION=${SKIP_INVALID_MOTION:-1}
+export AUGMENTATIONS=${AUGMENTATIONS:-0}
+export SEED=${SEED:-41}
+
+export IMAGE_WIDTH=${IMAGE_WIDTH:-640}
+export IMAGE_HEIGHT=${IMAGE_HEIGHT:-360}
+export LIDAR_SIZE=${LIDAR_SIZE:-128}
+export EPOCHS=${EPOCHS:-20}
+export EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-6}
+export EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-0.0}
+export BATCH_SIZE=${BATCH_SIZE:-8}
+export NUM_WORKERS=${NUM_WORKERS:-4}
+export LR=${LR:-2e-5}
+export WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
+export VAL_RATIO=${VAL_RATIO:-0.15}
+
+export EXTRINSIC_AWARE=${EXTRINSIC_AWARE:-1}
+export SOURCE_PROFILE=${SOURCE_PROFILE:-front_triplet_shifted}
+export EXTRINSIC_HIDDEN_DIM=${EXTRINSIC_HIDDEN_DIM:-64}
+export EXTRINSIC_DROPOUT=${EXTRINSIC_DROPOUT:-0.0}
+export HIDDEN_CHANNELS=${HIDDEN_CHANNELS:-0}
+export BLOCKS=${BLOCKS:-2}
+export DROPOUT=${DROPOUT:-0.0}
+export STAGE_FEATURE_ADAPTER_BLEND=${STAGE_FEATURE_ADAPTER_BLEND:-1.0}
+export FUSION_ADAPTER_BLEND=${FUSION_ADAPTER_BLEND:-1.0}
+export INIT_CHECKPOINT=${INIT_CHECKPOINT:-""}
+
+export XY_LOSS_WEIGHT=${XY_LOSS_WEIGHT:-0.55}
+export YAW_LOSS_WEIGHT=${YAW_LOSS_WEIGHT:-0.03}
+export SPEED_LOSS_WEIGHT=${SPEED_LOSS_WEIGHT:-0.80}
+export STOP_LOSS_WEIGHT=${STOP_LOSS_WEIGHT:-0.08}
+export FEATURE_DRIFT_LOSS_WEIGHT=${FEATURE_DRIFT_LOSS_WEIGHT:-0.10}
+
+export MOVING_SAMPLE_WEIGHT=${MOVING_SAMPLE_WEIGHT:-1.15}
+export STOPPED_SAMPLE_WEIGHT=${STOPPED_SAMPLE_WEIGHT:-1.0}
+export HAZARD_STOP_REASONS=${HAZARD_STOP_REASONS:-traffic_light,stop_sign,front_vehicle,junction_yield}
+export HAZARD_SAMPLE_WEIGHT=${HAZARD_SAMPLE_WEIGHT:-2.0}
+
+export SPEED_FLOOR_LOSS_WEIGHT=${SPEED_FLOOR_LOSS_WEIGHT:-0.03}
+export SPEED_FLOOR_MPS=${SPEED_FLOOR_MPS:-0.8}
+export SPEED_FLOOR_TARGET_THRESHOLD=${SPEED_FLOOR_TARGET_THRESHOLD:-2.0}
+export STOP_SPEED_CEILING_LOSS_WEIGHT=${STOP_SPEED_CEILING_LOSS_WEIGHT:-0.35}
+export STOP_SPEED_CEILING_MPS=${STOP_SPEED_CEILING_MPS:-0.5}
+export STOP_SPEED_TARGET_THRESHOLD=${STOP_SPEED_TARGET_THRESHOLD:-0.5}
+export LAUNCH_SAMPLE_WEIGHT=${LAUNCH_SAMPLE_WEIGHT:-1.4}
+export LAUNCH_SPEED_FLOOR_LOSS_WEIGHT=${LAUNCH_SPEED_FLOOR_LOSS_WEIGHT:-0.04}
+export LAUNCH_SPEED_FLOOR_MPS=${LAUNCH_SPEED_FLOOR_MPS:-1.2}
+export RELEASE_SAMPLE_WEIGHT=${RELEASE_SAMPLE_WEIGHT:-1.3}
+export RELEASE_SPEED_FLOOR_LOSS_WEIGHT=${RELEASE_SPEED_FLOOR_LOSS_WEIGHT:-0.04}
+export RELEASE_SPEED_FLOOR_MPS=${RELEASE_SPEED_FLOOR_MPS:-1.2}
+export GRAD_CLIP=${GRAD_CLIP:-1.0}
+
+mkdir -p "$WORK_ROOT" "$VIEW_ROOT" "$INDEX_DIR"
+
+if [[ "$SNAPSHOT_COMPLETE_EPISODES" == "1" ]]; then
+  echo "=== snapshot complete target-rig episodes from $SOURCE_DATA_ROOT -> $SNAPSHOT_ROOT"
+  SOURCE_DATA_ROOT="$SOURCE_DATA_ROOT" \
+  SNAPSHOT_ROOT="$SNAPSHOT_ROOT" \
+  REFRESH_SNAPSHOT="$REFRESH_SNAPSHOT" \
+  SNAPSHOT_MIN_FRAMES="$SNAPSHOT_MIN_FRAMES" \
+  SNAPSHOT_REQUIRED_PROFILES="$SNAPSHOT_REQUIRED_PROFILES" \
+  "$PY" - <<'PY'
+import json
+import os
+import shutil
+from pathlib import Path
+
+src = Path(os.environ["SOURCE_DATA_ROOT"]).expanduser()
+dst = Path(os.environ["SNAPSHOT_ROOT"]).expanduser()
+min_frames = int(os.environ.get("SNAPSHOT_MIN_FRAMES", "1150"))
+profiles = [p.strip() for p in os.environ.get("SNAPSHOT_REQUIRED_PROFILES", "").split(",") if p.strip()]
+
+if os.environ.get("REFRESH_SNAPSHOT", "1") == "1" and dst.exists():
+    shutil.rmtree(dst)
+dst.mkdir(parents=True, exist_ok=True)
+
+accepted = []
+rejected = []
+for ep in sorted(src.glob("episode_*")):
+    if not ep.is_dir():
+        continue
+    frames = ep / "frames.jsonl"
+    if not frames.exists():
+        rejected.append((ep.name, "missing frames.jsonl"))
+        continue
+    missing_layouts = [
+        profile
+        for profile in profiles
+        if not (ep / "rigs" / profile / "sensor_layout.json").exists()
+    ]
+    if missing_layouts:
+        rejected.append((ep.name, "missing layouts=" + ",".join(missing_layouts)))
+        continue
+    try:
+        frame_count = sum(1 for _ in frames.open("r", encoding="utf-8"))
+    except OSError as exc:
+        rejected.append((ep.name, f"frames read failed: {exc}"))
+        continue
+    if frame_count < min_frames:
+        rejected.append((ep.name, f"frames={frame_count} < {min_frames}"))
+        continue
+    target = dst / ep.name
+    if not target.exists():
+        target.symlink_to(ep, target_is_directory=True)
+    accepted.append((ep.name, frame_count))
+
+print(json.dumps({
+    "source": str(src),
+    "snapshot": str(dst),
+    "required_profiles": profiles,
+    "accepted": len(accepted),
+    "accepted_tail": accepted[-8:],
+    "rejected": len(rejected),
+    "rejected_tail": rejected[-8:],
+}, indent=2, ensure_ascii=False))
+if not accepted:
+    raise SystemExit("no complete target-rig episodes available for training")
+PY
+  export DATA_ROOT="$SNAPSHOT_ROOT"
+else
+  export DATA_ROOT=${DATA_ROOT:-"$SOURCE_DATA_ROOT"}
+fi
+
+EXPORT_ARGS=()
+if [[ "$EXPORT_OVERWRITE" == "1" ]]; then
+  EXPORT_ARGS+=(--overwrite)
+fi
+if [[ "$SKIP_INVALID_MOTION" == "1" || "$SKIP_INVALID_MOTION" == "true" || "$SKIP_INVALID_MOTION" == "TRUE" ]]; then
+  EXPORT_ARGS+=(--skip-invalid-motion)
+fi
+
+echo "=== export $PROFILE profile view"
+"$PY" -m teach2drive_adapter.export_paired_profile_view \
+  --input-root "$DATA_ROOT" \
+  --output-root "$TARGET_VIEW" \
+  --profile "$PROFILE" \
+  --require-cameras "$CAMERAS" \
+  "${EXPORT_ARGS[@]}"
+
+if [[ -f "$TARGET_INDEX" && "$INDEX_OVERWRITE" != "1" ]]; then
+  echo "=== reuse index $TARGET_INDEX"
+else
+  echo "=== build index $TARGET_INDEX cameras=$CAMERAS"
+  (
+    cd "$BOOTSTRAP_ROOT"
+    PYTHONPATH="$BOOTSTRAP_ROOT:${PYTHONPATH:-}" "$PY" -m teach2drive.token_dataset \
+      --input-root "$TARGET_VIEW" \
+      --output "$TARGET_INDEX" \
+      --cameras "$CAMERAS" \
+      --augmentations "$AUGMENTATIONS" \
+      --pseudo-label-name "__missing_pseudo_labels__.jsonl" \
+      --seed "$SEED"
+  )
+fi
+
+if [[ -f "$OUT/best_model.pt" && "$OVERWRITE" != "1" ]]; then
+  echo "=== reuse trained task feature adapter $OUT/best_model.pt"
+  exit 0
+fi
+if [[ "$OVERWRITE" == "1" ]]; then
+  rm -rf "$OUT"
+fi
+mkdir -p "$OUT"
+
+TRAIN_ARGS=()
+if [[ "$EXTRINSIC_AWARE" == "1" || "$EXTRINSIC_AWARE" == "true" || "$EXTRINSIC_AWARE" == "TRUE" ]]; then
+  TRAIN_ARGS+=(--extrinsic-aware)
+fi
+if [[ -n "$TFPP_CHECKPOINT" ]]; then
+  TRAIN_ARGS+=(--checkpoint "$TFPP_CHECKPOINT")
+fi
+if [[ -n "$INIT_CHECKPOINT" ]]; then
+  TRAIN_ARGS+=(--init-checkpoint "$INIT_CHECKPOINT")
+fi
+
+echo "=== train target-only task feature adapter"
+PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_adapter \
+  --index "$TARGET_INDEX" \
+  --episode-root-override "$TARGET_VIEW" \
+  --out-dir "$OUT" \
+  --garage-root "$GARAGE_ROOT" \
+  --team-config "$TEAM_CONFIG" \
+  --cameras "$CAMERAS" \
+  --tfpp-camera front \
+  --command-mode target_angle \
+  --image-size "$IMAGE_WIDTH" "$IMAGE_HEIGHT" \
+  --lidar-size "$LIDAR_SIZE" \
+  --source-profile "$SOURCE_PROFILE" \
+  --extrinsic-hidden-dim "$EXTRINSIC_HIDDEN_DIM" \
+  --extrinsic-dropout "$EXTRINSIC_DROPOUT" \
+  --hidden-channels "$HIDDEN_CHANNELS" \
+  --blocks "$BLOCKS" \
+  --dropout "$DROPOUT" \
+  --stage-feature-adapter-blend "$STAGE_FEATURE_ADAPTER_BLEND" \
+  --fusion-adapter-blend "$FUSION_ADAPTER_BLEND" \
+  --epochs "$EPOCHS" \
+  --early-stop-patience "$EARLY_STOP_PATIENCE" \
+  --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
+  --batch-size "$BATCH_SIZE" \
+  --num-workers "$NUM_WORKERS" \
+  --lr "$LR" \
+  --weight-decay "$WEIGHT_DECAY" \
+  --val-ratio "$VAL_RATIO" \
+  --seed "$SEED" \
+  --xy-loss-weight "$XY_LOSS_WEIGHT" \
+  --yaw-loss-weight "$YAW_LOSS_WEIGHT" \
+  --speed-loss-weight "$SPEED_LOSS_WEIGHT" \
+  --stop-loss-weight "$STOP_LOSS_WEIGHT" \
+  --feature-drift-loss-weight "$FEATURE_DRIFT_LOSS_WEIGHT" \
+  --moving-sample-weight "$MOVING_SAMPLE_WEIGHT" \
+  --stopped-sample-weight "$STOPPED_SAMPLE_WEIGHT" \
+  --hazard-stop-reasons "$HAZARD_STOP_REASONS" \
+  --hazard-sample-weight "$HAZARD_SAMPLE_WEIGHT" \
+  --speed-floor-loss-weight "$SPEED_FLOOR_LOSS_WEIGHT" \
+  --speed-floor-mps "$SPEED_FLOOR_MPS" \
+  --speed-floor-target-threshold "$SPEED_FLOOR_TARGET_THRESHOLD" \
+  --stop-speed-ceiling-loss-weight "$STOP_SPEED_CEILING_LOSS_WEIGHT" \
+  --stop-speed-ceiling-mps "$STOP_SPEED_CEILING_MPS" \
+  --stop-speed-target-threshold "$STOP_SPEED_TARGET_THRESHOLD" \
+  --launch-sample-weight "$LAUNCH_SAMPLE_WEIGHT" \
+  --launch-speed-floor-loss-weight "$LAUNCH_SPEED_FLOOR_LOSS_WEIGHT" \
+  --launch-speed-floor-mps "$LAUNCH_SPEED_FLOOR_MPS" \
+  --release-sample-weight "$RELEASE_SAMPLE_WEIGHT" \
+  --release-speed-floor-loss-weight "$RELEASE_SPEED_FLOOR_LOSS_WEIGHT" \
+  --release-speed-floor-mps "$RELEASE_SPEED_FLOOR_MPS" \
+  --grad-clip "$GRAD_CLIP" \
+  "${TRAIN_ARGS[@]}" \
+  2>&1 | tee "$OUT/train.log"
