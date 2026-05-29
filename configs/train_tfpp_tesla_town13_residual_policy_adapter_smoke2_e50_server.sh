@@ -12,6 +12,7 @@ export SNAPSHOT_ROOT=${SNAPSHOT_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_tesl
 export SNAPSHOT_COMPLETE_EPISODES=${SNAPSHOT_COMPLETE_EPISODES:-1}
 export REFRESH_SNAPSHOT=${REFRESH_SNAPSHOT:-1}
 export SNAPSHOT_MIN_FRAMES=${SNAPSHOT_MIN_FRAMES:-1150}
+export SNAPSHOT_REQUIRED_PROFILES=${SNAPSHOT_REQUIRED_PROFILES:-"front_triplet_shifted"}
 
 export WORK_ROOT=${WORK_ROOT:-"$HOME/dataset/byeongjae/runs/tfpp_tesla_town13_residual_policy_adapter_smoke2_complete"}
 export OUT=${OUT:-"$WORK_ROOT/train_front_triplet_shifted_residual_policy_adapter_e50"}
