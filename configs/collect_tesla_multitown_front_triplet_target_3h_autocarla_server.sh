@@ -25,7 +25,7 @@ export TRAFFIC_SCHEDULE=${TRAFFIC_SCHEDULE:-vehicle_b_mixed}
 export TRAFFIC_VEHICLES=${TRAFFIC_VEHICLES:-60}
 export FAIL_ON_INVALID_MOTION=${FAIL_ON_INVALID_MOTION:-1}
 
-TOWNS_CSV=${TOWNS_CSV:-Town03,Town05,Town06,Town10HD_Opt}
+TOWNS_CSV=${TOWNS_CSV:-Town03_Opt,Town05_Opt,Town06,Town10HD_Opt}
 IFS=',' read -r -a TOWNS <<< "$TOWNS_CSV"
 
 mkdir -p "$(dirname "$CARLA_LOG")" "$OUTPUT_ROOT"
