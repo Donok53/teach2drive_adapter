@@ -22,6 +22,7 @@ export NVIDIA_DEB_DIR=${NVIDIA_DEB_DIR:-"$HOME/nvidia-debs"}
 export NVIDIA_RUNTIME_ROOT=${NVIDIA_RUNTIME_ROOT:-"/"}
 export CARLA_SDL_VIDEODRIVER=${CARLA_SDL_VIDEODRIVER:-x11}
 export CARLA_DISPLAY=${CARLA_DISPLAY:-:1}
+export CARLA_GRAPHICS_ADAPTER=${CARLA_GRAPHICS_ADAPTER:-0}
 export CARLA_GLX_VENDOR=${CARLA_GLX_VENDOR:-}
 export CARLA_NV_PRIME_RENDER_OFFLOAD=${CARLA_NV_PRIME_RENDER_OFFLOAD:-}
 export COLLECT_CONFIG=${COLLECT_CONFIG:-configs/collect_tesla_front_triplet_target_3h.sh}
@@ -133,7 +134,7 @@ else
     [[ -n "${__GLX_VENDOR_LIBRARY_NAME:-}" ]] && carla_env+=("__GLX_VENDOR_LIBRARY_NAME=$__GLX_VENDOR_LIBRARY_NAME")
     [[ -n "${__NV_PRIME_RENDER_OFFLOAD:-}" ]] && carla_env+=("__NV_PRIME_RENDER_OFFLOAD=$__NV_PRIME_RENDER_OFFLOAD")
     nohup env "${carla_env[@]}" \
-      ./CarlaUE4.sh -RenderOffScreen -nosound -quality-level=Low -carla-rpc-port="$PORT" $CARLA_EXTRA_ARGS > "$CARLA_LOG" 2>&1 &
+      ./CarlaUE4.sh -RenderOffScreen -nosound -quality-level=Low -graphicsadapter="$CARLA_GRAPHICS_ADAPTER" -carla-rpc-port="$PORT" $CARLA_EXTRA_ARGS > "$CARLA_LOG" 2>&1 &
     echo "$!" > "$CARLA_LOG.pid"
   )
   CARLA_PID=$(cat "$CARLA_LOG.pid")
