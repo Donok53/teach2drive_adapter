@@ -37,6 +37,7 @@ export TOTAL_ROUTES=${TOTAL_ROUTES:-}
 export REFRESH_ROUTE_SUBSET=${REFRESH_ROUTE_SUBSET:-0}
 export TIMEOUT=${TIMEOUT:-600}
 export RESUME=${RESUME:-1}
+export ROUTES_SUBSET=${ROUTES_SUBSET:-}
 export REPETITION=${REPETITION:-0}
 export TOWN=${TOWN:-pdm_lite_8town_tesla}
 export DEBUG_CHALLENGE=${DEBUG_CHALLENGE:-0}
@@ -102,9 +103,15 @@ echo "GARAGE_ROOT=$GARAGE_ROOT"
 echo "CARLA_ROOT=$CARLA_ROOT"
 echo "EGO_VEHICLE_MODEL=$EGO_VEHICLE_MODEL"
 echo "ROUTES=$ROUTES"
+echo "ROUTES_SUBSET=${ROUTES_SUBSET:-<all>}"
 echo "TOTAL_ROUTES=$TOTAL_ROUTES"
 echo "OUTPUT_ROOT=$OUTPUT_ROOT"
 echo "CHECKPOINT_ENDPOINT=$CHECKPOINT_ENDPOINT"
+
+route_subset_args=()
+if [[ -n "$ROUTES_SUBSET" ]]; then
+  route_subset_args=(--routes-subset "$ROUTES_SUBSET")
+fi
 
 "$PY" leaderboard_autopilot/leaderboard/leaderboard_evaluator_local.py \
   --host "$HOST" \
@@ -112,6 +119,7 @@ echo "CHECKPOINT_ENDPOINT=$CHECKPOINT_ENDPOINT"
   --traffic-manager-port "$TM_PORT" \
   --traffic-manager-seed "$TM_SEED" \
   --routes "$ROUTE_SUBSET_XML" \
+  "${route_subset_args[@]}" \
   --repetitions 1 \
   --track MAP \
   --checkpoint "$CHECKPOINT_ENDPOINT" \
