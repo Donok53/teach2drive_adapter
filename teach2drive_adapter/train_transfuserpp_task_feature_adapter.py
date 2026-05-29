@@ -17,6 +17,7 @@ from .cache_transfuserpp_feature_fusion_features import (
     _capture_backbone_feature_fusion_features,
 )
 from .data import STOP_REASON_NAMES, Teach2DriveIndexDataset, split_by_episode
+from .peft_lora import install_lora_adapters, lora_parameters, lora_state_dict, set_lora_train_mode
 from .train_adapter import _per_sample_vector, _weighted_mean
 from .train_transfuserpp_feature_then_fusion_adapter import (
     ExtrinsicAwareFeatureThenFusionAdapter,
@@ -307,6 +308,7 @@ def _set_frozen_tfpp_runtime_mode(net: nn.Module, train: bool) -> None:
     """Keep TF++ deterministic, but allow cuDNN RNN backward during training."""
 
     net.eval()
+    set_lora_train_mode(net, train)
     if not train:
         return
     for module in net.modules():
@@ -365,7 +367,10 @@ def _run_epoch(net, adapter, patch, loader, optimizer, config, cameras, device, 
                 optimizer.zero_grad(set_to_none=True)
                 losses["loss"].backward()
                 if float(args.grad_clip) > 0.0:
-                    nn.utils.clip_grad_norm_(adapter.parameters(), float(args.grad_clip))
+                    nn.utils.clip_grad_norm_(
+                        list(adapter.parameters()) + list(lora_parameters(net)),
+                        float(args.grad_clip),
+                    )
                 optimizer.step()
         batch_size = int(scalar.shape[0])
         for name in metric_names:
@@ -433,6 +438,18 @@ def train(args: argparse.Namespace) -> None:
     net.eval()
     for param in net.parameters():
         param.requires_grad_(False)
+    peft_lora_modules: list[str] = []
+    if int(args.lora_rank) > 0:
+        peft_lora_modules = install_lora_adapters(
+            net,
+            include=args.lora_include,
+            exclude=args.lora_exclude,
+            rank=int(args.lora_rank),
+            alpha=float(args.lora_alpha),
+            dropout=float(args.lora_dropout),
+        )
+        if not peft_lora_modules:
+            raise ValueError(f"No LoRA modules matched include={args.lora_include!r} exclude={args.lora_exclude!r}")
 
     probe_loader = DataLoader(
         train_ds,
@@ -472,7 +489,9 @@ def train(args: argparse.Namespace) -> None:
         stage_blend=float(args.stage_feature_adapter_blend),
         fusion_blend=float(args.fusion_adapter_blend),
     )
-    optimizer = torch.optim.AdamW(adapter.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    trainable_params = list(adapter.parameters())
+    trainable_params.extend(lora_parameters(net))
+    optimizer = torch.optim.AdamW(trainable_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     metadata = {
         "mode": "transfuserpp_extrinsic_task_feature_then_fusion_adapter" if args.extrinsic_aware else "transfuserpp_task_feature_then_fusion_adapter",
@@ -483,6 +502,14 @@ def train(args: argparse.Namespace) -> None:
         "tfpp_load_info": load_info,
         "adapter_init_checkpoint": str(Path(args.init_checkpoint).expanduser()) if args.init_checkpoint else "",
         "adapter_init_load_info": load_adapter_info,
+        "peft_lora": {
+            "rank": int(args.lora_rank),
+            "alpha": float(args.lora_alpha),
+            "dropout": float(args.lora_dropout),
+            "include": args.lora_include,
+            "exclude": args.lora_exclude,
+            "modules": list(peft_lora_modules),
+        },
         "cameras": cameras,
         "tfpp_camera": args.tfpp_camera,
         "command_mode": args.command_mode,
@@ -508,6 +535,7 @@ def train(args: argparse.Namespace) -> None:
                 "fused_feature_shape": metadata["fused_feature_shape"],
                 "tfpp_load_info": load_info,
                 "adapter_init_load_info": load_adapter_info,
+                "peft_lora_modules": peft_lora_modules,
             },
             indent=2,
         ),
@@ -537,6 +565,7 @@ def train(args: argparse.Namespace) -> None:
                 torch.save(
                     {
                         "model_state": adapter.state_dict(),
+                        "peft_lora_state": lora_state_dict(net) if int(args.lora_rank) > 0 else {},
                         "stage_feature_shapes": stage_feature_shapes,
                         "fused_feature_shape": fused_feature_shape,
                         "metadata": metadata,
@@ -590,6 +619,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--stage-feature-adapter-blend", type=float, default=1.0)
     parser.add_argument("--fusion-adapter-blend", type=float, default=1.0)
+    parser.add_argument("--lora-rank", type=int, default=0)
+    parser.add_argument("--lora-alpha", type=float, default=16.0)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora-include",
+        default="^join\\.,^checkpoint_decoder\\.(encoder|decoder)\\.,^target_speed_network\\.",
+    )
+    parser.add_argument("--lora-exclude", default="")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--early-stop-patience", type=int, default=6)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)

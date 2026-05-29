@@ -64,6 +64,11 @@ export DROPOUT=${DROPOUT:-0.0}
 export STAGE_FEATURE_ADAPTER_BLEND=${STAGE_FEATURE_ADAPTER_BLEND:-1.0}
 export FUSION_ADAPTER_BLEND=${FUSION_ADAPTER_BLEND:-1.0}
 export INIT_CHECKPOINT=${INIT_CHECKPOINT:-""}
+export LORA_RANK=${LORA_RANK:-0}
+export LORA_ALPHA=${LORA_ALPHA:-16.0}
+export LORA_DROPOUT=${LORA_DROPOUT:-0.0}
+export LORA_INCLUDE=${LORA_INCLUDE:-"^join\\.,^checkpoint_decoder\\.(encoder|decoder)\\.,^target_speed_network\\."}
+export LORA_EXCLUDE=${LORA_EXCLUDE:-""}
 
 export XY_LOSS_WEIGHT=${XY_LOSS_WEIGHT:-0.55}
 export YAW_LOSS_WEIGHT=${YAW_LOSS_WEIGHT:-0.03}
@@ -233,6 +238,11 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --dropout "$DROPOUT" \
   --stage-feature-adapter-blend "$STAGE_FEATURE_ADAPTER_BLEND" \
   --fusion-adapter-blend "$FUSION_ADAPTER_BLEND" \
+  --lora-rank "$LORA_RANK" \
+  --lora-alpha "$LORA_ALPHA" \
+  --lora-dropout "$LORA_DROPOUT" \
+  --lora-include "$LORA_INCLUDE" \
+  --lora-exclude "$LORA_EXCLUDE" \
   --epochs "$EPOCHS" \
   --early-stop-patience "$EARLY_STOP_PATIENCE" \
   --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
