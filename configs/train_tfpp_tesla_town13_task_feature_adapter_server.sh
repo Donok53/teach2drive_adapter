@@ -52,6 +52,7 @@ export BATCH_SIZE=${BATCH_SIZE:-8}
 export NUM_WORKERS=${NUM_WORKERS:-4}
 export LR=${LR:-2e-5}
 export WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
+export DATA_PARALLEL=${DATA_PARALLEL:-0}
 export VAL_RATIO=${VAL_RATIO:-0.15}
 
 export EXTRINSIC_AWARE=${EXTRINSIC_AWARE:-1}
@@ -216,6 +217,9 @@ if [[ -n "$TFPP_CHECKPOINT" ]]; then
 fi
 if [[ -n "$INIT_CHECKPOINT" ]]; then
   TRAIN_ARGS+=(--init-checkpoint "$INIT_CHECKPOINT")
+fi
+if [[ "$DATA_PARALLEL" == "1" || "$DATA_PARALLEL" == "true" || "$DATA_PARALLEL" == "TRUE" ]]; then
+  TRAIN_ARGS+=(--data-parallel)
 fi
 
 echo "=== train target-only task feature adapter"

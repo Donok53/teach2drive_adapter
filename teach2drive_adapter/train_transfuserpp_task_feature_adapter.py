@@ -168,6 +168,92 @@ class _BackboneTaskPatch:
         backbone.forward = adapted_forward
 
 
+class _TaskAdapterForward(nn.Module):
+    """Run frozen TF++ with an inserted task adapter in a DataParallel-safe wrapper."""
+
+    def __init__(
+        self,
+        net: nn.Module,
+        adapter: FeatureThenFusionAdapter | ExtrinsicAwareFeatureThenFusionAdapter,
+        config,
+        cameras: list[str],
+        command_mode: str,
+        tfpp_camera: str,
+        stage_feature_shapes: Dict[str, tuple[int, int, int]],
+        fused_feature_shape: tuple[int, int, int],
+        stage_blend: float,
+        fusion_blend: float,
+    ) -> None:
+        super().__init__()
+        self.net = net
+        self.adapter = adapter
+        self.config = config
+        self.cameras = list(cameras)
+        self.command_mode = str(command_mode)
+        self.tfpp_camera = str(tfpp_camera)
+        self.stage_feature_shapes = stage_feature_shapes
+        self.fused_feature_shape = fused_feature_shape
+        self.stage_blend = float(stage_blend)
+        self.fusion_blend = float(fusion_blend)
+        self._patch: _BackboneTaskPatch | None = None
+
+    def set_runtime_mode(self, train: bool) -> None:
+        self.net.eval()
+        self.adapter.train(train)
+        set_lora_train_mode(self.net, train)
+        if train:
+            for module in self.net.modules():
+                if isinstance(module, nn.modules.rnn.RNNBase):
+                    module.train(True)
+
+    def _ensure_patch(self) -> _BackboneTaskPatch:
+        if self._patch is None:
+            self._patch = _BackboneTaskPatch(
+                self.net.backbone,
+                self.adapter,
+                self.stage_feature_shapes,
+                self.fused_feature_shape,
+                stage_blend=self.stage_blend,
+                fusion_blend=self.fusion_blend,
+            )
+        return self._patch
+
+    def restore(self) -> None:
+        if self._patch is not None:
+            self._patch.restore()
+            self._patch = None
+
+    def forward(
+        self,
+        scalar: torch.Tensor,
+        camera: torch.Tensor,
+        lidar: torch.Tensor,
+        target_dim: int,
+        speed_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        patch = self._ensure_patch()
+        patch.clear()
+        inputs = prepare_transfuserpp_inputs(
+            scalar=scalar,
+            camera=camera,
+            lidar=lidar,
+            cameras=self.cameras,
+            config=self.config,
+            command_mode=self.command_mode,
+            tfpp_camera=self.tfpp_camera,
+        )
+        outputs = self.net(**inputs)
+        pred_target = base_target_from_checkpoint(
+            pred_checkpoint=outputs[2],
+            pred_target_speed=outputs[1],
+            scalar=scalar,
+            config=self.config,
+            target_dim=int(target_dim),
+            speed_dim=int(speed_dim),
+        )
+        return pred_target, patch.drift_loss(scalar.device).reshape(1)
+
+
 def _infer_feature_shapes(net: nn.Module, config, loader: DataLoader, cameras: list[str], args, device: torch.device):
     captured, restore = _capture_backbone_feature_fusion_features(net)
     try:
@@ -201,7 +287,7 @@ def _infer_feature_shapes(net: nn.Module, config, loader: DataLoader, cameras: l
         restore()
 
 
-def _losses(pred: torch.Tensor, batch: Dict[str, torch.Tensor], patch: _BackboneTaskPatch, device: torch.device, args):
+def _losses(pred: torch.Tensor, batch: Dict[str, torch.Tensor], drift_loss: torch.Tensor, device: torch.device, args):
     target = batch["target"].to(device, non_blocking=True)
     scalar = batch["scalar"].to(device, non_blocking=True)
     stop_state = batch["stop_state"].to(device, non_blocking=True)
@@ -274,7 +360,7 @@ def _losses(pred: torch.Tensor, batch: Dict[str, torch.Tensor], patch: _Backbone
         effective_weight,
     )
     stop = _weighted_mean(nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], stop_target, reduction="none"), effective_weight)
-    drift = patch.drift_loss(device)
+    drift = drift_loss.reshape(-1).mean().to(device=device, dtype=torch.float32)
     total = (
         float(args.xy_loss_weight) * xy
         + float(args.yaw_loss_weight) * yaw
@@ -316,9 +402,13 @@ def _set_frozen_tfpp_runtime_mode(net: nn.Module, train: bool) -> None:
             module.train(True)
 
 
-def _run_epoch(net, adapter, patch, loader, optimizer, config, cameras, device, args, train: bool, epoch: int):
-    _set_frozen_tfpp_runtime_mode(net, train)
-    adapter.train(train)
+def _raw_task_model(model: nn.Module) -> _TaskAdapterForward:
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
+    raw_model = _raw_task_model(model)
+    raw_model.set_runtime_mode(train)
     metric_names = (
         "loss",
         "xy",
@@ -342,33 +432,21 @@ def _run_epoch(net, adapter, patch, loader, optimizer, config, cameras, device, 
         scalar = batch["scalar"].to(device, non_blocking=True)
         camera = batch["camera"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
-        inputs = prepare_transfuserpp_inputs(
-            scalar=scalar,
-            camera=camera,
-            lidar=lidar,
-            cameras=cameras,
-            config=config,
-            command_mode=args.command_mode,
-            tfpp_camera=args.tfpp_camera,
-        )
-        patch.clear()
         with torch.set_grad_enabled(train):
-            outputs = net(**inputs)
-            pred_target = base_target_from_checkpoint(
-                pred_checkpoint=outputs[2],
-                pred_target_speed=outputs[1],
-                scalar=scalar,
-                config=config,
+            pred_target, drift_loss = model(
+                scalar,
+                camera,
+                lidar,
                 target_dim=batch["target"].shape[1],
                 speed_dim=int(args.speed_dim),
             )
-            losses = _losses(pred_target, batch, patch, device, args)
+            losses = _losses(pred_target, batch, drift_loss, device, args)
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 losses["loss"].backward()
                 if float(args.grad_clip) > 0.0:
                     nn.utils.clip_grad_norm_(
-                        list(adapter.parameters()) + list(lora_parameters(net)),
+                        [param for param in model.parameters() if param.requires_grad],
                         float(args.grad_clip),
                     )
                 optimizer.step()
@@ -481,17 +559,26 @@ def train(args: argparse.Namespace) -> None:
             dropout=float(args.dropout),
         ).to(device)
     load_adapter_info = load_feature_then_fusion_checkpoint(adapter, args.init_checkpoint, strict=False)
-    patch = _BackboneTaskPatch(
-        net.backbone,
-        adapter,
-        stage_feature_shapes,
-        fused_feature_shape,
+    model = _TaskAdapterForward(
+        net=net,
+        adapter=adapter,
+        config=config,
+        cameras=cameras,
+        command_mode=args.command_mode,
+        tfpp_camera=args.tfpp_camera,
+        stage_feature_shapes=stage_feature_shapes,
+        fused_feature_shape=fused_feature_shape,
         stage_blend=float(args.stage_feature_adapter_blend),
         fusion_blend=float(args.fusion_adapter_blend),
+    ).to(device)
+    if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
+        model = nn.DataParallel(model)
+    optimizer = torch.optim.AdamW(
+        (param for param in model.parameters() if param.requires_grad),
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
     )
-    trainable_params = list(adapter.parameters())
-    trainable_params.extend(lora_parameters(net))
-    optimizer = torch.optim.AdamW(trainable_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     metadata = {
         "mode": "transfuserpp_extrinsic_task_feature_then_fusion_adapter" if args.extrinsic_aware else "transfuserpp_task_feature_then_fusion_adapter",
@@ -522,6 +609,7 @@ def train(args: argparse.Namespace) -> None:
         "extrinsic_vector": [float(v) for v in extrinsic_vector],
         "train_samples": int(len(train_ds)),
         "val_samples": int(len(val_ds)),
+        "data_parallel": bool(args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1),
         "args": vars(args),
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -536,6 +624,7 @@ def train(args: argparse.Namespace) -> None:
                 "tfpp_load_info": load_info,
                 "adapter_init_load_info": load_adapter_info,
                 "peft_lora_modules": peft_lora_modules,
+                "data_parallel": metadata["data_parallel"],
             },
             indent=2,
         ),
@@ -548,8 +637,8 @@ def train(args: argparse.Namespace) -> None:
     history = []
     try:
         for epoch in range(1, int(args.epochs) + 1):
-            train_metrics = _run_epoch(net, adapter, patch, train_loader, optimizer, config, cameras, device, args, train=True, epoch=epoch)
-            val_metrics = _run_epoch(net, adapter, patch, val_loader, optimizer, config, cameras, device, args, train=False, epoch=epoch)
+            train_metrics = _run_epoch(model, train_loader, optimizer, device, args, train=True, epoch=epoch)
+            val_metrics = _run_epoch(model, val_loader, optimizer, device, args, train=False, epoch=epoch)
             history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics})
             val_loss = float(val_metrics["loss"])
             print(
@@ -562,10 +651,11 @@ def train(args: argparse.Namespace) -> None:
                 best_val = val_loss
                 best_epoch = epoch
                 stale = 0
+                raw_model = _raw_task_model(model)
                 torch.save(
                     {
-                        "model_state": adapter.state_dict(),
-                        "peft_lora_state": lora_state_dict(net) if int(args.lora_rank) > 0 else {},
+                        "model_state": raw_model.adapter.state_dict(),
+                        "peft_lora_state": lora_state_dict(raw_model.net) if int(args.lora_rank) > 0 else {},
                         "stage_feature_shapes": stage_feature_shapes,
                         "fused_feature_shape": fused_feature_shape,
                         "metadata": metadata,
@@ -585,7 +675,7 @@ def train(args: argparse.Namespace) -> None:
                     )
                     break
     finally:
-        patch.restore()
+        _raw_task_model(model).restore()
 
     (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     summary = {"best_epoch": int(best_epoch), "best_val_loss": float(best_val), "mode": metadata["mode"]}
@@ -634,6 +724,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--speed-dim", type=int, default=4)
