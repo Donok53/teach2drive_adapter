@@ -303,8 +303,19 @@ def _losses(pred: torch.Tensor, batch: Dict[str, torch.Tensor], patch: _Backbone
     }
 
 
-def _run_epoch(net, adapter, patch, loader, optimizer, config, cameras, device, args, train: bool, epoch: int):
+def _set_frozen_tfpp_runtime_mode(net: nn.Module, train: bool) -> None:
+    """Keep TF++ deterministic, but allow cuDNN RNN backward during training."""
+
     net.eval()
+    if not train:
+        return
+    for module in net.modules():
+        if isinstance(module, nn.modules.rnn.RNNBase):
+            module.train(True)
+
+
+def _run_epoch(net, adapter, patch, loader, optimizer, config, cameras, device, args, train: bool, epoch: int):
+    _set_frozen_tfpp_runtime_mode(net, train)
     adapter.train(train)
     metric_names = (
         "loss",
