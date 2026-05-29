@@ -31,6 +31,14 @@ class LoRALinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.base(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
 
+    @property
+    def weight(self) -> torch.nn.Parameter:
+        return self.base.weight
+
+    @property
+    def bias(self) -> torch.nn.Parameter | None:
+        return self.base.bias
+
 
 def _split_patterns(raw: str | Iterable[str]) -> list[str]:
     if isinstance(raw, str):
