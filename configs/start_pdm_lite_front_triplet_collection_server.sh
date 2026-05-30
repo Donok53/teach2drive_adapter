@@ -7,6 +7,7 @@ SESSION="${SESSION:-pf}"
 PORT="${PORT:-2007}"
 TM_PORT="${TM_PORT:-8007}"
 CARLA_GRAPHICS_ADAPTER="${CARLA_GRAPHICS_ADAPTER:-7}"
+CARLA_QUALITY_LEVEL="${CARLA_QUALITY_LEVEL:-Low}"
 CARLA_EXTRA_ARGS="${CARLA_EXTRA_ARGS:--stdout -FullStdOutLogOutput}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/jovyan/dataset/byeongjae/datasets/pdm_lite_tesla_front_triplet_8town_3h}"
@@ -44,10 +45,11 @@ tmux new-session -d -s "$SESSION" bash -lc \
    PORT='$PORT' \
    TM_PORT='$TM_PORT' \
    CARLA_GRAPHICS_ADAPTER='$CARLA_GRAPHICS_ADAPTER' \
+   CARLA_QUALITY_LEVEL='$CARLA_QUALITY_LEVEL' \
    CARLA_EXTRA_ARGS='$CARLA_EXTRA_ARGS' \
    ROUTE_TIMEOUT_SEC='720' \
    ROUTE_TIMEOUT_KILL_AFTER_SEC='60' \
    bash configs/collect_tesla_pdm_lite_8town_3h_supervised_autocarla_server.sh"
 
-echo "started collection session=$SESSION port=$PORT tm_port=$TM_PORT gpu=$CARLA_GRAPHICS_ADAPTER args=$CARLA_EXTRA_ARGS log=$RUN_LOG"
+echo "started collection session=$SESSION port=$PORT tm_port=$TM_PORT gpu=$CARLA_GRAPHICS_ADAPTER quality=$CARLA_QUALITY_LEVEL args=$CARLA_EXTRA_ARGS log=$RUN_LOG"
 tmux ls
