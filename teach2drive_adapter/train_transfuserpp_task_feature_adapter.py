@@ -72,6 +72,7 @@ class _BackboneTaskPatch:
         self.fusion_blend = float(fusion_blend)
         self.original_fuse_features = backbone.fuse_features
         self.original_forward = backbone.forward
+        self.enabled = True
         self.records: list[torch.Tensor] = []
         self._install()
 
@@ -95,6 +96,9 @@ class _BackboneTaskPatch:
         patch = self
 
         def adapted_fuse_features(image_features, lidar_features, layer_idx):
+            if not patch.enabled:
+                return patch.original_fuse_features(image_features, lidar_features, layer_idx)
+
             idx = int(layer_idx)
             image_embd_layer = backbone.avgpool_img(image_features)
             lidar_embd_layer = backbone.avgpool_lidar(lidar_features)
@@ -147,6 +151,8 @@ class _BackboneTaskPatch:
 
         def adapted_forward(*args, **kwargs):
             output = patch.original_forward(*args, **kwargs)
+            if not patch.enabled:
+                return output
             if not isinstance(output, (tuple, list)) or len(output) < 2:
                 return output
             fused = output[1]
@@ -230,9 +236,8 @@ class _TaskAdapterForward(nn.Module):
         lidar: torch.Tensor,
         target_dim: int,
         speed_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         patch = self._ensure_patch()
-        patch.clear()
         inputs = prepare_transfuserpp_inputs(
             scalar=scalar,
             camera=camera,
@@ -242,6 +247,22 @@ class _TaskAdapterForward(nn.Module):
             command_mode=self.command_mode,
             tfpp_camera=self.tfpp_camera,
         )
+
+        patch.enabled = False
+        try:
+            with torch.no_grad():
+                prior_outputs = self.net(**inputs)
+                prior_target = base_target_from_checkpoint(
+                    pred_checkpoint=prior_outputs[2],
+                    pred_target_speed=prior_outputs[1],
+                    scalar=scalar,
+                    config=self.config,
+                    target_dim=int(target_dim),
+                    speed_dim=int(speed_dim),
+                ).detach()
+        finally:
+            patch.enabled = True
+        patch.clear()
         outputs = self.net(**inputs)
         pred_target = base_target_from_checkpoint(
             pred_checkpoint=outputs[2],
@@ -251,7 +272,7 @@ class _TaskAdapterForward(nn.Module):
             target_dim=int(target_dim),
             speed_dim=int(speed_dim),
         )
-        return pred_target, patch.drift_loss(scalar.device).reshape(1)
+        return pred_target, patch.drift_loss(scalar.device).reshape(1), prior_target
 
 
 def _infer_feature_shapes(net: nn.Module, config, loader: DataLoader, cameras: list[str], args, device: torch.device):
@@ -287,7 +308,14 @@ def _infer_feature_shapes(net: nn.Module, config, loader: DataLoader, cameras: l
         restore()
 
 
-def _losses(pred: torch.Tensor, batch: Dict[str, torch.Tensor], drift_loss: torch.Tensor, device: torch.device, args):
+def _losses(
+    pred: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    drift_loss: torch.Tensor,
+    prior: torch.Tensor,
+    device: torch.device,
+    args,
+):
     target = batch["target"].to(device, non_blocking=True)
     scalar = batch["scalar"].to(device, non_blocking=True)
     stop_state = batch["stop_state"].to(device, non_blocking=True)
@@ -300,6 +328,8 @@ def _losses(pred: torch.Tensor, batch: Dict[str, torch.Tensor], drift_loss: torc
     target_traj = target[:, :traj_dim].reshape(target.shape[0], -1, 3)
     pred_speed = pred[:, traj_dim : traj_dim + speed_dim]
     target_speed = target[:, traj_dim : traj_dim + speed_dim]
+    prior_traj = prior[:, :traj_dim].reshape(prior.shape[0], -1, 3)
+    prior_speed_target = prior[:, traj_dim : traj_dim + speed_dim]
     stop_target = target[:, -1:].clamp(0.0, 1.0)
 
     moving = _moving_mask(scalar, target, speed_dim, float(args.moving_speed_threshold))
@@ -341,6 +371,24 @@ def _losses(pred: torch.Tensor, batch: Dict[str, torch.Tensor], drift_loss: torc
         torch.mean(nn.functional.smooth_l1_loss(pred_speed, target_speed, reduction="none"), dim=1),
         effective_weight,
     )
+    if pred_traj.shape[1] >= 3:
+        pred_xy_accel = pred_traj[:, 2:, :2] - 2.0 * pred_traj[:, 1:-1, :2] + pred_traj[:, :-2, :2]
+        target_xy_accel = target_traj[:, 2:, :2] - 2.0 * target_traj[:, 1:-1, :2] + target_traj[:, :-2, :2]
+        traj_smooth = _weighted_mean(
+            torch.mean(nn.functional.smooth_l1_loss(pred_xy_accel, target_xy_accel, reduction="none"), dim=(1, 2)),
+            effective_weight,
+        )
+    else:
+        traj_smooth = torch.zeros((), dtype=torch.float32, device=device)
+    if pred_speed.shape[1] >= 2:
+        pred_speed_delta = pred_speed[:, 1:] - pred_speed[:, :-1]
+        target_speed_delta = target_speed[:, 1:] - target_speed[:, :-1]
+        speed_smooth = _weighted_mean(
+            torch.mean(nn.functional.smooth_l1_loss(pred_speed_delta, target_speed_delta, reduction="none"), dim=1),
+            effective_weight,
+        )
+    else:
+        speed_smooth = torch.zeros((), dtype=torch.float32, device=device)
     target_go = _target_speed_mask(target_speed, float(args.speed_floor_target_threshold))
     target_stop = ~_target_speed_mask(target_speed, float(args.stop_speed_target_threshold))
     speed_floor = _weighted_mean(
@@ -361,28 +409,44 @@ def _losses(pred: torch.Tensor, batch: Dict[str, torch.Tensor], drift_loss: torc
     )
     stop = _weighted_mean(nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], stop_target, reduction="none"), effective_weight)
     drift = drift_loss.reshape(-1).mean().to(device=device, dtype=torch.float32)
+    prior_xy = _weighted_mean(
+        torch.mean(nn.functional.smooth_l1_loss(pred_traj[..., :2], prior_traj[..., :2], reduction="none"), dim=(1, 2)),
+        effective_weight,
+    )
+    prior_speed = _weighted_mean(
+        torch.mean(nn.functional.smooth_l1_loss(pred_speed, prior_speed_target, reduction="none"), dim=1),
+        effective_weight,
+    )
     total = (
         float(args.xy_loss_weight) * xy
         + float(args.yaw_loss_weight) * yaw
         + float(args.speed_loss_weight) * speed
+        + float(args.traj_smooth_loss_weight) * traj_smooth
+        + float(args.speed_smooth_loss_weight) * speed_smooth
         + float(args.speed_floor_loss_weight) * speed_floor
         + float(args.launch_speed_floor_loss_weight) * launch_floor
         + float(args.release_speed_floor_loss_weight) * release_floor
         + float(args.stop_speed_ceiling_loss_weight) * stop_ceiling
         + float(args.stop_loss_weight) * stop
         + float(args.feature_drift_loss_weight) * drift
+        + float(args.output_prior_xy_loss_weight) * prior_xy
+        + float(args.output_prior_speed_loss_weight) * prior_speed
     )
     return {
         "loss": total,
         "xy": xy,
         "yaw": yaw,
         "speed": speed,
+        "traj_smooth": traj_smooth,
+        "speed_smooth": speed_smooth,
         "speed_floor": speed_floor,
         "launch_floor": launch_floor,
         "release_floor": release_floor,
         "stop_ceiling": stop_ceiling,
         "stop": stop,
         "drift": drift,
+        "prior_xy": prior_xy,
+        "prior_speed": prior_speed,
         "moving_ratio": moving.float().mean(),
         "hazard_ratio": hazard.float().mean(),
         "launch_ratio": launch.float().mean(),
@@ -414,12 +478,16 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "xy",
         "yaw",
         "speed",
+        "traj_smooth",
+        "speed_smooth",
         "speed_floor",
         "launch_floor",
         "release_floor",
         "stop_ceiling",
         "stop",
         "drift",
+        "prior_xy",
+        "prior_speed",
         "moving_ratio",
         "hazard_ratio",
         "launch_ratio",
@@ -433,14 +501,14 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         camera = batch["camera"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
         with torch.set_grad_enabled(train):
-            pred_target, drift_loss = model(
+            pred_target, drift_loss, prior_target = model(
                 scalar,
                 camera,
                 lidar,
                 target_dim=batch["target"].shape[1],
                 speed_dim=int(args.speed_dim),
             )
-            losses = _losses(pred_target, batch, drift_loss, device, args)
+            losses = _losses(pred_target, batch, drift_loss, prior_target, device, args)
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 losses["loss"].backward()
@@ -460,7 +528,9 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
             print(
                 f"step={step:05d}/{len(loader):05d} loss={totals['loss']/samples:.6f} "
                 f"xy={totals['xy']/samples:.6f} speed={totals['speed']/samples:.6f} "
+                f"smooth={totals['traj_smooth']/samples:.6f}/{totals['speed_smooth']/samples:.6f} "
                 f"stopceil={totals['stop_ceiling']/samples:.6f} stop={totals['stop']/samples:.6f} "
+                f"prior={totals['prior_xy']/samples:.6f}/{totals['prior_speed']/samples:.6f} "
                 f"drift={totals['drift']/samples:.6f} moving={totals['moving_ratio']/samples:.3f} "
                 f"samples/s={samples/elapsed:.1f}",
                 flush=True,
@@ -641,13 +711,17 @@ def train(args: argparse.Namespace) -> None:
             val_metrics = _run_epoch(model, val_loader, optimizer, device, args, train=False, epoch=epoch)
             history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics})
             val_loss = float(val_metrics["loss"])
+            improved = val_loss + float(args.early_stop_min_delta) < best_val
+            display_best = val_loss if improved or not best_epoch else best_val
             print(
                 f"epoch={epoch:03d} train={train_metrics['loss']:.6f} val={val_loss:.6f} "
-                f"best={best_val if best_epoch else val_loss:.6f} "
-                f"xy={val_metrics['xy']:.6f} speed={val_metrics['speed']:.6f} drift={val_metrics['drift']:.6f}",
+                f"best={display_best:.6f} new_best={int(improved)} "
+                f"xy={val_metrics['xy']:.6f} speed={val_metrics['speed']:.6f} "
+                f"prior={val_metrics['prior_xy']:.6f}/{val_metrics['prior_speed']:.6f} "
+                f"drift={val_metrics['drift']:.6f}",
                 flush=True,
             )
-            if val_loss + float(args.early_stop_min_delta) < best_val:
+            if improved:
                 best_val = val_loss
                 best_epoch = epoch
                 stale = 0
@@ -731,6 +805,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xy-loss-weight", type=float, default=0.55)
     parser.add_argument("--yaw-loss-weight", type=float, default=0.03)
     parser.add_argument("--speed-loss-weight", type=float, default=0.80)
+    parser.add_argument("--traj-smooth-loss-weight", type=float, default=0.0)
+    parser.add_argument("--speed-smooth-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-floor-loss-weight", type=float, default=0.03)
     parser.add_argument("--speed-floor-mps", type=float, default=0.8)
     parser.add_argument("--speed-floor-target-threshold", type=float, default=2.0)
@@ -739,6 +815,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-speed-target-threshold", type=float, default=0.5)
     parser.add_argument("--stop-loss-weight", type=float, default=0.08)
     parser.add_argument("--feature-drift-loss-weight", type=float, default=0.10)
+    parser.add_argument("--output-prior-xy-loss-weight", type=float, default=0.0)
+    parser.add_argument("--output-prior-speed-loss-weight", type=float, default=0.0)
     parser.add_argument("--moving-speed-threshold", type=float, default=1.0)
     parser.add_argument("--moving-sample-weight", type=float, default=1.15)
     parser.add_argument("--stopped-sample-weight", type=float, default=1.0)

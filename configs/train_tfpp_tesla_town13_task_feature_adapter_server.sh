@@ -74,8 +74,12 @@ export LORA_EXCLUDE=${LORA_EXCLUDE:-""}
 export XY_LOSS_WEIGHT=${XY_LOSS_WEIGHT:-0.55}
 export YAW_LOSS_WEIGHT=${YAW_LOSS_WEIGHT:-0.03}
 export SPEED_LOSS_WEIGHT=${SPEED_LOSS_WEIGHT:-0.80}
+export TRAJ_SMOOTH_LOSS_WEIGHT=${TRAJ_SMOOTH_LOSS_WEIGHT:-0.0}
+export SPEED_SMOOTH_LOSS_WEIGHT=${SPEED_SMOOTH_LOSS_WEIGHT:-0.0}
 export STOP_LOSS_WEIGHT=${STOP_LOSS_WEIGHT:-0.08}
 export FEATURE_DRIFT_LOSS_WEIGHT=${FEATURE_DRIFT_LOSS_WEIGHT:-0.10}
+export OUTPUT_PRIOR_XY_LOSS_WEIGHT=${OUTPUT_PRIOR_XY_LOSS_WEIGHT:-0.0}
+export OUTPUT_PRIOR_SPEED_LOSS_WEIGHT=${OUTPUT_PRIOR_SPEED_LOSS_WEIGHT:-0.0}
 
 export MOVING_SAMPLE_WEIGHT=${MOVING_SAMPLE_WEIGHT:-1.15}
 export STOPPED_SAMPLE_WEIGHT=${STOPPED_SAMPLE_WEIGHT:-1.0}
@@ -259,8 +263,12 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --xy-loss-weight "$XY_LOSS_WEIGHT" \
   --yaw-loss-weight "$YAW_LOSS_WEIGHT" \
   --speed-loss-weight "$SPEED_LOSS_WEIGHT" \
+  --traj-smooth-loss-weight "$TRAJ_SMOOTH_LOSS_WEIGHT" \
+  --speed-smooth-loss-weight "$SPEED_SMOOTH_LOSS_WEIGHT" \
   --stop-loss-weight "$STOP_LOSS_WEIGHT" \
   --feature-drift-loss-weight "$FEATURE_DRIFT_LOSS_WEIGHT" \
+  --output-prior-xy-loss-weight "$OUTPUT_PRIOR_XY_LOSS_WEIGHT" \
+  --output-prior-speed-loss-weight "$OUTPUT_PRIOR_SPEED_LOSS_WEIGHT" \
   --moving-sample-weight "$MOVING_SAMPLE_WEIGHT" \
   --stopped-sample-weight "$STOPPED_SAMPLE_WEIGHT" \
   --hazard-stop-reasons "$HAZARD_STOP_REASONS" \
