@@ -36,6 +36,7 @@ export TARGET_INDEX=${TARGET_INDEX:-"$INDEX_DIR/${PROFILE}_index.npz"}
 export OUT=${OUT:-"$WORK_ROOT/train_${PROFILE}_task_feature_adapter"}
 
 export EXPORT_OVERWRITE=${EXPORT_OVERWRITE:-0}
+export SKIP_EXPORT=${SKIP_EXPORT:-0}
 export INDEX_OVERWRITE=${INDEX_OVERWRITE:-0}
 export OVERWRITE=${OVERWRITE:-0}
 export SKIP_INVALID_MOTION=${SKIP_INVALID_MOTION:-1}
@@ -179,13 +180,21 @@ if [[ "$SKIP_INVALID_MOTION" == "1" || "$SKIP_INVALID_MOTION" == "true" || "$SKI
   EXPORT_ARGS+=(--skip-invalid-motion)
 fi
 
-echo "=== export $PROFILE profile view"
-"$PY" -m teach2drive_adapter.export_paired_profile_view \
-  --input-root "$DATA_ROOT" \
-  --output-root "$TARGET_VIEW" \
-  --profile "$PROFILE" \
-  --require-cameras "$CAMERAS" \
-  "${EXPORT_ARGS[@]}"
+if [[ "$SKIP_EXPORT" == "1" || "$SKIP_EXPORT" == "true" || "$SKIP_EXPORT" == "TRUE" ]]; then
+  if [[ ! -d "$TARGET_VIEW" ]]; then
+    echo "SKIP_EXPORT requested but TARGET_VIEW does not exist: $TARGET_VIEW" >&2
+    exit 1
+  fi
+  echo "=== reuse profile view $TARGET_VIEW"
+else
+  echo "=== export $PROFILE profile view"
+  "$PY" -m teach2drive_adapter.export_paired_profile_view \
+    --input-root "$DATA_ROOT" \
+    --output-root "$TARGET_VIEW" \
+    --profile "$PROFILE" \
+    --require-cameras "$CAMERAS" \
+    "${EXPORT_ARGS[@]}"
+fi
 
 if [[ -f "$TARGET_INDEX" && "$INDEX_OVERWRITE" != "1" ]]; then
   echo "=== reuse index $TARGET_INDEX"
