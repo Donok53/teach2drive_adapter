@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 LOG_DIR="${LOG_DIR:-$HOME/teach2drive/logs}"
+TORCH_ENV="${TORCH_ENV:-$HOME/.venv/torch2.1.2-py3.10-cuda11.8}"
+PYTHON_BIN="${PYTHON_BIN:-$TORCH_ENV/bin/python}"
 mkdir -p "$LOG_DIR"
 
 start_job() {
@@ -16,7 +18,7 @@ start_job() {
   tmux kill-session -t "$session" 2>/dev/null || true
   rm -f "$log_file"
   tmux new-session -d -s "$session" bash -lc \
-    "cd '$PWD' && CUDA_VISIBLE_DEVICES='$gpu' VARIANT='$variant' RUN_NAME='$run_name' bash configs/train_tfpp_tesla_town13_prior_residual_variant_server.sh > '$log_file' 2>&1"
+    "cd '$PWD' && PATH='$TORCH_ENV/bin':\$PATH PY='$PYTHON_BIN' CUDA_VISIBLE_DEVICES='$gpu' VARIANT='$variant' RUN_NAME='$run_name' bash configs/train_tfpp_tesla_town13_prior_residual_variant_server.sh > '$log_file' 2>&1"
   echo "started $session gpu=$gpu variant=$variant run=$run_name log=$log_file"
 }
 
