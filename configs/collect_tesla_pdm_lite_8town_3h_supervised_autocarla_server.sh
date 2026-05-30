@@ -15,6 +15,7 @@ export CARLA_ROOT=${CARLA_ROOT:-"$HOME/dataset/byeongjae/carla-simulator"}
 export GARAGE_ROOT=${GARAGE_ROOT:-"$HOME/teach2drive/workspace/carla_garage"}
 export OUTPUT_ROOT=${OUTPUT_ROOT:-"$HOME/dataset/byeongjae/datasets/pdm_lite_tesla_8town_3h"}
 export WORK_ROOT=${WORK_ROOT:-"$HOME/dataset/byeongjae/runs/pdm_lite_tesla_8town_3h_collect"}
+export DATASET_NAME=${DATASET_NAME:-pdm_lite_tesla_8town_3h}
 export EGO_VEHICLE_MODEL=${EGO_VEHICLE_MODEL:-vehicle.tesla.model3}
 export ROUTE_START=${ROUTE_START:-4}
 export ROUTE_END=${ROUTE_END:-385}
@@ -24,6 +25,7 @@ export PORT=${PORT:-2006}
 export TM_PORT=${TM_PORT:-8006}
 export CARLA_GRAPHICS_ADAPTER=${CARLA_GRAPHICS_ADAPTER:-6}
 export ROUTE_TIMEOUT_SEC=${ROUTE_TIMEOUT_SEC:-900}
+export ROUTE_TIMEOUT_KILL_AFTER_SEC=${ROUTE_TIMEOUT_KILL_AFTER_SEC:-60}
 export RUN_LOG=${RUN_LOG:-"$HOME/teach2drive/logs/collect_pdm_lite_tesla_supervised_port${PORT}.log"}
 export SUPERVISOR_STATE_DIR=${SUPERVISOR_STATE_DIR:-"$OUTPUT_ROOT/results/supervised_routes"}
 export COLLECT_CONFIG=${COLLECT_CONFIG:-configs/collect_tesla_pdm_lite_8town_3h.sh}
@@ -81,13 +83,14 @@ PY
 
 log "supervised PDM-Lite Tesla collection start"
 log "routes=${ROUTE_START}-${ROUTE_END} skip=${ROUTE_SKIP_CSV} port=${PORT} tm_port=${TM_PORT} gpu=${CARLA_GRAPHICS_ADAPTER}"
+log "route_timeout=${ROUTE_TIMEOUT_SEC}s kill_after=${ROUTE_TIMEOUT_KILL_AFTER_SEC}s dataset=${DATASET_NAME}"
 log "output=${OUTPUT_ROOT}"
 
 for route in $(seq "$ROUTE_START" "$ROUTE_END"); do
   done_file="$SUPERVISOR_STATE_DIR/route_${route}.done"
   fail_file="$SUPERVISOR_STATE_DIR/route_${route}.failed"
-  checkpoint="$OUTPUT_ROOT/results/pdm_lite_tesla_8town_3h_route_${route}_result.json"
-  debug_checkpoint="$OUTPUT_ROOT/results/pdm_lite_tesla_8town_3h_route_${route}_live.txt"
+  checkpoint="$OUTPUT_ROOT/results/${DATASET_NAME}_route_${route}_result.json"
+  debug_checkpoint="$OUTPUT_ROOT/results/${DATASET_NAME}_route_${route}_live.txt"
   carla_log="$HOME/teach2drive/logs/carla_pdm_lite_tesla_route_${route}_port${PORT}.log"
 
   if route_is_skipped "$route"; then
@@ -108,7 +111,7 @@ for route in $(seq "$ROUTE_START" "$ROUTE_END"); do
     kill_carla_on_port "$PORT"
 
     set +e
-    env \
+    timeout --kill-after="${ROUTE_TIMEOUT_KILL_AFTER_SEC}s" "${ROUTE_TIMEOUT_SEC}s" env \
       PY="$PY" \
       HOST=127.0.0.1 \
       PORT="$PORT" \
