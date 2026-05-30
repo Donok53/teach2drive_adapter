@@ -127,6 +127,8 @@ for route in $(seq "$ROUTE_START" "$ROUTE_END"); do
       DEBUG_CHECKPOINT="$debug_checkpoint" \
       CARLA_GRAPHICS_ADAPTER="$CARLA_GRAPHICS_ADAPTER" \
       CARLA_LOG="$carla_log" \
+      MONITOR_CARLA=1 \
+      CARLA_MONITOR_INTERVAL_SEC=2 \
       COLLECT_CONFIG="$COLLECT_CONFIG" \
       bash configs/collect_autocarla_server.sh >> "$RUN_LOG" 2>&1
     rc=$?

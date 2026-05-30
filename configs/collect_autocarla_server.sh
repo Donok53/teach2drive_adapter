@@ -26,6 +26,8 @@ export CARLA_GRAPHICS_ADAPTER=${CARLA_GRAPHICS_ADAPTER:-0}
 export CARLA_GLX_VENDOR=${CARLA_GLX_VENDOR:-}
 export CARLA_NV_PRIME_RENDER_OFFLOAD=${CARLA_NV_PRIME_RENDER_OFFLOAD:-}
 export COLLECT_CONFIG=${COLLECT_CONFIG:-configs/collect_tesla_front_triplet_target_3h.sh}
+export MONITOR_CARLA=${MONITOR_CARLA:-0}
+export CARLA_MONITOR_INTERVAL_SEC=${CARLA_MONITOR_INTERVAL_SEC:-2}
 export PATH="$HOME/.local/bin:$PATH"
 
 mkdir -p "$(dirname "$CARLA_LOG")" "$PYTHON_EGG_CACHE" "$XDG_RUNTIME_DIR" "$HOME/.local/bin"
@@ -157,6 +159,40 @@ else
     fi
     sleep 1
   done
+fi
+
+carla_has_failed() {
+  if [[ -n "${CARLA_PID:-}" ]] && ! kill -0 "$CARLA_PID" 2>/dev/null; then
+    return 0
+  fi
+  if [[ -f "$CARLA_LOG" ]] && grep -qE 'LowLevelFatalError|Signal 11 caught|CommonUnixCrashHandler|Engine crash handling finished|GameThread timed out waiting for RenderThread' "$CARLA_LOG"; then
+    return 0
+  fi
+  return 1
+}
+
+if [[ "$MONITOR_CARLA" == "1" ]]; then
+  bash "$COLLECT_CONFIG" &
+  collect_pid=$!
+
+  while kill -0 "$collect_pid" 2>/dev/null; do
+    if carla_has_failed; then
+      echo "=== CARLA failed while collection was running"
+      tail -120 "$CARLA_LOG" || true
+      kill -TERM "$collect_pid" 2>/dev/null || true
+      sleep 2
+      kill -KILL "$collect_pid" 2>/dev/null || true
+      wait "$collect_pid" 2>/dev/null || true
+      exit 134
+    fi
+    sleep "$CARLA_MONITOR_INTERVAL_SEC"
+  done
+
+  set +e
+  wait "$collect_pid"
+  rc=$?
+  set -e
+  exit "$rc"
 fi
 
 exec bash "$COLLECT_CONFIG"
