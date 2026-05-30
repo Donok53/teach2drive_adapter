@@ -171,17 +171,22 @@ carla_has_failed() {
   return 1
 }
 
+stop_collection_process_group() {
+  local pid="$1"
+  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  sleep 2
+  kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
+
 if [[ "$MONITOR_CARLA" == "1" ]]; then
-  bash "$COLLECT_CONFIG" &
+  setsid bash "$COLLECT_CONFIG" &
   collect_pid=$!
 
   while kill -0 "$collect_pid" 2>/dev/null; do
     if carla_has_failed; then
       echo "=== CARLA failed while collection was running"
       tail -120 "$CARLA_LOG" || true
-      kill -TERM "$collect_pid" 2>/dev/null || true
-      sleep 2
-      kill -KILL "$collect_pid" 2>/dev/null || true
+      stop_collection_process_group "$collect_pid"
       wait "$collect_pid" 2>/dev/null || true
       exit 134
     fi

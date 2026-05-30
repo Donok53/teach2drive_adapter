@@ -64,6 +64,23 @@ kill_carla_on_port() {
   fi
 }
 
+kill_evaluator_on_port() {
+  local port="$1"
+  local pids
+  pids=$(pgrep -f "leaderboard_evaluator_local.py.*--port ${port}" || true)
+  if [[ -n "$pids" ]]; then
+    log "stopping stale evaluator on port ${port}: ${pids//$'\n'/ }"
+    kill -TERM $pids 2>/dev/null || true
+    sleep 2
+    pids=$(pgrep -f "leaderboard_evaluator_local.py.*--port ${port}" || true)
+    if [[ -n "$pids" ]]; then
+      log "force stopping stale evaluator on port ${port}: ${pids//$'\n'/ }"
+      kill -KILL $pids 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+}
+
 checkpoint_has_record() {
   local checkpoint="$1"
   [[ -s "$checkpoint" ]] || return 1
@@ -108,6 +125,7 @@ for route in $(seq "$ROUTE_START" "$ROUTE_END"); do
   success=0
   for attempt in $(seq 1 "$MAX_ROUTE_ATTEMPTS"); do
     log "route ${route}: attempt ${attempt}/${MAX_ROUTE_ATTEMPTS}"
+    kill_evaluator_on_port "$PORT"
     kill_carla_on_port "$PORT"
 
     set +e
@@ -134,6 +152,7 @@ for route in $(seq "$ROUTE_START" "$ROUTE_END"); do
     rc=$?
     set -e
 
+    kill_evaluator_on_port "$PORT"
     kill_carla_on_port "$PORT"
 
     if [[ "$rc" == "0" ]] && checkpoint_has_record "$checkpoint"; then
