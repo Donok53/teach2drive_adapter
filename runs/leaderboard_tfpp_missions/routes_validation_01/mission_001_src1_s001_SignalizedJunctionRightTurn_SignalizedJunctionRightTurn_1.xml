@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='utf-8'?>
+<routes>
+  <route id="10001" town="Town13">
+    <weathers>
+      <weather route_percentage="0" cloudiness="5.0" precipitation="10.0" precipitation_deposits="0.0" wetness="0.0" wind_intensity="50.0" sun_azimuth_angle="-1.0" sun_altitude_angle="90.0" fog_density="2.0" />
+      <weather route_percentage="100" cloudiness="5.0" precipitation="0.0" precipitation_deposits="0.0" wetness="0.0" wind_intensity="10.0" sun_azimuth_angle="-1.0" sun_altitude_angle="15.0" fog_density="10.0" />
+    </weathers>
+    <waypoints>
+      <position x="6771.608" y="5342.997" z="179.083" />
+      <position x="6771.820" y="5317.998" z="179.186" />
+      <position x="6772.032" y="5292.999" z="179.290" />
+      <position x="6772.244" y="5268.000" z="179.392" />
+      <position x="6772.456" y="5243.001" z="179.492" />
+      <position x="6783.320" y="5224.945" z="179.768" />
+      <position x="6808.320" y="5225.037" z="180.170" />
+      <position x="6833.320" y="5225.128" z="180.570" />
+      <position x="6858.319" y="5225.220" z="180.965" />
+      <position x="6878.319" y="5225.293" z="181.281" />
+    </waypoints>
+    <scenarios>
+      <scenario name="SignalizedJunctionRightTurn_1" type="SignalizedJunctionRightTurn">
+        <trigger_point x="6772.3" y="5263.0" z="179.4" yaw="-89.5" />
+        <flow_speed value="7" />
+        <source_dist_interval from="15" to="55" />
+      </scenario>
+    </scenarios>
+  </route>
+</routes>
