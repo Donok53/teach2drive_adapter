@@ -36,6 +36,7 @@ export TARGET_INDEX=${TARGET_INDEX:-"$INDEX_DIR/${PROFILE}_index.npz"}
 export OUT=${OUT:-"$WORK_ROOT/train_${PROFILE}_task_feature_adapter"}
 
 export EXPORT_OVERWRITE=${EXPORT_OVERWRITE:-0}
+export SKIP_EXPORT=${SKIP_EXPORT:-0}
 export INDEX_OVERWRITE=${INDEX_OVERWRITE:-0}
 export OVERWRITE=${OVERWRITE:-0}
 export SKIP_INVALID_MOTION=${SKIP_INVALID_MOTION:-1}
@@ -74,8 +75,16 @@ export LORA_EXCLUDE=${LORA_EXCLUDE:-""}
 export XY_LOSS_WEIGHT=${XY_LOSS_WEIGHT:-0.55}
 export YAW_LOSS_WEIGHT=${YAW_LOSS_WEIGHT:-0.03}
 export SPEED_LOSS_WEIGHT=${SPEED_LOSS_WEIGHT:-0.80}
+export TRAJ_SMOOTH_LOSS_WEIGHT=${TRAJ_SMOOTH_LOSS_WEIGHT:-0.0}
+export SPEED_SMOOTH_LOSS_WEIGHT=${SPEED_SMOOTH_LOSS_WEIGHT:-0.0}
 export STOP_LOSS_WEIGHT=${STOP_LOSS_WEIGHT:-0.08}
 export FEATURE_DRIFT_LOSS_WEIGHT=${FEATURE_DRIFT_LOSS_WEIGHT:-0.10}
+export OUTPUT_PRIOR_XY_LOSS_WEIGHT=${OUTPUT_PRIOR_XY_LOSS_WEIGHT:-0.0}
+export OUTPUT_PRIOR_SPEED_LOSS_WEIGHT=${OUTPUT_PRIOR_SPEED_LOSS_WEIGHT:-0.0}
+export AUX_HIDDEN_DIM=${AUX_HIDDEN_DIM:-256}
+export CONTROL_LOSS_WEIGHT=${CONTROL_LOSS_WEIGHT:-0.0}
+export STOP_STATE_AUX_LOSS_WEIGHT=${STOP_STATE_AUX_LOSS_WEIGHT:-0.0}
+export STOP_REASON_AUX_LOSS_WEIGHT=${STOP_REASON_AUX_LOSS_WEIGHT:-0.0}
 
 export MOVING_SAMPLE_WEIGHT=${MOVING_SAMPLE_WEIGHT:-1.15}
 export STOPPED_SAMPLE_WEIGHT=${STOPPED_SAMPLE_WEIGHT:-1.0}
@@ -175,13 +184,21 @@ if [[ "$SKIP_INVALID_MOTION" == "1" || "$SKIP_INVALID_MOTION" == "true" || "$SKI
   EXPORT_ARGS+=(--skip-invalid-motion)
 fi
 
-echo "=== export $PROFILE profile view"
-"$PY" -m teach2drive_adapter.export_paired_profile_view \
-  --input-root "$DATA_ROOT" \
-  --output-root "$TARGET_VIEW" \
-  --profile "$PROFILE" \
-  --require-cameras "$CAMERAS" \
-  "${EXPORT_ARGS[@]}"
+if [[ "$SKIP_EXPORT" == "1" || "$SKIP_EXPORT" == "true" || "$SKIP_EXPORT" == "TRUE" ]]; then
+  if [[ ! -d "$TARGET_VIEW" ]]; then
+    echo "SKIP_EXPORT requested but TARGET_VIEW does not exist: $TARGET_VIEW" >&2
+    exit 1
+  fi
+  echo "=== reuse profile view $TARGET_VIEW"
+else
+  echo "=== export $PROFILE profile view"
+  "$PY" -m teach2drive_adapter.export_paired_profile_view \
+    --input-root "$DATA_ROOT" \
+    --output-root "$TARGET_VIEW" \
+    --profile "$PROFILE" \
+    --require-cameras "$CAMERAS" \
+    "${EXPORT_ARGS[@]}"
+fi
 
 if [[ -f "$TARGET_INDEX" && "$INDEX_OVERWRITE" != "1" ]]; then
   echo "=== reuse index $TARGET_INDEX"
@@ -259,8 +276,16 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --xy-loss-weight "$XY_LOSS_WEIGHT" \
   --yaw-loss-weight "$YAW_LOSS_WEIGHT" \
   --speed-loss-weight "$SPEED_LOSS_WEIGHT" \
+  --traj-smooth-loss-weight "$TRAJ_SMOOTH_LOSS_WEIGHT" \
+  --speed-smooth-loss-weight "$SPEED_SMOOTH_LOSS_WEIGHT" \
   --stop-loss-weight "$STOP_LOSS_WEIGHT" \
   --feature-drift-loss-weight "$FEATURE_DRIFT_LOSS_WEIGHT" \
+  --output-prior-xy-loss-weight "$OUTPUT_PRIOR_XY_LOSS_WEIGHT" \
+  --output-prior-speed-loss-weight "$OUTPUT_PRIOR_SPEED_LOSS_WEIGHT" \
+  --aux-hidden-dim "$AUX_HIDDEN_DIM" \
+  --control-loss-weight "$CONTROL_LOSS_WEIGHT" \
+  --stop-state-aux-loss-weight "$STOP_STATE_AUX_LOSS_WEIGHT" \
+  --stop-reason-aux-loss-weight "$STOP_REASON_AUX_LOSS_WEIGHT" \
   --moving-sample-weight "$MOVING_SAMPLE_WEIGHT" \
   --stopped-sample-weight "$STOPPED_SAMPLE_WEIGHT" \
   --hazard-stop-reasons "$HAZARD_STOP_REASONS" \
