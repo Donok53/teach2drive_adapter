@@ -49,6 +49,8 @@ export LIDAR_SIZE=${LIDAR_SIZE:-128}
 export EPOCHS=${EPOCHS:-20}
 export EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-6}
 export EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-0.0}
+export SELECTION_METRIC=${SELECTION_METRIC:-loss}
+export SELECTION_MODE=${SELECTION_MODE:-min}
 export BATCH_SIZE=${BATCH_SIZE:-8}
 export NUM_WORKERS=${NUM_WORKERS:-4}
 export LR=${LR:-2e-5}
@@ -97,6 +99,8 @@ export SPEED_FLOOR_TARGET_THRESHOLD=${SPEED_FLOOR_TARGET_THRESHOLD:-2.0}
 export STOP_SPEED_CEILING_LOSS_WEIGHT=${STOP_SPEED_CEILING_LOSS_WEIGHT:-0.35}
 export STOP_SPEED_CEILING_MPS=${STOP_SPEED_CEILING_MPS:-0.5}
 export STOP_SPEED_TARGET_THRESHOLD=${STOP_SPEED_TARGET_THRESHOLD:-0.5}
+export STOP_PROGRESS_CEILING_M=${STOP_PROGRESS_CEILING_M:-1.0}
+export GO_PROGRESS_RATIO=${GO_PROGRESS_RATIO:-0.5}
 export LAUNCH_SAMPLE_WEIGHT=${LAUNCH_SAMPLE_WEIGHT:-1.4}
 export LAUNCH_SPEED_FLOOR_LOSS_WEIGHT=${LAUNCH_SPEED_FLOOR_LOSS_WEIGHT:-0.04}
 export LAUNCH_SPEED_FLOOR_MPS=${LAUNCH_SPEED_FLOOR_MPS:-1.2}
@@ -267,6 +271,8 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --epochs "$EPOCHS" \
   --early-stop-patience "$EARLY_STOP_PATIENCE" \
   --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
+  --selection-metric "$SELECTION_METRIC" \
+  --selection-mode "$SELECTION_MODE" \
   --batch-size "$BATCH_SIZE" \
   --num-workers "$NUM_WORKERS" \
   --lr "$LR" \
@@ -296,6 +302,8 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --stop-speed-ceiling-loss-weight "$STOP_SPEED_CEILING_LOSS_WEIGHT" \
   --stop-speed-ceiling-mps "$STOP_SPEED_CEILING_MPS" \
   --stop-speed-target-threshold "$STOP_SPEED_TARGET_THRESHOLD" \
+  --stop-progress-ceiling-m "$STOP_PROGRESS_CEILING_M" \
+  --go-progress-ratio "$GO_PROGRESS_RATIO" \
   --launch-sample-weight "$LAUNCH_SAMPLE_WEIGHT" \
   --launch-speed-floor-loss-weight "$LAUNCH_SPEED_FLOOR_LOSS_WEIGHT" \
   --launch-speed-floor-mps "$LAUNCH_SPEED_FLOOR_MPS" \

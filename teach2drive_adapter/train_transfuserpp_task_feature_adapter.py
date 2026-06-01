@@ -52,6 +52,20 @@ def _hazard_reason_mask(stop_reason: torch.Tensor, names: str) -> torch.Tensor:
     return mask.reshape(-1).bool()
 
 
+def _reason_mask(stop_reason: torch.Tensor, stop_reason_mask: torch.Tensor, name: str) -> torch.Tensor:
+    if name not in STOP_REASON_NAMES:
+        return torch.zeros_like(stop_reason.reshape(-1), dtype=torch.bool)
+    active = _per_sample_vector(stop_reason_mask, int(stop_reason.reshape(-1).numel())) > 0.5
+    return (stop_reason.reshape(-1) == int(STOP_REASON_NAMES.index(name))) & active
+
+
+def _count_pair(metrics: dict[str, torch.Tensor], name: str, correct: torch.Tensor, active: torch.Tensor) -> None:
+    active_f = active.reshape(-1).to(dtype=torch.float32)
+    correct_f = correct.reshape(-1).to(dtype=torch.float32) * active_f
+    metrics[f"{name}_num"] = correct_f.sum()
+    metrics[f"{name}_den"] = active_f.sum()
+
+
 class _BackboneTaskPatch:
     """Insert a trainable feature-then-fusion adapter inside one TF++ backbone."""
 
@@ -471,6 +485,49 @@ def _losses(
         torch.relu(pred_speed - float(args.stop_speed_ceiling_mps)).mean(dim=1) * target_stop.to(dtype=pred_speed.dtype),
         effective_weight,
     )
+    pred_speed_max = pred_speed.clamp_min(0.0).amax(dim=1)
+    pred_stop_logit = pred[:, -1]
+    stop_active = target_stop.reshape(-1).bool()
+    go_active = target_go.reshape(-1).bool()
+    launch_active = launch.reshape(-1).bool()
+    release_active = release.reshape(-1).bool()
+    hazard_active = hazard.reshape(-1).bool()
+    pred_stop_by_speed = pred_speed_max <= float(args.stop_speed_ceiling_mps)
+    pred_go_by_speed = pred_speed_max >= float(args.speed_floor_mps)
+    pred_launch_by_speed = pred_speed_max >= float(args.launch_speed_floor_mps)
+    pred_release_by_speed = pred_speed_max >= float(args.release_speed_floor_mps)
+
+    stop_target_label = stop_target.reshape(-1) >= 0.5
+    pred_stop_by_logit = pred_stop_logit >= 0.0
+    stop_logit_acc_raw = pred_stop_by_logit == stop_target_label
+
+    target_final_xy = target_traj[:, -1, :2]
+    pred_final_xy = pred_traj[:, -1, :2]
+    target_progress = torch.linalg.norm(target_final_xy, dim=1)
+    pred_displacement = torch.linalg.norm(pred_final_xy, dim=1)
+    unit_target = target_final_xy / torch.clamp(target_progress[:, None], min=1e-6)
+    pred_progress = torch.sum(pred_final_xy * unit_target, dim=1)
+    progress_error_raw = nn.functional.smooth_l1_loss(pred_progress, target_progress, reduction="none")
+    progress_error = _weighted_mean(progress_error_raw, effective_weight)
+    go_progress_ok = pred_progress >= (target_progress * float(args.go_progress_ratio))
+    stop_progress_ok = pred_displacement <= float(args.stop_progress_ceiling_m)
+    hazard_stop_ceiling = _weighted_mean(
+        torch.relu(pred_speed - float(args.stop_speed_ceiling_mps)).mean(dim=1) * hazard_active.to(dtype=pred_speed.dtype),
+        effective_weight,
+    )
+    hazard_progress = _weighted_mean(
+        torch.relu(pred_displacement - float(args.stop_progress_ceiling_m)) * hazard_active.to(dtype=pred_speed.dtype),
+        effective_weight,
+    )
+    behavior_proxy = (
+        stop_ceiling
+        + speed_floor
+        + launch_floor
+        + release_floor
+        + hazard_stop_ceiling
+        + 0.25 * progress_error
+        + 0.25 * hazard_progress
+    )
     stop = _weighted_mean(nn.functional.binary_cross_entropy_with_logits(pred[:, -1:], stop_target, reduction="none"), effective_weight)
     drift = drift_loss.reshape(-1).mean().to(device=device, dtype=torch.float32)
     prior_xy = _weighted_mean(
@@ -516,7 +573,7 @@ def _losses(
         + float(args.stop_state_aux_loss_weight) * stop_state_aux
         + float(args.stop_reason_aux_loss_weight) * stop_reason_aux
     )
-    return {
+    metrics = {
         "loss": total,
         "xy": xy,
         "yaw": yaw,
@@ -527,6 +584,10 @@ def _losses(
         "launch_floor": launch_floor,
         "release_floor": release_floor,
         "stop_ceiling": stop_ceiling,
+        "hazard_stop_ceiling": hazard_stop_ceiling,
+        "progress_error": progress_error,
+        "hazard_progress": hazard_progress,
+        "behavior_proxy": behavior_proxy,
         "stop": stop,
         "drift": drift,
         "prior_xy": prior_xy,
@@ -539,6 +600,22 @@ def _losses(
         "launch_ratio": launch.float().mean(),
         "release_ratio": release.float().mean(),
     }
+    _count_pair(metrics, "stop_hold_recall", pred_stop_by_speed, stop_active)
+    _count_pair(metrics, "go_recall", pred_go_by_speed, go_active)
+    _count_pair(metrics, "hazard_hold_recall", pred_stop_by_speed, hazard_active)
+    _count_pair(metrics, "launch_go_recall", pred_launch_by_speed, launch_active)
+    _count_pair(metrics, "release_go_recall", pred_release_by_speed, release_active)
+    _count_pair(metrics, "stop_logit_recall", pred_stop_by_logit, stop_target_label)
+    _count_pair(metrics, "stop_logit_go_recall", ~pred_stop_by_logit, ~stop_target_label)
+    _count_pair(metrics, "stop_logit_acc", stop_logit_acc_raw, torch.ones_like(stop_target_label, dtype=torch.bool))
+    _count_pair(metrics, "go_progress_recall", go_progress_ok, go_active)
+    _count_pair(metrics, "stop_progress_hold", stop_progress_ok, stop_active)
+    _count_pair(metrics, "hazard_progress_hold", stop_progress_ok, hazard_active)
+    for reason_name in ("traffic_light", "stop_sign", "front_vehicle", "junction_yield"):
+        reason_active = _reason_mask(stop_reason, stop_reason_mask, reason_name).to(device=device)
+        metric_name = reason_name.replace("_", "")
+        _count_pair(metrics, f"{metric_name}_hold_recall", pred_stop_by_speed, reason_active)
+    return metrics
 
 
 def _set_frozen_tfpp_runtime_mode(net: nn.Module, train: bool) -> None:
@@ -571,6 +648,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "launch_floor",
         "release_floor",
         "stop_ceiling",
+        "hazard_stop_ceiling",
+        "progress_error",
+        "hazard_progress",
+        "behavior_proxy",
         "stop",
         "drift",
         "prior_xy",
@@ -583,7 +664,27 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "launch_ratio",
         "release_ratio",
     )
+    rate_metric_names = (
+        "stop_hold_recall",
+        "go_recall",
+        "hazard_hold_recall",
+        "launch_go_recall",
+        "release_go_recall",
+        "stop_logit_recall",
+        "stop_logit_go_recall",
+        "stop_logit_acc",
+        "go_progress_recall",
+        "stop_progress_hold",
+        "hazard_progress_hold",
+        "trafficlight_hold_recall",
+        "stopsign_hold_recall",
+        "frontvehicle_hold_recall",
+        "junctionyield_hold_recall",
+    )
     totals = {name: 0.0 for name in metric_names}
+    for name in rate_metric_names:
+        totals[f"{name}_num"] = 0.0
+        totals[f"{name}_den"] = 0.0
     totals["samples"] = 0
     start = time.time()
     for step, batch in enumerate(loader, start=1):
@@ -611,6 +712,9 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         batch_size = int(scalar.shape[0])
         for name in metric_names:
             totals[name] += float(losses[name].detach().cpu()) * batch_size
+        for name in rate_metric_names:
+            totals[f"{name}_num"] += float(losses[f"{name}_num"].detach().cpu())
+            totals[f"{name}_den"] += float(losses[f"{name}_den"].detach().cpu())
         totals["samples"] += batch_size
         if train and int(args.step_log_every) > 0 and (step == 1 or step % int(args.step_log_every) == 0):
             samples = max(int(totals["samples"]), 1)
@@ -620,6 +724,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
                 f"xy={totals['xy']/samples:.6f} speed={totals['speed']/samples:.6f} "
                 f"smooth={totals['traj_smooth']/samples:.6f}/{totals['speed_smooth']/samples:.6f} "
                 f"stopceil={totals['stop_ceiling']/samples:.6f} stop={totals['stop']/samples:.6f} "
+                f"risk={totals['behavior_proxy']/samples:.6f} "
                 f"prior={totals['prior_xy']/samples:.6f}/{totals['prior_speed']/samples:.6f} "
                 f"aux={totals['control']/samples:.6f}/{totals['stop_state_aux']/samples:.6f}/{totals['stop_reason_aux']/samples:.6f} "
                 f"drift={totals['drift']/samples:.6f} moving={totals['moving_ratio']/samples:.3f} "
@@ -627,7 +732,11 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
                 flush=True,
             )
     samples = max(int(totals.pop("samples")), 1)
-    return {name: value / samples for name, value in totals.items()}
+    result = {name: totals[name] / samples for name in metric_names}
+    for name in rate_metric_names:
+        result[name] = totals[f"{name}_num"] / max(totals[f"{name}_den"], 1.0)
+        result[f"{name}_count"] = totals[f"{name}_den"]
+    return result
 
 
 def train(args: argparse.Namespace) -> None:
@@ -796,7 +905,13 @@ def train(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    best_val = float("inf")
+    if args.selection_metric == "loss":
+        selection_name = "loss"
+    else:
+        selection_name = str(args.selection_metric)
+    selection_mode = str(args.selection_mode)
+    best_score = float("-inf") if selection_mode == "max" else float("inf")
+    best_val_loss = float("inf")
     best_epoch = 0
     stale = 0
     history = []
@@ -806,19 +921,30 @@ def train(args: argparse.Namespace) -> None:
             val_metrics = _run_epoch(model, val_loader, optimizer, device, args, train=False, epoch=epoch)
             history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics})
             val_loss = float(val_metrics["loss"])
-            improved = val_loss + float(args.early_stop_min_delta) < best_val
-            display_best = val_loss if improved or not best_epoch else best_val
+            if selection_name not in val_metrics:
+                raise KeyError(f"selection metric {selection_name!r} not in validation metrics")
+            selection_value = float(val_metrics[selection_name])
+            if selection_mode == "max":
+                improved = selection_value > best_score + float(args.early_stop_min_delta)
+            else:
+                improved = selection_value + float(args.early_stop_min_delta) < best_score
+            display_best = selection_value if improved or not best_epoch else best_score
             print(
                 f"epoch={epoch:03d} train={train_metrics['loss']:.6f} val={val_loss:.6f} "
-                f"best={display_best:.6f} new_best={int(improved)} "
+                f"select={selection_name}:{selection_value:.6f} best={display_best:.6f} new_best={int(improved)} "
                 f"xy={val_metrics['xy']:.6f} speed={val_metrics['speed']:.6f} "
+                f"risk={val_metrics['behavior_proxy']:.6f} prog={val_metrics['progress_error']:.6f} "
+                f"sg={val_metrics['stop_hold_recall']:.3f}/{val_metrics['go_recall']:.3f} "
+                f"hz={val_metrics['hazard_hold_recall']:.3f} "
+                f"lr={val_metrics['launch_go_recall']:.3f}/{val_metrics['release_go_recall']:.3f} "
                 f"prior={val_metrics['prior_xy']:.6f}/{val_metrics['prior_speed']:.6f} "
                 f"aux={val_metrics['control']:.6f}/{val_metrics['stop_state_aux']:.6f}/{val_metrics['stop_reason_aux']:.6f} "
                 f"drift={val_metrics['drift']:.6f}",
                 flush=True,
             )
             if improved:
-                best_val = val_loss
+                best_score = selection_value
+                best_val_loss = val_loss
                 best_epoch = epoch
                 stale = 0
                 raw_model = _raw_task_model(model)
@@ -831,6 +957,9 @@ def train(args: argparse.Namespace) -> None:
                         "fused_feature_shape": fused_feature_shape,
                         "metadata": metadata,
                         "epoch": epoch,
+                        "selection_metric": selection_name,
+                        "selection_mode": selection_mode,
+                        "selection_value": selection_value,
                         "val_metrics": val_metrics,
                         "train_metrics": train_metrics,
                     },
@@ -841,7 +970,7 @@ def train(args: argparse.Namespace) -> None:
                 if stale >= int(args.early_stop_patience):
                     print(
                         f"early_stop: no val improvement for {stale} epochs "
-                        f"(patience={args.early_stop_patience}, best={best_val:.6f})",
+                        f"(patience={args.early_stop_patience}, {selection_name}={best_score:.6f})",
                         flush=True,
                     )
                     break
@@ -849,7 +978,14 @@ def train(args: argparse.Namespace) -> None:
         _raw_task_model(model).restore()
 
     (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    summary = {"best_epoch": int(best_epoch), "best_val_loss": float(best_val), "mode": metadata["mode"]}
+    summary = {
+        "best_epoch": int(best_epoch),
+        "best_val_loss": float(best_val_loss),
+        "best_selection_metric": selection_name,
+        "best_selection_mode": selection_mode,
+        "best_selection_value": float(best_score),
+        "mode": metadata["mode"],
+    }
     if (out_dir / "best_model.pt").exists():
         best = torch.load(out_dir / "best_model.pt", map_location="cpu")
         summary.update(best.get("val_metrics", {}))
@@ -891,6 +1027,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--early-stop-patience", type=int, default=6)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
+    parser.add_argument("--selection-metric", default="loss")
+    parser.add_argument("--selection-mode", choices=["min", "max"], default="min")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
@@ -910,6 +1048,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-speed-ceiling-loss-weight", type=float, default=0.35)
     parser.add_argument("--stop-speed-ceiling-mps", type=float, default=0.5)
     parser.add_argument("--stop-speed-target-threshold", type=float, default=0.5)
+    parser.add_argument("--stop-progress-ceiling-m", type=float, default=1.0)
+    parser.add_argument("--go-progress-ratio", type=float, default=0.5)
     parser.add_argument("--stop-loss-weight", type=float, default=0.08)
     parser.add_argument("--feature-drift-loss-weight", type=float, default=0.10)
     parser.add_argument("--output-prior-xy-loss-weight", type=float, default=0.0)
