@@ -66,6 +66,13 @@ def _count_pair(metrics: dict[str, torch.Tensor], name: str, correct: torch.Tens
     metrics[f"{name}_den"] = active_f.sum()
 
 
+def _miss_rate(metrics: dict[str, float], name: str, weight: float) -> float:
+    count = float(metrics.get(f"{name}_count", 0.0))
+    if count <= 0.0:
+        return 0.0
+    return float(weight) * max(0.0, 1.0 - float(metrics.get(name, 0.0)))
+
+
 class _BackboneTaskPatch:
     """Insert a trainable feature-then-fusion adapter inside one TF++ backbone."""
 
@@ -507,6 +514,9 @@ def _losses(
     pred_displacement = torch.linalg.norm(pred_final_xy, dim=1)
     unit_target = target_final_xy / torch.clamp(target_progress[:, None], min=1e-6)
     pred_progress = torch.sum(pred_final_xy * unit_target, dim=1)
+    pred_lateral = pred_final_xy - pred_progress[:, None] * unit_target
+    lateral_error_raw = torch.linalg.norm(pred_lateral, dim=1)
+    lateral_error = _weighted_mean(lateral_error_raw, effective_weight)
     progress_error_raw = nn.functional.smooth_l1_loss(pred_progress, target_progress, reduction="none")
     progress_error = _weighted_mean(progress_error_raw, effective_weight)
     go_progress_ok = pred_progress >= (target_progress * float(args.go_progress_ratio))
@@ -585,6 +595,7 @@ def _losses(
         "release_floor": release_floor,
         "stop_ceiling": stop_ceiling,
         "hazard_stop_ceiling": hazard_stop_ceiling,
+        "lateral_error": lateral_error,
         "progress_error": progress_error,
         "hazard_progress": hazard_progress,
         "behavior_proxy": behavior_proxy,
@@ -649,6 +660,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "release_floor",
         "stop_ceiling",
         "hazard_stop_ceiling",
+        "lateral_error",
         "progress_error",
         "hazard_progress",
         "behavior_proxy",
@@ -724,7 +736,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
                 f"xy={totals['xy']/samples:.6f} speed={totals['speed']/samples:.6f} "
                 f"smooth={totals['traj_smooth']/samples:.6f}/{totals['speed_smooth']/samples:.6f} "
                 f"stopceil={totals['stop_ceiling']/samples:.6f} stop={totals['stop']/samples:.6f} "
-                f"risk={totals['behavior_proxy']/samples:.6f} "
+                f"risk={totals['behavior_proxy']/samples:.6f} lane={totals['lateral_error']/samples:.6f} "
                 f"prior={totals['prior_xy']/samples:.6f}/{totals['prior_speed']/samples:.6f} "
                 f"aux={totals['control']/samples:.6f}/{totals['stop_state_aux']/samples:.6f}/{totals['stop_reason_aux']/samples:.6f} "
                 f"drift={totals['drift']/samples:.6f} moving={totals['moving_ratio']/samples:.3f} "
@@ -736,6 +748,21 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
     for name in rate_metric_names:
         result[name] = totals[f"{name}_num"] / max(totals[f"{name}_den"], 1.0)
         result[f"{name}_count"] = totals[f"{name}_den"]
+    result["closed_loop_proxy"] = (
+        0.35 * result["behavior_proxy"]
+        + 0.75 * result["lateral_error"]
+        + 0.20 * result["progress_error"]
+        + _miss_rate(result, "stop_hold_recall", 2.0)
+        + _miss_rate(result, "go_recall", 0.5)
+        + _miss_rate(result, "hazard_hold_recall", 3.0)
+        + _miss_rate(result, "launch_go_recall", 1.0)
+        + _miss_rate(result, "release_go_recall", 1.0)
+        + _miss_rate(result, "go_progress_recall", 0.5)
+        + _miss_rate(result, "stop_progress_hold", 2.0)
+        + _miss_rate(result, "hazard_progress_hold", 3.0)
+        + _miss_rate(result, "trafficlight_hold_recall", 2.0)
+        + _miss_rate(result, "stopsign_hold_recall", 1.0)
+    )
     return result
 
 
@@ -933,7 +960,8 @@ def train(args: argparse.Namespace) -> None:
                 f"epoch={epoch:03d} train={train_metrics['loss']:.6f} val={val_loss:.6f} "
                 f"select={selection_name}:{selection_value:.6f} best={display_best:.6f} new_best={int(improved)} "
                 f"xy={val_metrics['xy']:.6f} speed={val_metrics['speed']:.6f} "
-                f"risk={val_metrics['behavior_proxy']:.6f} prog={val_metrics['progress_error']:.6f} "
+                f"closed={val_metrics['closed_loop_proxy']:.6f} risk={val_metrics['behavior_proxy']:.6f} "
+                f"lane={val_metrics['lateral_error']:.6f} prog={val_metrics['progress_error']:.6f} "
                 f"sg={val_metrics['stop_hold_recall']:.3f}/{val_metrics['go_recall']:.3f} "
                 f"hz={val_metrics['hazard_hold_recall']:.3f} "
                 f"lr={val_metrics['launch_go_recall']:.3f}/{val_metrics['release_go_recall']:.3f} "

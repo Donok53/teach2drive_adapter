@@ -28,9 +28,11 @@ export LORA_ALPHA=${LORA_ALPHA:-32.0}
 export LORA_DROPOUT=${LORA_DROPOUT:-0.02}
 export LORA_INCLUDE=${LORA_INCLUDE:-"^join\\.,^checkpoint_decoder\\.,^target_speed_network\\."}
 export LR=${LR:-8e-6}
-export BATCH_SIZE=${BATCH_SIZE:-8}
+export BATCH_SIZE=${BATCH_SIZE:-24}
 export EPOCHS=${EPOCHS:-24}
 export EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-8}
+export SELECTION_METRIC=${SELECTION_METRIC:-closed_loop_proxy}
+export SELECTION_MODE=${SELECTION_MODE:-min}
 
 export STOP_LOSS_WEIGHT=${STOP_LOSS_WEIGHT:-0.10}
 export HAZARD_SAMPLE_WEIGHT=${HAZARD_SAMPLE_WEIGHT:-2.5}
