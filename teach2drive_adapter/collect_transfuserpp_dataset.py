@@ -1644,6 +1644,10 @@ def collect(args) -> None:
                 if episode_key in existing_summary_keys and not args.overwrite:
                     print(f"paired episode={episode_index} already collected; skipping", flush=True)
                     continue
+                episode_dir = output_root / f"episode_{episode_index:06d}"
+                if episode_dir.exists() and not args.overwrite:
+                    print(f"paired episode={episode_index} has no summary; removing stale partial directory", flush=True)
+                    shutil.rmtree(episode_dir)
                 episode_sec = _episode_seconds_for(0, episode_index, episode_plan)
                 traffic_profile = _traffic_profile_for_episode(traffic_cycle, episode_index)
                 episode_background_actors = []
@@ -1674,6 +1678,13 @@ def collect(args) -> None:
                     if episode_key in existing_summary_keys and not args.overwrite:
                         print(f"profile={profile.name} episode={episode_index} already collected; skipping", flush=True)
                         continue
+                    episode_dir = output_root / profile.name / f"episode_{episode_index:06d}"
+                    if episode_dir.exists() and not args.overwrite:
+                        print(
+                            f"profile={profile.name} episode={episode_index} has no summary; removing stale partial directory",
+                            flush=True,
+                        )
+                        shutil.rmtree(episode_dir)
                     episode_sec = _episode_seconds_for(profile_index, episode_index, episode_plan)
                     traffic_profile = _traffic_profile_for_episode(traffic_cycle, episode_index)
                     episode_background_actors = []

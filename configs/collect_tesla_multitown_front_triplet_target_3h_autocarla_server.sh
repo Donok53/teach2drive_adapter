@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 # Target-only: front_triplet_shifted is the only sensor profile collected.
 
 export CARLA_ROOT=${CARLA_ROOT:-"$HOME/dataset/byeongjae/carla-simulator"}
+export PY=${PY:-python}
 export TOWN_PRESET=${TOWN_PRESET:-longest6}
 export OUTPUT_ROOT=${OUTPUT_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_tesla_${TOWN_PRESET}_front_triplet_target_3h"}
 export COLLECT_CONFIG=${COLLECT_CONFIG:-configs/collect_tesla_front_triplet_target_3h.sh}
@@ -77,9 +78,25 @@ stop_carla() {
 
 episode_complete() {
   local episode_index="$1"
-  local episode_name
-  printf -v episode_name "episode_%06d" "$episode_index"
-  [[ -f "$OUTPUT_ROOT/$episode_name/episode_meta.json" && -f "$OUTPUT_ROOT/$episode_name/frames.jsonl" ]]
+  local summary_path="$OUTPUT_ROOT/dataset_summary.json"
+  [[ -f "$summary_path" ]] || return 1
+  "$PY" - "$summary_path" "$episode_index" <<'PY'
+import json
+import sys
+
+summary_path = sys.argv[1]
+episode_index = int(sys.argv[2])
+with open(summary_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+for episode in payload.get("episodes", []):
+    if (
+        episode.get("collection_mode") == "paired"
+        and int(episode.get("episode_index", -1)) == episode_index
+        and int(episode.get("saved_frames", 0)) > 0
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 TOWN_COUNT=0

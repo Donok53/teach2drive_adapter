@@ -19,6 +19,7 @@ export FORCE_RESTART_CARLA=${FORCE_RESTART_CARLA:-0}
 export CARLA_PRELOAD_MAP=${CARLA_PRELOAD_MAP:-0}
 export CARLA_MAP_LOAD_TIMEOUT_SEC=${CARLA_MAP_LOAD_TIMEOUT_SEC:-180}
 export CARLA_MAP_RETRIES=${CARLA_MAP_RETRIES:-3}
+export CARLA_POST_MAP_SETTLE_SEC=${CARLA_POST_MAP_SETTLE_SEC:-8}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export PYTHON_EGG_CACHE=${PYTHON_EGG_CACHE:-"$HOME/.cache/python-eggs-carla37"}
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-"/tmp/runtime-$USER"}
@@ -193,7 +194,7 @@ preload_carla_map() {
   fi
 
   echo "=== ensure CARLA map=$MAP before collector"
-  timeout "$CARLA_MAP_LOAD_TIMEOUT_SEC" "$PY" - "$HOST" "$PORT" "$MAP" <<'PY'
+  timeout "$CARLA_MAP_LOAD_TIMEOUT_SEC" "$PY" - "$HOST" "$PORT" "$MAP" "$CARLA_POST_MAP_SETTLE_SEC" <<'PY'
 import sys
 import time
 import carla
@@ -216,6 +217,15 @@ current = world.get_map().name
 print(f"map_ready current={current}", flush=True)
 if expected not in current:
     raise SystemExit(f"expected map containing {expected!r}, got {current!r}")
+
+settle_sec = float(sys.argv[4])
+if settle_sec > 0:
+    time.sleep(settle_sec)
+    world = client.get_world()
+    current = world.get_map().name
+    print(f"map_still_ready current={current}", flush=True)
+    if expected not in current:
+        raise SystemExit(f"expected map containing {expected!r} after settle, got {current!r}")
 PY
 }
 
