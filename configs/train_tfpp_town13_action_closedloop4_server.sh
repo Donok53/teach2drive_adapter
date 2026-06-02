@@ -35,31 +35,35 @@ launch() {
   fi
 
   echo "launch $name gpu=$gpu out=$out log=$log"
-  tmux new-session -d -s "$session" -- \
-    env \
-      CUDA_VISIBLE_DEVICES="$gpu" \
-      PYTHONUNBUFFERED=1 \
-      SNAPSHOT_COMPLETE_EPISODES=0 \
-      REFRESH_SNAPSHOT=0 \
-      SKIP_EXPORT=1 \
-      INDEX_OVERWRITE=0 \
-      TARGET_VIEW="$TARGET_VIEW" \
-      TARGET_INDEX="$TARGET_INDEX" \
-      WORK_ROOT="$RUN_ROOT/${name}_work" \
-      OUT="$out" \
-      OVERWRITE=1 \
-      SAVE_EPOCH_CHECKPOINTS=1 \
-      EPOCH_CHECKPOINT_DIR=epoch_checkpoints \
-      BATCH_SIZE=24 \
-      NUM_WORKERS=4 \
-      EPOCHS=18 \
-      EARLY_STOP_PATIENCE=8 \
-      EARLY_STOP_MIN_DELTA=0.0 \
-      OUTPUT_PRIOR_XY_LOSS_WEIGHT=0.0 \
-      OUTPUT_PRIOR_SPEED_LOSS_WEIGHT=0.0 \
-      "$@" \
-      bash "$BASE_CONFIG" \
-      > "$log" 2>&1
+  local cmd=()
+  cmd+=(
+    env
+    "CUDA_VISIBLE_DEVICES=$gpu"
+    PYTHONUNBUFFERED=1
+    SNAPSHOT_COMPLETE_EPISODES=0
+    REFRESH_SNAPSHOT=0
+    SKIP_EXPORT=1
+    INDEX_OVERWRITE=0
+    "TARGET_VIEW=$TARGET_VIEW"
+    "TARGET_INDEX=$TARGET_INDEX"
+    "WORK_ROOT=$RUN_ROOT/${name}_work"
+    "OUT=$out"
+    OVERWRITE=1
+    SAVE_EPOCH_CHECKPOINTS=1
+    EPOCH_CHECKPOINT_DIR=epoch_checkpoints
+    BATCH_SIZE=24
+    NUM_WORKERS=4
+    EPOCHS=18
+    EARLY_STOP_PATIENCE=8
+    EARLY_STOP_MIN_DELTA=0.0
+    OUTPUT_PRIOR_XY_LOSS_WEIGHT=0.0
+    OUTPUT_PRIOR_SPEED_LOSS_WEIGHT=0.0
+    "$@"
+    bash "$BASE_CONFIG"
+  )
+  local command_string=""
+  printf -v command_string "%q " "${cmd[@]}"
+  tmux new-session -d -s "$session" -c "$PWD" -- bash -lc "$command_string > $(printf '%q' "$log") 2>&1"
 }
 
 COMMON_RISK=(
