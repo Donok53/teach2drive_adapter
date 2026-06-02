@@ -1068,6 +1068,30 @@ def train(args: argparse.Namespace) -> None:
     best_epoch = 0
     stale = 0
     history = []
+    epoch_checkpoint_dir = out_dir / str(args.epoch_checkpoint_dir)
+    if bool(args.save_epoch_checkpoints):
+        epoch_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_task_checkpoint(path: Path, epoch: int, train_metrics: dict, val_metrics: dict, selection_value: float) -> None:
+        raw_model = _raw_task_model(model)
+        torch.save(
+            {
+                "model_state": raw_model.adapter.state_dict(),
+                "peft_lora_state": lora_state_dict(raw_model.net) if int(args.lora_rank) > 0 else {},
+                "aux_state": raw_model.aux_state_dict(),
+                "stage_feature_shapes": stage_feature_shapes,
+                "fused_feature_shape": fused_feature_shape,
+                "metadata": metadata,
+                "epoch": int(epoch),
+                "selection_metric": selection_name,
+                "selection_mode": selection_mode,
+                "selection_value": float(selection_value),
+                "val_metrics": val_metrics,
+                "train_metrics": train_metrics,
+            },
+            path,
+        )
+
     try:
         for epoch in range(1, int(args.epochs) + 1):
             train_metrics = _run_epoch(model, train_loader, optimizer, device, args, train=True, epoch=epoch)
@@ -1101,29 +1125,15 @@ def train(args: argparse.Namespace) -> None:
                 f"drift={val_metrics['drift']:.6f}",
                 flush=True,
             )
+            if bool(args.save_epoch_checkpoints):
+                epoch_path = epoch_checkpoint_dir / f"epoch_{epoch:03d}.pt"
+                save_task_checkpoint(epoch_path, epoch, train_metrics, val_metrics, selection_value)
             if improved:
                 best_score = selection_value
                 best_val_loss = val_loss
                 best_epoch = epoch
                 stale = 0
-                raw_model = _raw_task_model(model)
-                torch.save(
-                    {
-                        "model_state": raw_model.adapter.state_dict(),
-                        "peft_lora_state": lora_state_dict(raw_model.net) if int(args.lora_rank) > 0 else {},
-                        "aux_state": raw_model.aux_state_dict(),
-                        "stage_feature_shapes": stage_feature_shapes,
-                        "fused_feature_shape": fused_feature_shape,
-                        "metadata": metadata,
-                        "epoch": epoch,
-                        "selection_metric": selection_name,
-                        "selection_mode": selection_mode,
-                        "selection_value": selection_value,
-                        "val_metrics": val_metrics,
-                        "train_metrics": train_metrics,
-                    },
-                    out_dir / "best_model.pt",
-                )
+                save_task_checkpoint(out_dir / "best_model.pt", epoch, train_metrics, val_metrics, selection_value)
             else:
                 stale += 1
                 if stale >= int(args.early_stop_patience):
@@ -1188,6 +1198,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument("--selection-metric", default="loss")
     parser.add_argument("--selection-mode", choices=["min", "max"], default="min")
+    parser.add_argument("--save-epoch-checkpoints", action="store_true")
+    parser.add_argument("--epoch-checkpoint-dir", default="epoch_checkpoints")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)

@@ -51,6 +51,8 @@ export EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-6}
 export EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-0.0}
 export SELECTION_METRIC=${SELECTION_METRIC:-loss}
 export SELECTION_MODE=${SELECTION_MODE:-min}
+export SAVE_EPOCH_CHECKPOINTS=${SAVE_EPOCH_CHECKPOINTS:-0}
+export EPOCH_CHECKPOINT_DIR=${EPOCH_CHECKPOINT_DIR:-epoch_checkpoints}
 export BATCH_SIZE=${BATCH_SIZE:-8}
 export NUM_WORKERS=${NUM_WORKERS:-4}
 export LR=${LR:-2e-5}
@@ -245,6 +247,9 @@ fi
 if [[ "$DATA_PARALLEL" == "1" || "$DATA_PARALLEL" == "true" || "$DATA_PARALLEL" == "TRUE" ]]; then
   TRAIN_ARGS+=(--data-parallel)
 fi
+if [[ "$SAVE_EPOCH_CHECKPOINTS" == "1" || "$SAVE_EPOCH_CHECKPOINTS" == "true" || "$SAVE_EPOCH_CHECKPOINTS" == "TRUE" ]]; then
+  TRAIN_ARGS+=(--save-epoch-checkpoints)
+fi
 
 echo "=== train target-only task feature adapter"
 PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_adapter \
@@ -276,6 +281,7 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
   --selection-metric "$SELECTION_METRIC" \
   --selection-mode "$SELECTION_MODE" \
+  --epoch-checkpoint-dir "$EPOCH_CHECKPOINT_DIR" \
   --batch-size "$BATCH_SIZE" \
   --num-workers "$NUM_WORKERS" \
   --lr "$LR" \
