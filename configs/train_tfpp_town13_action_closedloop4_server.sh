@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 #     select the deployable checkpoint instead of trusting one open-loop metric.
 
 BASE_CONFIG="${BASE_CONFIG:-configs/train_tfpp_tesla_town13_task_feature_adapter_server.sh}"
-PY="${PY:-/home/jovyan_venv/.venv/torch2.3.0-py3.10-cuda11.8/bin/python}"
+PY="${PY:-/home/jovyan_venv/.venv/torch2.1.2-py3.10-cuda11.8/bin/python}"
 LOG_DIR="${LOG_DIR:-$HOME/teach2drive/logs}"
 RUN_ROOT="${RUN_ROOT:-$HOME/dataset/byeongjae/runs}"
 VIEW_ROOT="${VIEW_ROOT:-$RUN_ROOT/tfpp_tesla_town13_expert_only_lora16_head_blend1/profile_views}"
