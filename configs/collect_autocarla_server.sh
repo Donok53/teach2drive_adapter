@@ -15,6 +15,10 @@ export CARLA_ROOT=${CARLA_ROOT:-"$HOME/dataset/byeongjae/carla-simulator"}
 export CARLA_LOG=${CARLA_LOG:-"$HOME/teach2drive/logs/carla_collect.log"}
 export CARLA_READY_TIMEOUT_SEC=${CARLA_READY_TIMEOUT_SEC:-180}
 export CARLA_EXTRA_ARGS=${CARLA_EXTRA_ARGS:-"-stdout -FullStdOutLogOutput"}
+export FORCE_RESTART_CARLA=${FORCE_RESTART_CARLA:-0}
+export CARLA_PRELOAD_MAP=${CARLA_PRELOAD_MAP:-0}
+export CARLA_MAP_LOAD_TIMEOUT_SEC=${CARLA_MAP_LOAD_TIMEOUT_SEC:-180}
+export CARLA_MAP_RETRIES=${CARLA_MAP_RETRIES:-3}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
 export PYTHON_EGG_CACHE=${PYTHON_EGG_CACHE:-"$HOME/.cache/python-eggs-carla37"}
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-"/tmp/runtime-$USER"}
@@ -116,9 +120,31 @@ client.get_world()
 PY
 }
 
-if check_carla >/dev/null 2>&1; then
-  echo "=== CARLA already ready on $HOST:$PORT"
-else
+kill_carla_on_port() {
+  local pids=()
+  local pid
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(pgrep -f "carla-rpc-port=${PORT}" 2>/dev/null || true)
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(pgrep -f "carla-rpc-port ${PORT}" 2>/dev/null || true)
+
+  if [[ "${#pids[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "=== stopping CARLA on port $PORT: ${pids[*]}"
+  for pid in "${pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 3
+  for pid in "${pids[@]}"; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
+start_carla() {
   echo "=== start CARLA host=$HOST port=$PORT"
   (
     cd "$CARLA_ROOT"
@@ -139,7 +165,9 @@ else
   )
   CARLA_PID=$(cat "$CARLA_LOG.pid")
   echo "CARLA_PID=$CARLA_PID log=$CARLA_LOG"
+}
 
+wait_carla_ready() {
   for i in $(seq 1 "$CARLA_READY_TIMEOUT_SEC"); do
     if check_carla >/dev/null 2>&1; then
       echo "=== CARLA ready after ${i}s"
@@ -157,6 +185,72 @@ else
     fi
     sleep 1
   done
+}
+
+preload_carla_map() {
+  if [[ "$CARLA_PRELOAD_MAP" != "1" || -z "${MAP:-}" ]]; then
+    return 0
+  fi
+
+  echo "=== ensure CARLA map=$MAP before collector"
+  timeout "$CARLA_MAP_LOAD_TIMEOUT_SEC" "$PY" - "$HOST" "$PORT" "$MAP" <<'PY'
+import sys
+import time
+import carla
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+expected = str(sys.argv[3]).split("/")[-1]
+
+client = carla.Client(host, port)
+client.set_timeout(20.0)
+world = client.get_world()
+current = world.get_map().name
+if expected not in current:
+    print(f"load_world start expected={expected} current={current}", flush=True)
+    world = client.load_world(expected)
+    time.sleep(2.0)
+
+world = client.get_world()
+current = world.get_map().name
+print(f"map_ready current={current}", flush=True)
+if expected not in current:
+    raise SystemExit(f"expected map containing {expected!r}, got {current!r}")
+PY
+}
+
+if [[ "$FORCE_RESTART_CARLA" == "1" || "$FORCE_RESTART_CARLA" == "true" || "$FORCE_RESTART_CARLA" == "TRUE" ]]; then
+  kill_carla_on_port
+fi
+
+map_attempts=1
+if [[ "$CARLA_PRELOAD_MAP" == "1" ]]; then
+  map_attempts="$CARLA_MAP_RETRIES"
+fi
+
+map_ready=0
+for attempt in $(seq 1 "$map_attempts"); do
+  if check_carla >/dev/null 2>&1; then
+    echo "=== CARLA already ready on $HOST:$PORT"
+  else
+    start_carla
+    wait_carla_ready
+  fi
+
+  if preload_carla_map; then
+    map_ready=1
+    break
+  fi
+
+  echo "=== CARLA map preload failed attempt=$attempt/$map_attempts map=${MAP:-}"
+  tail -80 "$CARLA_LOG" || true
+  kill_carla_on_port
+  sleep 3
+done
+
+if [[ "$map_ready" != "1" ]]; then
+  echo "=== CARLA map preload did not succeed after $map_attempts attempt(s)"
+  exit 1
 fi
 
 exec bash "$COLLECT_CONFIG"

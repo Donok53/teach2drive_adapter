@@ -1530,16 +1530,24 @@ def collect(args) -> None:
     client = carla.Client(args.host, args.port)
     client.set_timeout(float(args.timeout))
     world = client.get_world()
-    if args.map:
+    if args.map and not args.skip_load_world:
         short = str(args.map).split("/")[-1]
         if short not in world.get_map().name:
             world = client.load_world(short)
             time.sleep(1.0)
+    elif args.map:
+        short = str(args.map).split("/")[-1]
+        current_map = world.get_map().name
+        if short not in current_map:
+            raise RuntimeError(
+                f"--skip-load-world was set, but CARLA is on {current_map!r}; expected map containing {short!r}"
+            )
 
     original_settings = world.get_settings()
     traffic_manager = client.get_trafficmanager(int(args.traffic_manager_port))
     background_actors = []
     summaries = _load_existing_summaries(output_root)
+    existing_summary_keys = {_summary_key(summary) for summary in summaries}
     plan_profile_count = 1 if args.collection_mode == "paired" else len(profiles)
     episode_plan = _build_episode_plan(plan_profile_count, args)
     traffic_cycle = _traffic_schedule_cycle(args)
@@ -1630,6 +1638,12 @@ def collect(args) -> None:
         if args.collection_mode == "paired":
             episode_indices = sorted(index for pidx, index in episode_plan if pidx == 0)
             for episode_index in episode_indices:
+                episode_key = _summary_key(
+                    {"collection_mode": "paired", "profile": "", "episode_index": episode_index}
+                )
+                if episode_key in existing_summary_keys and not args.overwrite:
+                    print(f"paired episode={episode_index} already collected; skipping", flush=True)
+                    continue
                 episode_sec = _episode_seconds_for(0, episode_index, episode_plan)
                 traffic_profile = _traffic_profile_for_episode(traffic_cycle, episode_index)
                 episode_background_actors = []
@@ -1649,10 +1663,17 @@ def collect(args) -> None:
                     if episode_background_actors:
                         _destroy_actors(client, episode_background_actors)
                 _write_dataset_summary(output_root, summaries)
+                existing_summary_keys.add(episode_key)
         else:
             for profile_index, profile in enumerate(profiles):
                 episode_indices = sorted(index for pidx, index in episode_plan if pidx == profile_index)
                 for episode_index in episode_indices:
+                    episode_key = _summary_key(
+                        {"collection_mode": "separate", "profile": profile.name, "episode_index": episode_index}
+                    )
+                    if episode_key in existing_summary_keys and not args.overwrite:
+                        print(f"profile={profile.name} episode={episode_index} already collected; skipping", flush=True)
+                        continue
                     episode_sec = _episode_seconds_for(profile_index, episode_index, episode_plan)
                     traffic_profile = _traffic_profile_for_episode(traffic_cycle, episode_index)
                     episode_background_actors = []
@@ -1672,6 +1693,7 @@ def collect(args) -> None:
                         if episode_background_actors:
                             _destroy_actors(client, episode_background_actors)
                     _write_dataset_summary(output_root, summaries)
+                    existing_summary_keys.add(episode_key)
     finally:
         _destroy_actors(client, background_actors)
         try:
@@ -1698,6 +1720,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--carla-root", default="/home/jovyan/dataset/byeongjae/carla-simulator")
     parser.add_argument("--map", default="Town10HD_Opt")
+    parser.add_argument(
+        "--skip-load-world",
+        action="store_true",
+        help="Do not call client.load_world(); require the running CARLA server to already be on --map.",
+    )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--profiles", default="tfpp_ego,front_triplet_shifted")
     parser.add_argument("--collection-mode", choices=["paired", "separate"], default="paired", help="paired stores every profile on the same ego/timestamp; separate keeps the legacy per-profile episodes.")

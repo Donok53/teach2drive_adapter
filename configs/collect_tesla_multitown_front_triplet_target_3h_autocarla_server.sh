@@ -12,6 +12,7 @@ export TOWN_PRESET=${TOWN_PRESET:-longest6}
 export OUTPUT_ROOT=${OUTPUT_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_tesla_${TOWN_PRESET}_front_triplet_target_3h"}
 export COLLECT_CONFIG=${COLLECT_CONFIG:-configs/collect_tesla_front_triplet_target_3h.sh}
 export CARLA_LOG=${CARLA_LOG:-"$HOME/teach2drive/logs/carla_multitown_tesla_front_triplet_collect.log"}
+BASE_CARLA_LOG="$CARLA_LOG"
 
 export HOST=${HOST:-127.0.0.1}
 export PORT=${PORT:-2000}
@@ -26,6 +27,11 @@ export TRAFFIC_SCHEDULE=${TRAFFIC_SCHEDULE:-vehicle_b_mixed}
 export TRAFFIC_VEHICLES=${TRAFFIC_VEHICLES:-60}
 export FAIL_ON_INVALID_MOTION=${FAIL_ON_INVALID_MOTION:-1}
 export CONTINUE_ON_TOWN_FAILURE=${CONTINUE_ON_TOWN_FAILURE:-1}
+export CARLA_PRELOAD_MAP=${CARLA_PRELOAD_MAP:-1}
+export COLLECT_SKIP_LOAD_WORLD=${COLLECT_SKIP_LOAD_WORLD:-1}
+export FORCE_RESTART_CARLA=${FORCE_RESTART_CARLA:-1}
+export CARLA_MAP_LOAD_TIMEOUT_SEC=${CARLA_MAP_LOAD_TIMEOUT_SEC:-180}
+export CARLA_MAP_RETRIES=${CARLA_MAP_RETRIES:-3}
 
 if [[ -z "${TOWNS_CSV:-}" ]]; then
   case "$TOWN_PRESET" in
@@ -48,11 +54,32 @@ FAILED_TOWNS_LOG="$OUTPUT_ROOT/failed_towns.jsonl"
 : > "$FAILED_TOWNS_LOG"
 
 stop_carla() {
-  if pgrep -f CarlaUE4 >/dev/null 2>&1; then
-    pkill -TERM -f CarlaUE4 2>/dev/null || true
-    sleep 3
-    pkill -KILL -f CarlaUE4 2>/dev/null || true
+  local pids=()
+  local pid
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(pgrep -f "carla-rpc-port=${PORT}" 2>/dev/null || true)
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(pgrep -f "carla-rpc-port ${PORT}" 2>/dev/null || true)
+  if [[ "${#pids[@]}" -eq 0 ]]; then
+    return 0
   fi
+  echo "=== stopping CARLA on port $PORT: ${pids[*]}"
+  for pid in "${pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 3
+  for pid in "${pids[@]}"; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
+episode_complete() {
+  local episode_index="$1"
+  local episode_name
+  printf -v episode_name "episode_%06d" "$episode_index"
+  [[ -f "$OUTPUT_ROOT/$episode_name/episode_meta.json" && -f "$OUTPUT_ROOT/$episode_name/frames.jsonl" ]]
 }
 
 TOWN_COUNT=0
@@ -85,10 +112,28 @@ for town in "${TOWNS[@]}"; do
   if [[ "$town_offset" -lt "$extra_episodes" ]]; then
     episodes_for_town=$((episodes_for_town + 1))
   fi
+
+  complete_for_town=1
+  for episode_index in $(seq "$episode_cursor" $((episode_cursor + episodes_for_town - 1))); do
+    if ! episode_complete "$episode_index"; then
+      complete_for_town=0
+      break
+    fi
+  done
+  if [[ "$complete_for_town" == "1" ]]; then
+    echo "=== skip target-only expert data: map=$town episodes=$episodes_for_town start=$episode_cursor already complete"
+    completed_episodes=$((completed_episodes + episodes_for_town))
+    episode_cursor=$((episode_cursor + episodes_for_town))
+    town_offset=$((town_offset + 1))
+    continue
+  fi
+
   export MAP="$town"
   export START_EPISODE_INDEX="$episode_cursor"
   export EPISODES="$episodes_for_town"
   export TRAFFIC_SCHEDULE_SEED=$((31 + town_offset))
+  carla_log_prefix="${BASE_CARLA_LOG%.log}"
+  export CARLA_LOG="${carla_log_prefix}_${MAP}_port${PORT}.log"
 
   echo "=== collect target-only expert data: map=$MAP episodes=$EPISODES start=$START_EPISODE_INDEX output=$OUTPUT_ROOT"
   if bash configs/collect_autocarla_server.sh; then

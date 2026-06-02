@@ -37,6 +37,7 @@ LIDAR_FORMAT=${LIDAR_FORMAT:-npz}
 OVERWRITE=${OVERWRITE:-0}
 TIMEOUT=${TIMEOUT:-30.0}
 SENSOR_TIMEOUT=${SENSOR_TIMEOUT:-10.0}
+COLLECT_SKIP_LOAD_WORLD=${COLLECT_SKIP_LOAD_WORLD:-0}
 
 EXTRA_ARGS=()
 if [[ "$OVERWRITE" == "1" || "$OVERWRITE" == "true" || "$OVERWRITE" == "TRUE" ]]; then
@@ -53,6 +54,9 @@ if [[ "$FAIL_ON_INVALID_MOTION" == "1" || "$FAIL_ON_INVALID_MOTION" == "true" ||
 fi
 if [[ -n "$TRAFFIC_SCHEDULE_SPEC" ]]; then
   EXTRA_ARGS+=(--traffic-schedule-spec "$TRAFFIC_SCHEDULE_SPEC")
+fi
+if [[ "$COLLECT_SKIP_LOAD_WORLD" == "1" || "$COLLECT_SKIP_LOAD_WORLD" == "true" || "$COLLECT_SKIP_LOAD_WORLD" == "TRUE" ]]; then
+  EXTRA_ARGS+=(--skip-load-world)
 fi
 
 "$PY" -m teach2drive_adapter.collect_transfuserpp_dataset \
