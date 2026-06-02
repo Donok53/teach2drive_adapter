@@ -73,6 +73,94 @@ def _miss_rate(metrics: dict[str, float], name: str, weight: float) -> float:
     return float(weight) * max(0.0, 1.0 - float(metrics.get(name, 0.0)))
 
 
+def _controller_proxy_losses(
+    pred_traj: torch.Tensor,
+    pred_speed: torch.Tensor,
+    pred_stop_logit: torch.Tensor,
+    scalar: torch.Tensor,
+    control_target: torch.Tensor,
+    control_mask: torch.Tensor,
+    effective_weight: torch.Tensor,
+    args,
+) -> dict[str, torch.Tensor]:
+    """Approximate the downstream TF++ controller and compare with expert controls."""
+
+    device = pred_traj.device
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    metrics: dict[str, torch.Tensor] = {
+        "controller_proxy": zero,
+        "plan_steer_error": zero,
+        "plan_throttle_error": zero,
+        "plan_brake_error": zero,
+    }
+    for name in ("plan_brake_recall", "plan_go_recall", "plan_steer_close", "plan_throttle_close"):
+        metrics[f"{name}_num"] = zero
+        metrics[f"{name}_den"] = zero
+
+    if control_target.numel() == 0 or control_target.ndim < 2 or control_target.shape[1] < 3:
+        return metrics
+
+    batch_size = int(pred_traj.shape[0])
+    control_active_f = _per_sample_vector(control_mask, batch_size)
+    control_active = control_active_f > 0.5
+    if not bool(control_active.any()):
+        return metrics
+
+    expert_steer = control_target[:, 0].clamp(-1.0, 1.0)
+    expert_throttle = control_target[:, 1].clamp(0.0, 1.0)
+    expert_brake = control_target[:, 2].clamp(0.0, 1.0)
+
+    waypoint_count = int(pred_traj.shape[1])
+    aim_idx = min(max(waypoint_count - 1, 0), 3)
+    aim = pred_traj[:, aim_idx, :2]
+    pred_steer = torch.atan2(aim[:, 1], torch.clamp(aim[:, 0], min=1e-3)) / (0.5 * torch.pi)
+    pred_steer = pred_steer.clamp(-1.0, 1.0)
+
+    pred_speed_nonnegative = pred_speed.clamp_min(0.0)
+    speed_from_head = pred_speed_nonnegative.amax(dim=1)
+    if waypoint_count >= 2:
+        one_idx = min(max(waypoint_count - 1, 1), 3)
+        half_idx = max(0, one_idx // 2)
+        plan_delta = pred_traj[:, one_idx, :2] - pred_traj[:, half_idx, :2]
+        speed_from_plan = torch.linalg.norm(plan_delta, dim=1) * 2.0
+    else:
+        speed_from_plan = speed_from_head
+    desired_speed = 0.5 * speed_from_head + 0.5 * speed_from_plan
+    current_speed = scalar[:, 0].abs() if scalar.shape[1] else torch.zeros_like(desired_speed)
+
+    pred_brake_bool = (
+        (pred_stop_logit >= 0.0)
+        | (speed_from_head <= float(args.stop_speed_ceiling_mps))
+        | (desired_speed <= float(args.stop_speed_ceiling_mps))
+    )
+    pred_brake = pred_brake_bool.to(dtype=torch.float32)
+    pred_throttle = ((desired_speed - current_speed) / max(float(args.speed_floor_mps), 1e-3)).clamp(0.0, 1.0)
+    pred_throttle = pred_throttle * (1.0 - pred_brake)
+
+    active_weight = effective_weight * control_active_f
+    steer_raw = nn.functional.smooth_l1_loss(pred_steer, expert_steer, reduction="none")
+    throttle_raw = nn.functional.smooth_l1_loss(pred_throttle, expert_throttle, reduction="none")
+    brake_raw = nn.functional.smooth_l1_loss(pred_brake, expert_brake, reduction="none")
+    metrics["plan_steer_error"] = _weighted_mean(steer_raw, active_weight)
+    metrics["plan_throttle_error"] = _weighted_mean(throttle_raw, active_weight)
+    metrics["plan_brake_error"] = _weighted_mean(brake_raw, active_weight)
+    metrics["controller_proxy"] = (
+        0.75 * metrics["plan_steer_error"]
+        + 1.00 * metrics["plan_throttle_error"]
+        + 2.00 * metrics["plan_brake_error"]
+    )
+
+    expert_brake_active = control_active & (expert_brake >= 0.5)
+    expert_go_active = control_active & (expert_brake < 0.5) & (expert_throttle >= float(args.controller_go_throttle_threshold))
+    steer_close = (pred_steer - expert_steer).abs() <= float(args.controller_steer_close_threshold)
+    throttle_close = (pred_throttle - expert_throttle).abs() <= float(args.controller_throttle_close_threshold)
+    _count_pair(metrics, "plan_brake_recall", pred_brake_bool, expert_brake_active)
+    _count_pair(metrics, "plan_go_recall", ~pred_brake_bool & (pred_throttle >= float(args.controller_go_throttle_threshold)), expert_go_active)
+    _count_pair(metrics, "plan_steer_close", steer_close, control_active)
+    _count_pair(metrics, "plan_throttle_close", throttle_close, control_active)
+    return metrics
+
+
 class _BackboneTaskPatch:
     """Insert a trainable feature-then-fusion adapter inside one TF++ backbone."""
 
@@ -548,6 +636,16 @@ def _losses(
         torch.mean(nn.functional.smooth_l1_loss(pred_speed, prior_speed_target, reduction="none"), dim=1),
         effective_weight,
     )
+    controller_metrics = _controller_proxy_losses(
+        pred_traj=pred_traj,
+        pred_speed=pred_speed,
+        pred_stop_logit=pred_stop_logit,
+        scalar=scalar,
+        control_target=control_target,
+        control_mask=control_mask,
+        effective_weight=effective_weight,
+        args=args,
+    )
     zero = torch.zeros((), dtype=torch.float32, device=device)
     control = zero
     if "control" in aux and control_target.numel() > 0:
@@ -603,6 +701,10 @@ def _losses(
         "drift": drift,
         "prior_xy": prior_xy,
         "prior_speed": prior_speed,
+        "controller_proxy": controller_metrics["controller_proxy"],
+        "plan_steer_error": controller_metrics["plan_steer_error"],
+        "plan_throttle_error": controller_metrics["plan_throttle_error"],
+        "plan_brake_error": controller_metrics["plan_brake_error"],
         "control": control,
         "stop_state_aux": stop_state_aux,
         "stop_reason_aux": stop_reason_aux,
@@ -626,6 +728,9 @@ def _losses(
         reason_active = _reason_mask(stop_reason, stop_reason_mask, reason_name).to(device=device)
         metric_name = reason_name.replace("_", "")
         _count_pair(metrics, f"{metric_name}_hold_recall", pred_stop_by_speed, reason_active)
+    for name in ("plan_brake_recall", "plan_go_recall", "plan_steer_close", "plan_throttle_close"):
+        metrics[f"{name}_num"] = controller_metrics[f"{name}_num"]
+        metrics[f"{name}_den"] = controller_metrics[f"{name}_den"]
     return metrics
 
 
@@ -668,6 +773,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "drift",
         "prior_xy",
         "prior_speed",
+        "controller_proxy",
+        "plan_steer_error",
+        "plan_throttle_error",
+        "plan_brake_error",
         "control",
         "stop_state_aux",
         "stop_reason_aux",
@@ -692,6 +801,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "stopsign_hold_recall",
         "frontvehicle_hold_recall",
         "junctionyield_hold_recall",
+        "plan_brake_recall",
+        "plan_go_recall",
+        "plan_steer_close",
+        "plan_throttle_close",
     )
     totals = {name: 0.0 for name in metric_names}
     for name in rate_metric_names:
@@ -737,6 +850,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
                 f"smooth={totals['traj_smooth']/samples:.6f}/{totals['speed_smooth']/samples:.6f} "
                 f"stopceil={totals['stop_ceiling']/samples:.6f} stop={totals['stop']/samples:.6f} "
                 f"risk={totals['behavior_proxy']/samples:.6f} lane={totals['lateral_error']/samples:.6f} "
+                f"ctrl={totals['controller_proxy']/samples:.6f} "
+                f"plan={totals['plan_steer_error']/samples:.6f}/{totals['plan_throttle_error']/samples:.6f}/{totals['plan_brake_error']/samples:.6f} "
                 f"prior={totals['prior_xy']/samples:.6f}/{totals['prior_speed']/samples:.6f} "
                 f"aux={totals['control']/samples:.6f}/{totals['stop_state_aux']/samples:.6f}/{totals['stop_reason_aux']/samples:.6f} "
                 f"drift={totals['drift']/samples:.6f} moving={totals['moving_ratio']/samples:.3f} "
@@ -762,6 +877,17 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         + _miss_rate(result, "hazard_progress_hold", 3.0)
         + _miss_rate(result, "trafficlight_hold_recall", 2.0)
         + _miss_rate(result, "stopsign_hold_recall", 1.0)
+    )
+    result["controller_closed_loop_proxy"] = (
+        result["closed_loop_proxy"]
+        + 2.00 * result["controller_proxy"]
+        + 0.75 * result["plan_steer_error"]
+        + 0.50 * result["plan_throttle_error"]
+        + 2.00 * result["plan_brake_error"]
+        + _miss_rate(result, "plan_brake_recall", 3.0)
+        + _miss_rate(result, "plan_go_recall", 1.5)
+        + _miss_rate(result, "plan_steer_close", 1.0)
+        + _miss_rate(result, "plan_throttle_close", 1.0)
     )
     return result
 
@@ -962,8 +1088,13 @@ def train(args: argparse.Namespace) -> None:
                 f"xy={val_metrics['xy']:.6f} speed={val_metrics['speed']:.6f} "
                 f"closed={val_metrics['closed_loop_proxy']:.6f} risk={val_metrics['behavior_proxy']:.6f} "
                 f"lane={val_metrics['lateral_error']:.6f} prog={val_metrics['progress_error']:.6f} "
+                f"ctrl_closed={val_metrics['controller_closed_loop_proxy']:.6f} "
+                f"ctrl={val_metrics['controller_proxy']:.6f} "
+                f"plan={val_metrics['plan_steer_error']:.6f}/{val_metrics['plan_throttle_error']:.6f}/{val_metrics['plan_brake_error']:.6f} "
                 f"sg={val_metrics['stop_hold_recall']:.3f}/{val_metrics['go_recall']:.3f} "
                 f"hz={val_metrics['hazard_hold_recall']:.3f} "
+                f"plan_sgtb={val_metrics['plan_steer_close']:.3f}/{val_metrics['plan_go_recall']:.3f}/"
+                f"{val_metrics['plan_throttle_close']:.3f}/{val_metrics['plan_brake_recall']:.3f} "
                 f"lr={val_metrics['launch_go_recall']:.3f}/{val_metrics['release_go_recall']:.3f} "
                 f"prior={val_metrics['prior_xy']:.6f}/{val_metrics['prior_speed']:.6f} "
                 f"aux={val_metrics['control']:.6f}/{val_metrics['stop_state_aux']:.6f}/{val_metrics['stop_reason_aux']:.6f} "
@@ -1100,6 +1231,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--release-sample-weight", type=float, default=1.3)
     parser.add_argument("--release-speed-floor-loss-weight", type=float, default=0.04)
     parser.add_argument("--release-speed-floor-mps", type=float, default=1.2)
+    parser.add_argument("--controller-steer-close-threshold", type=float, default=0.15)
+    parser.add_argument("--controller-throttle-close-threshold", type=float, default=0.20)
+    parser.add_argument("--controller-go-throttle-threshold", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int, default=0)
