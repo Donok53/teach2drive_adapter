@@ -12,7 +12,7 @@ export HOST=${HOST:-127.0.0.1}
 export PORT=${PORT:-2007}
 
 export TOWN_PRESET=${TOWN_PRESET:-benchmix8}
-export TOWNS_CSV=${TOWNS_CSV:-Town01,Town02,Town03,Town04,Town05,Town06,Town10HD,Town12}
+export TOWNS_CSV=${TOWNS_CSV:-Town01,Town02_Opt,Town03_Opt,Town04_Opt,Town05_Opt,Town06,Town10HD_Opt,Town12}
 export OUTPUT_ROOT=${OUTPUT_ROOT:-"$HOME/dataset/byeongjae/datasets/t2d_tesla_benchmix8_front_triplet_target_3h"}
 export TOTAL_EPISODES=${TOTAL_EPISODES:-36}
 export EPISODE_SEC=${EPISODE_SEC:-300}
