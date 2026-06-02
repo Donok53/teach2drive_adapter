@@ -18,6 +18,7 @@ export CARLA_EXTRA_ARGS=${CARLA_EXTRA_ARGS:-"-stdout -FullStdOutLogOutput"}
 export FORCE_RESTART_CARLA=${FORCE_RESTART_CARLA:-0}
 export CARLA_PRELOAD_MAP=${CARLA_PRELOAD_MAP:-0}
 export CARLA_MAP_LOAD_TIMEOUT_SEC=${CARLA_MAP_LOAD_TIMEOUT_SEC:-180}
+export CARLA_CLIENT_TIMEOUT_SEC=${CARLA_CLIENT_TIMEOUT_SEC:-20}
 export CARLA_MAP_RETRIES=${CARLA_MAP_RETRIES:-3}
 export CARLA_POST_MAP_SETTLE_SEC=${CARLA_POST_MAP_SETTLE_SEC:-8}
 export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
@@ -194,7 +195,7 @@ preload_carla_map() {
   fi
 
   echo "=== ensure CARLA map=$MAP before collector"
-  timeout "$CARLA_MAP_LOAD_TIMEOUT_SEC" "$PY" - "$HOST" "$PORT" "$MAP" "$CARLA_POST_MAP_SETTLE_SEC" <<'PY'
+  timeout "$CARLA_MAP_LOAD_TIMEOUT_SEC" "$PY" - "$HOST" "$PORT" "$MAP" "$CARLA_POST_MAP_SETTLE_SEC" "$CARLA_CLIENT_TIMEOUT_SEC" <<'PY'
 import sys
 import time
 import carla
@@ -204,7 +205,7 @@ port = int(sys.argv[2])
 expected = str(sys.argv[3]).split("/")[-1]
 
 client = carla.Client(host, port)
-client.set_timeout(20.0)
+client.set_timeout(float(sys.argv[5]))
 world = client.get_world()
 current = world.get_map().name
 if expected not in current:
