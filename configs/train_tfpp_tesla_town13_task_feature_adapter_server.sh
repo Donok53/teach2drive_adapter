@@ -67,6 +67,9 @@ export EXTRINSIC_DROPOUT=${EXTRINSIC_DROPOUT:-0.0}
 export HIDDEN_CHANNELS=${HIDDEN_CHANNELS:-0}
 export BLOCKS=${BLOCKS:-2}
 export DROPOUT=${DROPOUT:-0.0}
+export STAGE_ADAPTER_LAYERS=${STAGE_ADAPTER_LAYERS:-all}
+export STAGE_ADAPTER_MODALITIES=${STAGE_ADAPTER_MODALITIES:-all}
+export FUSION_ADAPTER_ENABLED=${FUSION_ADAPTER_ENABLED:-1}
 export STAGE_FEATURE_ADAPTER_BLEND=${STAGE_FEATURE_ADAPTER_BLEND:-1.0}
 export FUSION_ADAPTER_BLEND=${FUSION_ADAPTER_BLEND:-1.0}
 export INIT_CHECKPOINT=${INIT_CHECKPOINT:-""}
@@ -250,6 +253,9 @@ fi
 if [[ "$SAVE_EPOCH_CHECKPOINTS" == "1" || "$SAVE_EPOCH_CHECKPOINTS" == "true" || "$SAVE_EPOCH_CHECKPOINTS" == "TRUE" ]]; then
   TRAIN_ARGS+=(--save-epoch-checkpoints)
 fi
+if [[ "$FUSION_ADAPTER_ENABLED" == "0" || "$FUSION_ADAPTER_ENABLED" == "false" || "$FUSION_ADAPTER_ENABLED" == "FALSE" ]]; then
+  TRAIN_ARGS+=(--disable-fusion-adapter)
+fi
 
 echo "=== train target-only task feature adapter"
 PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_adapter \
@@ -269,6 +275,8 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --hidden-channels "$HIDDEN_CHANNELS" \
   --blocks "$BLOCKS" \
   --dropout "$DROPOUT" \
+  --stage-adapter-layers "$STAGE_ADAPTER_LAYERS" \
+  --stage-adapter-modalities "$STAGE_ADAPTER_MODALITIES" \
   --stage-feature-adapter-blend "$STAGE_FEATURE_ADAPTER_BLEND" \
   --fusion-adapter-blend "$FUSION_ADAPTER_BLEND" \
   --lora-rank "$LORA_RANK" \

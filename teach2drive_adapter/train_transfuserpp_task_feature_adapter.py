@@ -38,6 +38,22 @@ def _camera_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _parse_stage_adapter_layers(raw: str | None) -> tuple[int, ...] | None:
+    value = (raw or "all").strip().lower()
+    if value in {"", "all", "*"}:
+        return None
+    if value.startswith("early:"):
+        count = int(value.split(":", 1)[1])
+        return tuple(range(max(0, count)))
+    layers = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        layers.append(int(item))
+    return tuple(sorted(set(layers)))
+
+
 def _hazard_reason_mask(stop_reason: torch.Tensor, names: str) -> torch.Tensor:
     ids = []
     for name in names.split(","):
@@ -172,6 +188,9 @@ class _BackboneTaskPatch:
         fused_feature_shape: tuple[int, int, int],
         stage_blend: float,
         fusion_blend: float,
+        stage_adapter_layers: tuple[int, ...] | None = None,
+        stage_adapter_modalities: str = "all",
+        fusion_adapter_enabled: bool = True,
     ) -> None:
         self.backbone = backbone
         self.adapter = adapter
@@ -179,6 +198,9 @@ class _BackboneTaskPatch:
         self.fused_feature_shape = fused_feature_shape
         self.stage_blend = float(stage_blend)
         self.fusion_blend = float(fusion_blend)
+        self.stage_adapter_layers = None if stage_adapter_layers is None else tuple(int(v) for v in stage_adapter_layers)
+        self.stage_adapter_modalities = str(stage_adapter_modalities)
+        self.fusion_adapter_enabled = bool(fusion_adapter_enabled)
         self.original_fuse_features = backbone.fuse_features
         self.original_forward = backbone.forward
         self.enabled = True
@@ -211,6 +233,11 @@ class _BackboneTaskPatch:
                 return patch.original_fuse_features(image_features, lidar_features, layer_idx)
 
             idx = int(layer_idx)
+            if patch.stage_adapter_layers is not None and idx not in patch.stage_adapter_layers:
+                return patch.original_fuse_features(image_features, lidar_features, layer_idx)
+            if patch.stage_adapter_modalities == "none":
+                return patch.original_fuse_features(image_features, lidar_features, layer_idx)
+
             image_embd_layer = backbone.avgpool_img(image_features)
             lidar_embd_layer = backbone.avgpool_lidar(lidar_features)
             lidar_embd_layer = backbone.lidar_channel_to_img[idx](lidar_embd_layer)
@@ -228,8 +255,14 @@ class _BackboneTaskPatch:
                 )
 
             adapted_image, adapted_lidar = patch.adapter.adapt_layer(idx, image_embd_layer.float(), lidar_embd_layer.float())
-            patch._record(adapted_image, image_embd_layer)
-            patch._record(adapted_lidar, lidar_embd_layer)
+            if patch.stage_adapter_modalities in {"all", "camera"}:
+                patch._record(adapted_image, image_embd_layer)
+            else:
+                adapted_image = image_embd_layer.float()
+            if patch.stage_adapter_modalities in {"all", "lidar"}:
+                patch._record(adapted_lidar, lidar_embd_layer)
+            else:
+                adapted_lidar = lidar_embd_layer.float()
             adapted_image = adapted_image.to(dtype=image_embd_layer.dtype)
             adapted_lidar = adapted_lidar.to(dtype=lidar_embd_layer.dtype)
             if patch.stage_blend < 1.0:
@@ -267,6 +300,9 @@ class _BackboneTaskPatch:
             if not isinstance(output, (tuple, list)) or len(output) < 2:
                 return output
             fused = output[1]
+            if not patch.fusion_adapter_enabled:
+                patch.last_fused = fused
+                return output
             got = tuple(int(v) for v in fused.shape[1:])
             if got != patch.fused_feature_shape:
                 raise ValueError(f"fused feature shape mismatch: {got} != {patch.fused_feature_shape}")
@@ -316,6 +352,9 @@ class _TaskAdapterForward(nn.Module):
         fused_feature_shape: tuple[int, int, int],
         stage_blend: float,
         fusion_blend: float,
+        stage_adapter_layers: tuple[int, ...] | None = None,
+        stage_adapter_modalities: str = "all",
+        fusion_adapter_enabled: bool = True,
         aux_hidden_dim: int = 256,
         use_stop_state_aux: bool = False,
         use_stop_reason_aux: bool = False,
@@ -332,6 +371,9 @@ class _TaskAdapterForward(nn.Module):
         self.fused_feature_shape = fused_feature_shape
         self.stage_blend = float(stage_blend)
         self.fusion_blend = float(fusion_blend)
+        self.stage_adapter_layers = stage_adapter_layers
+        self.stage_adapter_modalities = str(stage_adapter_modalities)
+        self.fusion_adapter_enabled = bool(fusion_adapter_enabled)
         self._patch: _BackboneTaskPatch | None = None
         fused_channels = int(fused_feature_shape[0])
         self.stop_state_head = _AuxHead(fused_channels, 4, int(aux_hidden_dim)) if use_stop_state_aux else None
@@ -359,6 +401,9 @@ class _TaskAdapterForward(nn.Module):
                 self.fused_feature_shape,
                 stage_blend=self.stage_blend,
                 fusion_blend=self.fusion_blend,
+                stage_adapter_layers=self.stage_adapter_layers,
+                stage_adapter_modalities=self.stage_adapter_modalities,
+                fusion_adapter_enabled=self.fusion_adapter_enabled,
             )
         return self._patch
 
@@ -961,6 +1006,8 @@ def train(args: argparse.Namespace) -> None:
         drop_last=False,
     )
     stage_feature_shapes, fused_feature_shape = _infer_feature_shapes(net, config, probe_loader, cameras, args, device)
+    stage_adapter_layers = _parse_stage_adapter_layers(args.stage_adapter_layers)
+    fusion_adapter_enabled = not bool(args.disable_fusion_adapter)
     extrinsic_vector = build_extrinsic_vector(args.source_profile)
     if args.extrinsic_aware:
         adapter = ExtrinsicAwareFeatureThenFusionAdapter(
@@ -993,6 +1040,9 @@ def train(args: argparse.Namespace) -> None:
         fused_feature_shape=fused_feature_shape,
         stage_blend=float(args.stage_feature_adapter_blend),
         fusion_blend=float(args.fusion_adapter_blend),
+        stage_adapter_layers=stage_adapter_layers,
+        stage_adapter_modalities=str(args.stage_adapter_modalities),
+        fusion_adapter_enabled=fusion_adapter_enabled,
         aux_hidden_dim=int(args.aux_hidden_dim),
         use_stop_state_aux=float(args.stop_state_aux_loss_weight) > 0.0,
         use_stop_reason_aux=float(args.stop_reason_aux_loss_weight) > 0.0,
@@ -1031,6 +1081,9 @@ def train(args: argparse.Namespace) -> None:
         "lidar_size": int(args.lidar_size),
         "stage_feature_shapes": {key: list(value) for key, value in stage_feature_shapes.items()},
         "fused_feature_shape": list(fused_feature_shape),
+        "stage_adapter_layers": None if stage_adapter_layers is None else [int(v) for v in stage_adapter_layers],
+        "stage_adapter_modalities": str(args.stage_adapter_modalities),
+        "fusion_adapter_enabled": bool(fusion_adapter_enabled),
         "extrinsic_aware": bool(args.extrinsic_aware),
         "source_profile": args.source_profile,
         "extrinsic_vector": [float(v) for v in extrinsic_vector],
@@ -1048,6 +1101,9 @@ def train(args: argparse.Namespace) -> None:
                 "val_samples": len(val_ds),
                 "stage_feature_shapes": metadata["stage_feature_shapes"],
                 "fused_feature_shape": metadata["fused_feature_shape"],
+                "stage_adapter_layers": metadata["stage_adapter_layers"],
+                "stage_adapter_modalities": metadata["stage_adapter_modalities"],
+                "fusion_adapter_enabled": metadata["fusion_adapter_enabled"],
                 "tfpp_load_info": load_info,
                 "adapter_init_load_info": load_adapter_info,
                 "peft_lora_modules": peft_lora_modules,
@@ -1183,6 +1239,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-channels", type=int, default=0)
     parser.add_argument("--blocks", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--stage-adapter-layers",
+        default="all",
+        help="Stage fusion layers to adapt: all, early:N, or comma-separated indices such as 0,1.",
+    )
+    parser.add_argument(
+        "--stage-adapter-modalities",
+        choices=["all", "camera", "lidar", "none"],
+        default="all",
+        help="Which stage token streams are replaced by the learned adapter output.",
+    )
+    parser.add_argument("--disable-fusion-adapter", action="store_true")
     parser.add_argument("--stage-feature-adapter-blend", type=float, default=1.0)
     parser.add_argument("--fusion-adapter-blend", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=0)
