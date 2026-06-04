@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 from typing import Dict
@@ -52,6 +53,32 @@ def _parse_stage_adapter_layers(raw: str | None) -> tuple[int, ...] | None:
             continue
         layers.append(int(item))
     return tuple(sorted(set(layers)))
+
+
+def _split_patterns(raw: str) -> list[str]:
+    return [item.strip() for item in str(raw).split(",") if item.strip()]
+
+
+def _matches_any(name: str, patterns: list[str]) -> bool:
+    return bool(patterns) and any(re.search(pattern, name) for pattern in patterns)
+
+
+def _unfreeze_matching_tfpp_parameters(net: nn.Module, include: str, exclude: str) -> list[str]:
+    include_patterns = _split_patterns(include)
+    exclude_patterns = _split_patterns(exclude)
+    if not include_patterns:
+        return []
+    unfrozen = []
+    for name, param in net.named_parameters():
+        if not _matches_any(name, include_patterns):
+            continue
+        if _matches_any(name, exclude_patterns):
+            continue
+        param.requires_grad_(True)
+        unfrozen.append(name)
+    if not unfrozen:
+        raise ValueError(f"No TF++ parameters matched --unfreeze-include={include!r} --unfreeze-exclude={exclude!r}")
+    return unfrozen
 
 
 def _hazard_reason_mask(stop_reason: torch.Tensor, names: str) -> torch.Tensor:
@@ -359,6 +386,9 @@ class _TaskAdapterForward(nn.Module):
         use_stop_state_aux: bool = False,
         use_stop_reason_aux: bool = False,
         use_control_aux: bool = False,
+        lidar_shift_x_m: float = 0.0,
+        lidar_shift_y_m: float = 0.0,
+        lidar_pixels_per_meter: float = 4.0,
     ) -> None:
         super().__init__()
         self.net = net
@@ -374,6 +404,9 @@ class _TaskAdapterForward(nn.Module):
         self.stage_adapter_layers = stage_adapter_layers
         self.stage_adapter_modalities = str(stage_adapter_modalities)
         self.fusion_adapter_enabled = bool(fusion_adapter_enabled)
+        self.lidar_shift_x_m = float(lidar_shift_x_m)
+        self.lidar_shift_y_m = float(lidar_shift_y_m)
+        self.lidar_pixels_per_meter = float(lidar_pixels_per_meter)
         self._patch: _BackboneTaskPatch | None = None
         fused_channels = int(fused_feature_shape[0])
         self.stop_state_head = _AuxHead(fused_channels, 4, int(aux_hidden_dim)) if use_stop_state_aux else None
@@ -449,6 +482,9 @@ class _TaskAdapterForward(nn.Module):
             config=self.config,
             command_mode=self.command_mode,
             tfpp_camera=self.tfpp_camera,
+            lidar_shift_x_m=self.lidar_shift_x_m,
+            lidar_shift_y_m=self.lidar_shift_y_m,
+            lidar_pixels_per_meter=self.lidar_pixels_per_meter,
         )
 
         patch.enabled = False
@@ -996,6 +1032,7 @@ def train(args: argparse.Namespace) -> None:
         )
         if not peft_lora_modules:
             raise ValueError(f"No LoRA modules matched include={args.lora_include!r} exclude={args.lora_exclude!r}")
+    unfrozen_tfpp_params = _unfreeze_matching_tfpp_parameters(net, args.unfreeze_include, args.unfreeze_exclude)
 
     probe_loader = DataLoader(
         train_ds,
@@ -1047,15 +1084,36 @@ def train(args: argparse.Namespace) -> None:
         use_stop_state_aux=float(args.stop_state_aux_loss_weight) > 0.0,
         use_stop_reason_aux=float(args.stop_reason_aux_loss_weight) > 0.0,
         use_control_aux=float(args.control_loss_weight) > 0.0,
+        lidar_shift_x_m=float(args.lidar_canonical_shift_x_m),
+        lidar_shift_y_m=float(args.lidar_canonical_shift_y_m),
+        lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
     ).to(device)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
         model = nn.DataParallel(model)
-    optimizer = torch.optim.AdamW(
-        (param for param in model.parameters() if param.requires_grad),
-        lr=float(args.lr),
-        weight_decay=float(args.weight_decay),
-    )
+    main_params = []
+    unfrozen_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        bare_name = name[len("module.") :] if name.startswith("module.") else name
+        is_tfpp_base = bare_name.startswith("net.") and ".lora_" not in bare_name
+        if is_tfpp_base:
+            unfrozen_params.append(param)
+        else:
+            main_params.append(param)
+    param_groups = []
+    if main_params:
+        param_groups.append({"params": main_params, "lr": float(args.lr), "weight_decay": float(args.weight_decay)})
+    if unfrozen_params:
+        param_groups.append(
+            {
+                "params": unfrozen_params,
+                "lr": float(args.unfreeze_lr) if float(args.unfreeze_lr) > 0.0 else float(args.lr),
+                "weight_decay": float(args.unfreeze_weight_decay),
+            }
+        )
+    optimizer = torch.optim.AdamW(param_groups)
 
     metadata = {
         "mode": "transfuserpp_extrinsic_task_feature_then_fusion_adapter" if args.extrinsic_aware else "transfuserpp_task_feature_then_fusion_adapter",
@@ -1074,11 +1132,21 @@ def train(args: argparse.Namespace) -> None:
             "exclude": args.lora_exclude,
             "modules": list(peft_lora_modules),
         },
+        "unfrozen_tfpp": {
+            "include": args.unfreeze_include,
+            "exclude": args.unfreeze_exclude,
+            "lr": float(args.unfreeze_lr) if float(args.unfreeze_lr) > 0.0 else float(args.lr),
+            "weight_decay": float(args.unfreeze_weight_decay),
+            "count": int(len(unfrozen_tfpp_params)),
+            "preview": list(unfrozen_tfpp_params[:80]),
+        },
         "cameras": cameras,
         "tfpp_camera": args.tfpp_camera,
         "command_mode": args.command_mode,
         "image_size": list(args.image_size),
         "lidar_size": int(args.lidar_size),
+        "lidar_canonical_shift_m": [float(args.lidar_canonical_shift_x_m), float(args.lidar_canonical_shift_y_m)],
+        "lidar_pixels_per_meter": float(args.lidar_pixels_per_meter),
         "stage_feature_shapes": {key: list(value) for key, value in stage_feature_shapes.items()},
         "fused_feature_shape": list(fused_feature_shape),
         "stage_adapter_layers": None if stage_adapter_layers is None else [int(v) for v in stage_adapter_layers],
@@ -1107,6 +1175,9 @@ def train(args: argparse.Namespace) -> None:
                 "tfpp_load_info": load_info,
                 "adapter_init_load_info": load_adapter_info,
                 "peft_lora_modules": peft_lora_modules,
+                "unfrozen_tfpp_count": len(unfrozen_tfpp_params),
+                "unfrozen_tfpp_preview": unfrozen_tfpp_params[:20],
+                "lidar_canonical_shift_m": metadata["lidar_canonical_shift_m"],
                 "data_parallel": metadata["data_parallel"],
             },
             indent=2,
@@ -1261,6 +1332,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="^join\\.,^checkpoint_decoder\\.(encoder|decoder)\\.,^target_speed_network\\.",
     )
     parser.add_argument("--lora-exclude", default="")
+    parser.add_argument(
+        "--unfreeze-include",
+        default="",
+        help="Comma-separated regexes for TF++ base parameters to fine-tune, e.g. '^backbone\\.(image_encoder|lidar_encoder)\\.(stem|s1|s2)'.",
+    )
+    parser.add_argument("--unfreeze-exclude", default="")
+    parser.add_argument("--unfreeze-lr", type=float, default=0.0)
+    parser.add_argument("--unfreeze-weight-decay", type=float, default=1e-5)
+    parser.add_argument("--lidar-canonical-shift-x-m", type=float, default=0.0)
+    parser.add_argument("--lidar-canonical-shift-y-m", type=float, default=0.0)
+    parser.add_argument("--lidar-pixels-per-meter", type=float, default=4.0)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--early-stop-patience", type=int, default=6)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)

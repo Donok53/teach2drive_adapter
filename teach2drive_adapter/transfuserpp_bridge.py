@@ -248,6 +248,39 @@ def lidar_to_transfuserpp_bev(lidar: torch.Tensor, config) -> torch.Tensor:
     return lidar.contiguous()
 
 
+def translate_lidar_bev_meters(
+    lidar: torch.Tensor,
+    shift_x_m: float = 0.0,
+    shift_y_m: float = 0.0,
+    pixels_per_meter: float = 4.0,
+) -> torch.Tensor:
+    """Translate an ego-frame BEV histogram by a metric offset before TF++ sees it.
+
+    The collected BEV is indexed as [B, C, y, x]. Positive x moves occupancy
+    forward in the vehicle frame; positive y moves it left in the vehicle frame.
+    """
+
+    shift_x_px = float(shift_x_m) * float(pixels_per_meter)
+    shift_y_px = float(shift_y_m) * float(pixels_per_meter)
+    if abs(shift_x_px) < 1e-6 and abs(shift_y_px) < 1e-6:
+        return lidar
+    if lidar.ndim != 4:
+        raise ValueError(f"Expected LiDAR BEV [B,C,H,W], got {tuple(lidar.shape)}")
+    height = int(lidar.shape[-2])
+    width = int(lidar.shape[-1])
+    y_base, x_base = torch.meshgrid(
+        torch.arange(height, dtype=lidar.dtype, device=lidar.device),
+        torch.arange(width, dtype=lidar.dtype, device=lidar.device),
+        indexing="ij",
+    )
+    x_src = x_base - shift_x_px
+    y_src = y_base - shift_y_px
+    x_norm = 2.0 * x_src / max(width - 1, 1) - 1.0
+    y_norm = 2.0 * y_src / max(height - 1, 1) - 1.0
+    grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0).expand(lidar.shape[0], -1, -1, -1)
+    return F.grid_sample(lidar, grid, mode="bilinear", padding_mode="zeros", align_corners=True).contiguous()
+
+
 def target_point_from_scalar(scalar: torch.Tensor) -> torch.Tensor:
     if scalar.shape[1] < 12:
         return torch.zeros((scalar.shape[0], 2), dtype=scalar.dtype, device=scalar.device)
@@ -318,11 +351,21 @@ def prepare_transfuserpp_inputs(
     config,
     command_mode: str = "lane_follow",
     tfpp_camera: str = "front",
+    lidar_shift_x_m: float = 0.0,
+    lidar_shift_y_m: float = 0.0,
+    lidar_pixels_per_meter: float = 4.0,
 ) -> Dict[str, torch.Tensor]:
     target_point = target_point_from_scalar(scalar)
+    lidar_bev = lidar_to_transfuserpp_bev(lidar, config=config)
+    lidar_bev = translate_lidar_bev_meters(
+        lidar_bev,
+        shift_x_m=float(lidar_shift_x_m),
+        shift_y_m=float(lidar_shift_y_m),
+        pixels_per_meter=float(lidar_pixels_per_meter),
+    )
     return {
         "rgb": camera_to_transfuserpp_rgb(camera, cameras=cameras, config=config, tfpp_camera=tfpp_camera),
-        "lidar_bev": lidar_to_transfuserpp_bev(lidar, config=config),
+        "lidar_bev": lidar_bev,
         "target_point": target_point,
         "ego_vel": scalar[:, :1].contiguous(),
         "command": command_from_target_point(target_point, mode=command_mode),

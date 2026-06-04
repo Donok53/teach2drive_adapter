@@ -78,6 +78,13 @@ export LORA_ALPHA=${LORA_ALPHA:-16.0}
 export LORA_DROPOUT=${LORA_DROPOUT:-0.0}
 export LORA_INCLUDE=${LORA_INCLUDE:-"^join\\.,^checkpoint_decoder\\.(encoder|decoder)\\.,^target_speed_network\\."}
 export LORA_EXCLUDE=${LORA_EXCLUDE:-""}
+export UNFREEZE_INCLUDE=${UNFREEZE_INCLUDE:-""}
+export UNFREEZE_EXCLUDE=${UNFREEZE_EXCLUDE:-""}
+export UNFREEZE_LR=${UNFREEZE_LR:-0.0}
+export UNFREEZE_WEIGHT_DECAY=${UNFREEZE_WEIGHT_DECAY:-1e-5}
+export LIDAR_CANONICAL_SHIFT_X_M=${LIDAR_CANONICAL_SHIFT_X_M:-0.0}
+export LIDAR_CANONICAL_SHIFT_Y_M=${LIDAR_CANONICAL_SHIFT_Y_M:-0.0}
+export LIDAR_PIXELS_PER_METER=${LIDAR_PIXELS_PER_METER:-4.0}
 
 export XY_LOSS_WEIGHT=${XY_LOSS_WEIGHT:-0.55}
 export YAW_LOSS_WEIGHT=${YAW_LOSS_WEIGHT:-0.03}
@@ -284,6 +291,13 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --lora-dropout "$LORA_DROPOUT" \
   --lora-include "$LORA_INCLUDE" \
   --lora-exclude "$LORA_EXCLUDE" \
+  --unfreeze-include "$UNFREEZE_INCLUDE" \
+  --unfreeze-exclude "$UNFREEZE_EXCLUDE" \
+  --unfreeze-lr "$UNFREEZE_LR" \
+  --unfreeze-weight-decay "$UNFREEZE_WEIGHT_DECAY" \
+  --lidar-canonical-shift-x-m "$LIDAR_CANONICAL_SHIFT_X_M" \
+  --lidar-canonical-shift-y-m "$LIDAR_CANONICAL_SHIFT_Y_M" \
+  --lidar-pixels-per-meter "$LIDAR_PIXELS_PER_METER" \
   --epochs "$EPOCHS" \
   --early-stop-patience "$EARLY_STOP_PATIENCE" \
   --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
