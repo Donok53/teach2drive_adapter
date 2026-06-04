@@ -105,7 +105,7 @@ launch benchmix8_geom_lidar_cam_early_b24 0 \
 launch benchmix8_early_unfreeze_cam_lidar_b24 1 \
   SEED=102 \
   LR=1.2e-5 \
-  UNFREEZE_INCLUDE='^backbone\\.(image_encoder|lidar_encoder)\\.(stem|s1|s2)' \
+  UNFREEZE_INCLUDE='^backbone\.(image_encoder|lidar_encoder)\.(stem|s1|s2)' \
   UNFREEZE_LR=2.0e-6 \
   UNFREEZE_WEIGHT_DECAY=1e-6 \
   STAGE_ADAPTER_LAYERS=early:2 \
