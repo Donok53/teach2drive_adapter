@@ -135,7 +135,12 @@ launch() {
 }
 
 # A. Residual-only: the cleanest test of bounded output correction.
-launch residual_frozen_b24 0 \
+RESIDUAL_GPU0="${RESIDUAL_GPU0:-0}"
+RESIDUAL_GPU1="${RESIDUAL_GPU1:-1}"
+RESIDUAL_GPU2="${RESIDUAL_GPU2:-2}"
+RESIDUAL_GPU3="${RESIDUAL_GPU3:-3}"
+
+launch residual_frozen_b24 "${RESIDUAL_GPU0}" \
   SEED=71 \
   LR=1.5e-5 \
   LORA_RANK=0 \
@@ -148,7 +153,7 @@ launch residual_frozen_b24 0 \
   SELECTION_MODE=min
 
 # B. Tiny LoRA plus residual: closest successor to action_cl1.
-launch residual_lora4_b24 1 \
+launch residual_lora4_b24 "${RESIDUAL_GPU1}" \
   SEED=72 \
   LR=1.2e-5 \
   LORA_RANK=4 \
@@ -162,7 +167,7 @@ launch residual_lora4_b24 1 \
   SELECTION_MODE=min
 
 # C. Stronger action correction: more capacity, still bounded.
-launch residual_lora8_go_b24 2 \
+launch residual_lora8_go_b24 "${RESIDUAL_GPU2}" \
   SEED=73 \
   LR=1.0e-5 \
   LORA_RANK=8 \
@@ -178,7 +183,7 @@ launch residual_lora8_go_b24 2 \
   SELECTION_MODE=min
 
 # D. Conservative safety variant: smaller trajectory delta, stronger stop/hold.
-launch residual_lora4_safe_b24 3 \
+launch residual_lora4_safe_b24 "${RESIDUAL_GPU3}" \
   SEED=74 \
   LR=8e-6 \
   LORA_RANK=4 \
