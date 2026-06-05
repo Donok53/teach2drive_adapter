@@ -135,10 +135,10 @@ launch() {
 }
 
 # A. Residual-only: the cleanest test of bounded output correction.
-RESIDUAL_GPU0="${RESIDUAL_GPU0:-0}"
-RESIDUAL_GPU1="${RESIDUAL_GPU1:-1}"
-RESIDUAL_GPU2="${RESIDUAL_GPU2:-2}"
-RESIDUAL_GPU3="${RESIDUAL_GPU3:-3}"
+RESIDUAL_GPU0="${RESIDUAL_GPU0:-1}"
+RESIDUAL_GPU1="${RESIDUAL_GPU1:-2}"
+RESIDUAL_GPU2="${RESIDUAL_GPU2:-3}"
+RESIDUAL_GPU3="${RESIDUAL_GPU3:-4}"
 
 launch residual_frozen_b24 "${RESIDUAL_GPU0}" \
   SEED=71 \
