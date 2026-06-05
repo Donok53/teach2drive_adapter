@@ -37,6 +37,7 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
 
         checkpoint = torch.load(Path(checkpoint_path).expanduser(), map_location=self.device)
         metadata = checkpoint.get("metadata", {})
+        self._load_output_residual(checkpoint, metadata)
         peft_lora = metadata.get("peft_lora", {})
         peft_state = checkpoint.get("peft_lora_state", {})
         rank = int(peft_lora.get("rank", 0) or 0)
@@ -72,3 +73,66 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
             f"missing={missing} unexpected={unexpected}",
             flush=True,
         )
+
+    def _load_output_residual(self, checkpoint, metadata) -> None:
+        residual_meta = metadata.get("output_residual", {})
+        aux_state = checkpoint.get("aux_state", {})
+        residual_state = aux_state.get("output_residual_head", {})
+        if not bool(residual_meta.get("enabled", False)) or not residual_state:
+            self._output_residual_head = None
+            print("[FeatureThenFusionPeftAdapterSensorRigAgent] output_residual=off", flush=True)
+            return
+
+        _ensure_adapter_import_path()
+        from teach2drive_adapter.train_transfuserpp_task_feature_adapter import GatedOutputResidualHead
+
+        self._output_residual_head = GatedOutputResidualHead(
+            fused_channels=int(self._fused_feature_shape[0]),
+            checkpoint_dim=int(residual_meta.get("checkpoint_dim", 20)),
+            speed_classes=int(residual_meta.get("speed_classes", len(getattr(self.config, "target_speeds", [])) or 1)),
+            hidden_dim=int(residual_meta.get("hidden_dim", 256)),
+            checkpoint_scale=float(residual_meta.get("checkpoint_scale", 0.75)),
+            speed_logit_scale=float(residual_meta.get("speed_logit_scale", 1.5)),
+            gate_bias=float(residual_meta.get("gate_bias", -2.0)),
+            dropout=0.0,
+        ).to(self.device)
+        missing, unexpected = self._output_residual_head.load_state_dict(residual_state, strict=False)
+        self._output_residual_head.eval()
+        self._patch_output_residual_for_nets()
+        print(
+            "[FeatureThenFusionPeftAdapterSensorRigAgent] output_residual=on "
+            f"missing={len(missing)} unexpected={len(unexpected)} "
+            f"checkpoint_scale={float(residual_meta.get('checkpoint_scale', 0.75)):.3f} "
+            f"speed_logit_scale={float(residual_meta.get('speed_logit_scale', 1.5)):.3f}",
+            flush=True,
+        )
+
+    def _patch_output_residual_for_nets(self) -> None:
+        if getattr(self, "_output_residual_head", None) is None:
+            return
+        for index, net in enumerate(self.nets):
+            original_forward = net.forward
+
+            def residual_forward(*args, _original_forward=original_forward, _index=index, **kwargs):
+                output = _original_forward(*args, **kwargs)
+                if not isinstance(output, (tuple, list)) or len(output) < 3:
+                    return output
+                fused = getattr(self, "_last_fused_by_net", {}).get(int(_index))
+                if fused is None:
+                    return output
+                pred_target_speed = output[1]
+                pred_checkpoint = output[2]
+                with torch.no_grad():
+                    adapted_checkpoint, adapted_speed, _ = self._output_residual_head(
+                        fused,
+                        pred_checkpoint,
+                        pred_target_speed,
+                    )
+                out = list(output)
+                if adapted_speed is not None:
+                    out[1] = adapted_speed
+                if adapted_checkpoint is not None:
+                    out[2] = adapted_checkpoint
+                return tuple(out) if isinstance(output, tuple) else out
+
+            net.forward = residual_forward

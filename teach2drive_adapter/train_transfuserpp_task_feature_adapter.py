@@ -364,6 +364,114 @@ class _AuxHead(nn.Module):
         return self.net(x)
 
 
+class GatedOutputResidualHead(nn.Module):
+    """Small bounded residual head for TF++ controller-facing outputs.
+
+    The head does not replace the TransFuser++ policy. It predicts a gated,
+    bounded delta for the checkpoint trajectory and target-speed logits, so the
+    frozen TF++ prior remains the default behavior unless the residual branch
+    learns a confident correction.
+    """
+
+    def __init__(
+        self,
+        fused_channels: int,
+        checkpoint_dim: int,
+        speed_classes: int,
+        hidden_dim: int,
+        checkpoint_scale: float,
+        speed_logit_scale: float,
+        gate_bias: float = -2.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.fused_channels = int(fused_channels)
+        self.checkpoint_dim = int(checkpoint_dim)
+        self.speed_classes = int(speed_classes)
+        self.checkpoint_scale = float(checkpoint_scale)
+        self.speed_logit_scale = float(speed_logit_scale)
+        input_dim = self.fused_channels + self.checkpoint_dim + self.speed_classes
+        hidden = int(hidden_dim) if int(hidden_dim) > 0 else max(128, input_dim // 2)
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+        )
+        self.checkpoint_delta = nn.Linear(hidden, self.checkpoint_dim)
+        self.speed_delta = nn.Linear(hidden, self.speed_classes)
+        self.gate = nn.Linear(hidden, 2)
+        nn.init.zeros_(self.checkpoint_delta.weight)
+        nn.init.zeros_(self.checkpoint_delta.bias)
+        nn.init.zeros_(self.speed_delta.weight)
+        nn.init.zeros_(self.speed_delta.bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, float(gate_bias))
+
+    @staticmethod
+    def _pool_fused(fused: torch.Tensor) -> torch.Tensor:
+        if fused.ndim == 4:
+            return fused.mean(dim=(2, 3))
+        if fused.ndim == 3:
+            return fused.mean(dim=2)
+        if fused.ndim == 2:
+            return fused
+        return fused.reshape(fused.shape[0], -1)
+
+    @staticmethod
+    def _pad_or_trim(x: torch.Tensor, width: int) -> torch.Tensor:
+        width = int(width)
+        if x.shape[1] == width:
+            return x
+        if x.shape[1] > width:
+            return x[:, :width]
+        pad = torch.zeros((x.shape[0], width - x.shape[1]), dtype=x.dtype, device=x.device)
+        return torch.cat([x, pad], dim=1)
+
+    def forward(
+        self,
+        fused: torch.Tensor,
+        pred_checkpoint: torch.Tensor | None,
+        pred_target_speed: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, torch.Tensor]]:
+        batch_size = int(fused.shape[0])
+        pooled = self._pad_or_trim(self._pool_fused(fused.float()), self.fused_channels)
+        if pred_checkpoint is None:
+            checkpoint_flat = torch.zeros((batch_size, self.checkpoint_dim), dtype=pooled.dtype, device=pooled.device)
+            checkpoint_shape = None
+        else:
+            checkpoint_shape = tuple(int(v) for v in pred_checkpoint.shape)
+            checkpoint_flat = self._pad_or_trim(pred_checkpoint.float().reshape(batch_size, -1), self.checkpoint_dim)
+        if pred_target_speed is None:
+            speed_logits = torch.zeros((batch_size, self.speed_classes), dtype=pooled.dtype, device=pooled.device)
+        else:
+            speed_logits = self._pad_or_trim(pred_target_speed.float(), self.speed_classes)
+
+        hidden = self.trunk(torch.cat([pooled, checkpoint_flat, speed_logits], dim=1))
+        gates = torch.sigmoid(self.gate(hidden))
+        checkpoint_delta = torch.tanh(self.checkpoint_delta(hidden)) * float(self.checkpoint_scale) * gates[:, :1]
+        speed_delta = torch.tanh(self.speed_delta(hidden)) * float(self.speed_logit_scale) * gates[:, 1:2]
+
+        adapted_checkpoint = None
+        if pred_checkpoint is not None and checkpoint_shape is not None:
+            adapted_flat = checkpoint_flat + checkpoint_delta
+            adapted_checkpoint = adapted_flat[:, : int(np.prod(checkpoint_shape[1:]))].reshape(checkpoint_shape)
+            adapted_checkpoint = adapted_checkpoint.to(dtype=pred_checkpoint.dtype)
+        adapted_speed = None
+        if pred_target_speed is not None:
+            adapted_speed = (speed_logits + speed_delta)[:, : pred_target_speed.shape[1]].to(dtype=pred_target_speed.dtype)
+
+        stats = {
+            "output_residual_checkpoint_gate": gates[:, 0].mean(),
+            "output_residual_speed_gate": gates[:, 1].mean(),
+            "output_residual_checkpoint_norm": checkpoint_delta.abs().mean(),
+            "output_residual_speed_norm": speed_delta.abs().mean(),
+        }
+        return adapted_checkpoint, adapted_speed, stats
+
+
 class _TaskAdapterForward(nn.Module):
     """Run frozen TF++ with an inserted task adapter in a DataParallel-safe wrapper."""
 
@@ -386,6 +494,12 @@ class _TaskAdapterForward(nn.Module):
         use_stop_state_aux: bool = False,
         use_stop_reason_aux: bool = False,
         use_control_aux: bool = False,
+        use_output_residual: bool = False,
+        output_residual_hidden_dim: int = 256,
+        output_residual_checkpoint_scale: float = 0.75,
+        output_residual_speed_logit_scale: float = 1.5,
+        output_residual_gate_bias: float = -2.0,
+        output_residual_dropout: float = 0.0,
         lidar_shift_x_m: float = 0.0,
         lidar_shift_y_m: float = 0.0,
         lidar_pixels_per_meter: float = 4.0,
@@ -412,11 +526,27 @@ class _TaskAdapterForward(nn.Module):
         self.stop_state_head = _AuxHead(fused_channels, 4, int(aux_hidden_dim)) if use_stop_state_aux else None
         self.stop_reason_head = _AuxHead(fused_channels, 8, int(aux_hidden_dim)) if use_stop_reason_aux else None
         self.control_head = _AuxHead(fused_channels, 3, int(aux_hidden_dim)) if use_control_aux else None
+        checkpoint_len = int(getattr(config, "predict_checkpoint_len", 10) or 10)
+        speed_classes = len(getattr(config, "target_speeds", [])) or 1
+        self.output_residual_head = (
+            GatedOutputResidualHead(
+                fused_channels=fused_channels,
+                checkpoint_dim=checkpoint_len * 2,
+                speed_classes=speed_classes,
+                hidden_dim=int(output_residual_hidden_dim),
+                checkpoint_scale=float(output_residual_checkpoint_scale),
+                speed_logit_scale=float(output_residual_speed_logit_scale),
+                gate_bias=float(output_residual_gate_bias),
+                dropout=float(output_residual_dropout),
+            )
+            if use_output_residual
+            else None
+        )
 
     def set_runtime_mode(self, train: bool) -> None:
         self.net.eval()
         self.adapter.train(train)
-        for head in (self.stop_state_head, self.stop_reason_head, self.control_head):
+        for head in (self.stop_state_head, self.stop_reason_head, self.control_head, self.output_residual_head):
             if head is not None:
                 head.train(train)
         set_lora_train_mode(self.net, train)
@@ -453,6 +583,8 @@ class _TaskAdapterForward(nn.Module):
             state["stop_reason_head"] = self.stop_reason_head.state_dict()
         if self.control_head is not None:
             state["control_head"] = self.control_head.state_dict()
+        if self.output_residual_head is not None:
+            state["output_residual_head"] = self.output_residual_head.state_dict()
         return state
 
     @staticmethod
@@ -503,15 +635,24 @@ class _TaskAdapterForward(nn.Module):
             patch.enabled = True
         patch.clear()
         outputs = self.net(**inputs)
+        aux: dict[str, torch.Tensor] = {}
+        pred_target_speed = outputs[1]
+        pred_checkpoint = outputs[2]
+        if self.output_residual_head is not None and patch.last_fused is not None:
+            pred_checkpoint, pred_target_speed, residual_stats = self.output_residual_head(
+                patch.last_fused.float(),
+                pred_checkpoint,
+                pred_target_speed,
+            )
+            aux.update(residual_stats)
         pred_target = base_target_from_checkpoint(
-            pred_checkpoint=outputs[2],
-            pred_target_speed=outputs[1],
+            pred_checkpoint=pred_checkpoint,
+            pred_target_speed=pred_target_speed,
             scalar=scalar,
             config=self.config,
             target_dim=int(target_dim),
             speed_dim=int(speed_dim),
         )
-        aux: dict[str, torch.Tensor] = {}
         if patch.last_fused is not None and (
             self.stop_state_head is not None or self.stop_reason_head is not None or self.control_head is not None
         ):
@@ -733,6 +874,10 @@ def _losses(
         control_raw = torch.mean(nn.functional.smooth_l1_loss(aux["control"], control_target, reduction="none"), dim=1)
         control_active = _per_sample_vector(control_mask, int(control_raw.numel())) * effective_weight
         control = torch.sum(control_raw * control_active) / torch.clamp(torch.sum(control_active), min=1e-6)
+    residual_checkpoint_gate = aux.get("output_residual_checkpoint_gate", zero)
+    residual_speed_gate = aux.get("output_residual_speed_gate", zero)
+    residual_checkpoint_norm = aux.get("output_residual_checkpoint_norm", zero)
+    residual_speed_norm = aux.get("output_residual_speed_norm", zero)
 
     stop_state_aux = zero
     if "stop_state" in aux:
@@ -787,6 +932,10 @@ def _losses(
         "plan_throttle_error": controller_metrics["plan_throttle_error"],
         "plan_brake_error": controller_metrics["plan_brake_error"],
         "control": control,
+        "output_residual_checkpoint_gate": residual_checkpoint_gate,
+        "output_residual_speed_gate": residual_speed_gate,
+        "output_residual_checkpoint_norm": residual_checkpoint_norm,
+        "output_residual_speed_norm": residual_speed_norm,
         "stop_state_aux": stop_state_aux,
         "stop_reason_aux": stop_reason_aux,
         "moving_ratio": moving.float().mean(),
@@ -859,6 +1008,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "plan_throttle_error",
         "plan_brake_error",
         "control",
+        "output_residual_checkpoint_gate",
+        "output_residual_speed_gate",
+        "output_residual_checkpoint_norm",
+        "output_residual_speed_norm",
         "stop_state_aux",
         "stop_reason_aux",
         "moving_ratio",
@@ -933,6 +1086,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
                 f"risk={totals['behavior_proxy']/samples:.6f} lane={totals['lateral_error']/samples:.6f} "
                 f"ctrl={totals['controller_proxy']/samples:.6f} "
                 f"plan={totals['plan_steer_error']/samples:.6f}/{totals['plan_throttle_error']/samples:.6f}/{totals['plan_brake_error']/samples:.6f} "
+                f"res={totals['output_residual_checkpoint_gate']/samples:.3f}/{totals['output_residual_speed_gate']/samples:.3f}/"
+                f"{totals['output_residual_checkpoint_norm']/samples:.3f}/{totals['output_residual_speed_norm']/samples:.3f} "
                 f"prior={totals['prior_xy']/samples:.6f}/{totals['prior_speed']/samples:.6f} "
                 f"aux={totals['control']/samples:.6f}/{totals['stop_state_aux']/samples:.6f}/{totals['stop_reason_aux']/samples:.6f} "
                 f"drift={totals['drift']/samples:.6f} moving={totals['moving_ratio']/samples:.3f} "
@@ -1084,6 +1239,12 @@ def train(args: argparse.Namespace) -> None:
         use_stop_state_aux=float(args.stop_state_aux_loss_weight) > 0.0,
         use_stop_reason_aux=float(args.stop_reason_aux_loss_weight) > 0.0,
         use_control_aux=float(args.control_loss_weight) > 0.0,
+        use_output_residual=bool(args.output_residual),
+        output_residual_hidden_dim=int(args.output_residual_hidden_dim),
+        output_residual_checkpoint_scale=float(args.output_residual_checkpoint_scale),
+        output_residual_speed_logit_scale=float(args.output_residual_speed_logit_scale),
+        output_residual_gate_bias=float(args.output_residual_gate_bias),
+        output_residual_dropout=float(args.output_residual_dropout),
         lidar_shift_x_m=float(args.lidar_canonical_shift_x_m),
         lidar_shift_y_m=float(args.lidar_canonical_shift_y_m),
         lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
@@ -1152,6 +1313,16 @@ def train(args: argparse.Namespace) -> None:
         "stage_adapter_layers": None if stage_adapter_layers is None else [int(v) for v in stage_adapter_layers],
         "stage_adapter_modalities": str(args.stage_adapter_modalities),
         "fusion_adapter_enabled": bool(fusion_adapter_enabled),
+        "output_residual": {
+            "enabled": bool(args.output_residual),
+            "hidden_dim": int(args.output_residual_hidden_dim),
+            "checkpoint_scale": float(args.output_residual_checkpoint_scale),
+            "speed_logit_scale": float(args.output_residual_speed_logit_scale),
+            "gate_bias": float(args.output_residual_gate_bias),
+            "dropout": float(args.output_residual_dropout),
+            "checkpoint_dim": int((getattr(config, "predict_checkpoint_len", 10) or 10) * 2),
+            "speed_classes": int(len(getattr(config, "target_speeds", [])) or 1),
+        },
         "extrinsic_aware": bool(args.extrinsic_aware),
         "source_profile": args.source_profile,
         "extrinsic_vector": [float(v) for v in extrinsic_vector],
@@ -1172,6 +1343,7 @@ def train(args: argparse.Namespace) -> None:
                 "stage_adapter_layers": metadata["stage_adapter_layers"],
                 "stage_adapter_modalities": metadata["stage_adapter_modalities"],
                 "fusion_adapter_enabled": metadata["fusion_adapter_enabled"],
+                "output_residual": metadata["output_residual"],
                 "tfpp_load_info": load_info,
                 "adapter_init_load_info": load_adapter_info,
                 "peft_lora_modules": peft_lora_modules,
@@ -1247,6 +1419,8 @@ def train(args: argparse.Namespace) -> None:
                 f"plan_sgtb={val_metrics['plan_steer_close']:.3f}/{val_metrics['plan_go_recall']:.3f}/"
                 f"{val_metrics['plan_throttle_close']:.3f}/{val_metrics['plan_brake_recall']:.3f} "
                 f"lr={val_metrics['launch_go_recall']:.3f}/{val_metrics['release_go_recall']:.3f} "
+                f"res={val_metrics['output_residual_checkpoint_gate']:.3f}/{val_metrics['output_residual_speed_gate']:.3f}/"
+                f"{val_metrics['output_residual_checkpoint_norm']:.3f}/{val_metrics['output_residual_speed_norm']:.3f} "
                 f"prior={val_metrics['prior_xy']:.6f}/{val_metrics['prior_speed']:.6f} "
                 f"aux={val_metrics['control']:.6f}/{val_metrics['stop_state_aux']:.6f}/{val_metrics['stop_reason_aux']:.6f} "
                 f"drift={val_metrics['drift']:.6f}",
@@ -1377,6 +1551,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-prior-speed-loss-weight", type=float, default=0.0)
     parser.add_argument("--aux-hidden-dim", type=int, default=256)
     parser.add_argument("--control-loss-weight", type=float, default=0.0)
+    parser.add_argument("--output-residual", action="store_true")
+    parser.add_argument("--output-residual-hidden-dim", type=int, default=256)
+    parser.add_argument("--output-residual-checkpoint-scale", type=float, default=0.75)
+    parser.add_argument("--output-residual-speed-logit-scale", type=float, default=1.5)
+    parser.add_argument("--output-residual-gate-bias", type=float, default=-2.0)
+    parser.add_argument("--output-residual-dropout", type=float, default=0.0)
     parser.add_argument("--stop-state-aux-loss-weight", type=float, default=0.0)
     parser.add_argument("--stop-reason-aux-loss-weight", type=float, default=0.0)
     parser.add_argument("--moving-speed-threshold", type=float, default=1.0)

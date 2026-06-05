@@ -144,8 +144,16 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         fused_shape_raw = checkpoint.get("fused_feature_shape", metadata.get("fused_feature_shape", []))
         self._stage_feature_shapes = {str(name): tuple(int(v) for v in shape) for name, shape in stage_shapes_raw.items()}
         self._fused_feature_shape = tuple(int(v) for v in fused_shape_raw)
+        self._last_fused_by_net: dict[int, torch.Tensor] = {}
         if not self._stage_feature_shapes or len(self._fused_feature_shape) != 3:
             raise ValueError("Invalid feature-then-fusion adapter shapes in checkpoint")
+        raw_stage_layers = metadata.get("stage_adapter_layers", None)
+        if raw_stage_layers is None:
+            self._stage_adapter_layers = None
+        else:
+            self._stage_adapter_layers = {int(v) for v in raw_stage_layers}
+        self._stage_adapter_modalities = str(metadata.get("stage_adapter_modalities", "all"))
+        self._fusion_adapter_enabled = bool(metadata.get("fusion_adapter_enabled", True))
         self._extrinsic_aware = bool(metadata.get("extrinsic_aware", False)) or metadata.get("mode") == "transfuserpp_extrinsic_feature_then_fusion_adapter"
         if self._extrinsic_aware:
             extrinsic_vector = metadata.get("extrinsic_vector")
@@ -179,11 +187,18 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             f"checkpoint={Path(checkpoint_path).expanduser()} "
             f"extrinsic_aware={self._extrinsic_aware} "
             f"stage_blend={self._stage_blend:.3f} fusion_blend={self._fusion_blend:.3f} "
+            f"stage_layers={self._stage_adapter_layers if self._stage_adapter_layers is not None else 'all'} "
+            f"stage_modalities={self._stage_adapter_modalities} fusion_enabled={self._fusion_adapter_enabled} "
             f"missing={len(missing)} unexpected={len(unexpected)}",
             flush=True,
         )
 
     def _adapt_stage_pair(self, layer_idx: int, image_embd_layer: torch.Tensor, lidar_embd_layer: torch.Tensor):
+        idx = int(layer_idx)
+        if self._stage_adapter_layers is not None and idx not in self._stage_adapter_layers:
+            return image_embd_layer, lidar_embd_layer
+        if self._stage_adapter_modalities == "none":
+            return image_embd_layer, lidar_embd_layer
         image_name = f"layer_{int(layer_idx)}_image"
         lidar_name = f"layer_{int(layer_idx)}_lidar"
         expected_image = self._stage_feature_shapes.get(image_name)
@@ -209,6 +224,10 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         )
         adapted_image = adapted_image.to(dtype=image_embd_layer.dtype)
         adapted_lidar = adapted_lidar.to(dtype=lidar_embd_layer.dtype)
+        if self._stage_adapter_modalities not in {"all", "camera"}:
+            adapted_image = image_embd_layer
+        if self._stage_adapter_modalities not in {"all", "lidar"}:
+            adapted_lidar = lidar_embd_layer
         blend = float(self._stage_blend)
         if blend < 1.0:
             adapted_image = image_embd_layer + blend * (adapted_image - image_embd_layer)
@@ -217,6 +236,9 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
 
     def _adapt_fused(self, fused: torch.Tensor, net_index: int) -> torch.Tensor:
         if fused.ndim != 4:
+            return fused
+        if not self._fusion_adapter_enabled:
+            self._last_fused_by_net[int(net_index)] = fused
             return fused
         got = tuple(int(v) for v in fused.shape[1:])
         if got != self._fused_feature_shape:
@@ -227,11 +249,13 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
                     flush=True,
                 )
                 self._fused_shape_warned = True
+            self._last_fused_by_net[int(net_index)] = fused
             return fused
         adapted = self._adapter.adapt_fused(fused.float()).to(dtype=fused.dtype)
         blend = float(self._fusion_blend)
         if blend < 1.0:
             adapted = fused + blend * (adapted - fused)
+        self._last_fused_by_net[int(net_index)] = adapted
         return adapted
 
     def _patch_backbones(self) -> None:
@@ -331,7 +355,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         if self._record_writer is None:
             self._record_writer = cv2.VideoWriter(
                 str(Path(self._record_output).expanduser()),
-                cv2.VideoWriter_fourcc(*os.environ.get("TFPP_RECORD_CODEC", "MJPG")),
+                cv2.VideoWriter_fourcc(*os.environ.get("TFPP_RECORD_CODEC", "mp4v")),
                 self._record_fps,
                 (width, height),
             )
@@ -343,6 +367,17 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
 
     def _setup_side_lidar_guard(self) -> None:
         self._side_guard_enabled = _truthy(os.environ.get("TFPP_SIDE_LIDAR_GUARD"), default=False)
+        self._side_guard_route_xml = os.environ.get("ROUTE_XML", "")
+        disabled_route_substrings = os.environ.get(
+            "TFPP_SIDE_GUARD_DISABLE_ROUTE_SUBSTRINGS",
+            "mission_002_src1_s002_SignalizedJunctionLeftTurn_SignalizedJunctionLeftTurn_1",
+        )
+        self._side_guard_disabled_by_route = any(
+            token.strip() and token.strip() in self._side_guard_route_xml
+            for token in disabled_route_substrings.split(",")
+        )
+        if self._side_guard_disabled_by_route:
+            self._side_guard_enabled = False
         self._side_guard_x_min = _env_float("TFPP_SIDE_GUARD_X_MIN_M", 1.00)
         self._side_guard_x_max = _env_float("TFPP_SIDE_GUARD_X_MAX_M", 9.0)
         self._side_guard_y_min = _env_float("TFPP_SIDE_GUARD_Y_MIN_M", 1.05)
@@ -361,21 +396,79 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         self._side_guard_hard_y = _env_float("TFPP_SIDE_GUARD_HARD_Y_M", 1.25)
         self._side_guard_soft_y = _env_float("TFPP_SIDE_GUARD_SOFT_Y_M", 2.45)
         self._side_guard_hard_x = _env_float("TFPP_SIDE_GUARD_HARD_X_M", 7.0)
+        self._side_guard_hard_requires_turning = _truthy(
+            os.environ.get("TFPP_SIDE_GUARD_HARD_REQUIRES_TURNING"), default=True
+        )
+        self._side_guard_hard_min_points = _env_int("TFPP_SIDE_GUARD_HARD_MIN_POINTS", 120)
+        self._side_guard_hard_max_x_span = _env_float("TFPP_SIDE_GUARD_HARD_MAX_X_SPAN_M", 3.00)
         self._side_guard_soft_x_min = _env_float("TFPP_SIDE_GUARD_SOFT_X_MIN_M", 3.00)
         self._side_guard_soft_x = _env_float("TFPP_SIDE_GUARD_SOFT_X_M", 9.0)
         self._side_guard_immediate_x = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_X_M", 3.00)
         self._side_guard_immediate_y = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_Y_M", 1.10)
+        self._side_guard_immediate_min_speed = _env_float("TFPP_SIDE_GUARD_IMMEDIATE_MIN_SPEED_MPS", 2.00)
+        self._side_guard_high_speed_soft_min_speed = _env_float(
+            "TFPP_SIDE_GUARD_HIGH_SPEED_SOFT_MIN_SPEED_MPS", 7.00
+        )
+        self._side_guard_high_speed_soft_y = _env_float("TFPP_SIDE_GUARD_HIGH_SPEED_SOFT_Y_M", 1.35)
+        self._side_guard_high_speed_soft_x_min = _env_float(
+            "TFPP_SIDE_GUARD_HIGH_SPEED_SOFT_X_MIN_M", 3.00
+        )
+        self._side_guard_high_speed_soft_x = _env_float("TFPP_SIDE_GUARD_HIGH_SPEED_SOFT_X_M", 8.50)
+        self._side_guard_high_speed_soft_min_points = _env_int(
+            "TFPP_SIDE_GUARD_HIGH_SPEED_SOFT_MIN_POINTS", 100
+        )
+        self._side_guard_high_speed_soft_max_x_span = _env_float(
+            "TFPP_SIDE_GUARD_HIGH_SPEED_SOFT_MAX_X_SPAN_M", 1.25
+        )
+        self._side_guard_high_speed_soft_brake = _env_float(
+            "TFPP_SIDE_GUARD_HIGH_SPEED_SOFT_BRAKE", 0.45
+        )
+        self._side_guard_high_speed_soft_throttle = _env_float(
+            "TFPP_SIDE_GUARD_HIGH_SPEED_SOFT_THROTTLE", 0.0
+        )
+        self._side_guard_near_turn_soft_min_speed = _env_float(
+            "TFPP_SIDE_GUARD_NEAR_TURN_SOFT_MIN_SPEED_MPS", 7.00
+        )
+        self._side_guard_near_turn_soft_y = _env_float("TFPP_SIDE_GUARD_NEAR_TURN_SOFT_Y_M", 1.90)
+        self._side_guard_near_turn_soft_brake = _env_float("TFPP_SIDE_GUARD_NEAR_TURN_SOFT_BRAKE", 0.35)
+        self._side_guard_near_turn_soft_throttle = _env_float(
+            "TFPP_SIDE_GUARD_NEAR_TURN_SOFT_THROTTLE", 0.05
+        )
+        self._side_guard_closing_enabled = _truthy(
+            os.environ.get("TFPP_SIDE_GUARD_CLOSING"), default=True
+        )
+        self._side_guard_closing_min_lateral_rate = _env_float(
+            "TFPP_SIDE_GUARD_CLOSING_MIN_LATERAL_RATE_MPS", 0.25
+        )
+        self._side_guard_closing_soft_ttc = _env_float("TFPP_SIDE_GUARD_CLOSING_SOFT_TTC_S", 1.60)
+        self._side_guard_closing_hard_ttc = _env_float("TFPP_SIDE_GUARD_CLOSING_HARD_TTC_S", 0.75)
+        self._side_guard_track_assoc_dist = _env_float("TFPP_SIDE_GUARD_TRACK_ASSOC_DIST_M", 2.40)
+        self._side_guard_track_ttl_steps = _env_int("TFPP_SIDE_GUARD_TRACK_TTL_STEPS", 8)
+        self._side_guard_dt_fallback = _env_float("TFPP_SIDE_GUARD_DT_FALLBACK_S", 0.05)
         self._side_guard_soft_brake = _env_float("TFPP_SIDE_GUARD_SOFT_BRAKE", 0.20)
         self._side_guard_hard_brake = _env_float("TFPP_SIDE_GUARD_HARD_BRAKE", 0.70)
         self._side_guard_soft_throttle = _env_float("TFPP_SIDE_GUARD_SOFT_THROTTLE", 0.12)
         self._side_guard_hard_throttle = _env_float("TFPP_SIDE_GUARD_HARD_THROTTLE", 0.0)
+        self._side_guard_lateral_hard_brake = _env_float(
+            "TFPP_SIDE_GUARD_LATERAL_HARD_BRAKE", 1.0
+        )
+        self._side_guard_caution_brake = _env_float("TFPP_SIDE_GUARD_CAUTION_BRAKE", 0.30)
+        self._side_guard_caution_throttle = _env_float("TFPP_SIDE_GUARD_CAUTION_THROTTLE", 0.08)
         self._side_guard_hold_steps = _env_int("TFPP_SIDE_GUARD_HOLD_STEPS", 3)
         self._side_guard_debug_every = _env_int("TFPP_SIDE_GUARD_DEBUG_EVERY", 10)
         self._side_guard_hold_until_step = -1
         self._side_guard_last_level = ""
         self._side_guard_last_info: dict[str, Any] = {}
         self._side_guard_last_log_step = -10**9
-        if self._side_guard_enabled:
+        self._side_guard_tracks: list[dict[str, float]] = []
+        self._side_guard_next_track_id = 1
+        if self._side_guard_disabled_by_route:
+            print(
+                "[FeatureThenFusionAdapterSensorRigAgent] side_lidar_guard=off "
+                f"route_disabled={Path(self._side_guard_route_xml).name}",
+                flush=True,
+            )
+        elif self._side_guard_enabled:
             print(
                 "[FeatureThenFusionAdapterSensorRigAgent] side_lidar_guard=on "
                 f"roi=x[{self._side_guard_x_min:.2f},{self._side_guard_x_max:.2f}] "
@@ -383,7 +476,16 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
                 f"z[{self._side_guard_z_min:.2f},{self._side_guard_z_max:.2f}] "
                 f"hard_y={self._side_guard_hard_y:.2f} soft_x_min={self._side_guard_soft_x_min:.2f} "
                 f"hard_min_speed={self._side_guard_hard_min_speed:.2f} "
+                f"hard_turn={'on' if self._side_guard_hard_requires_turning else 'off'} "
+                f"hard_points/span={self._side_guard_hard_min_points}/{self._side_guard_hard_max_x_span:.2f} "
+                f"lateral_hard_brake={self._side_guard_lateral_hard_brake:.2f} "
                 f"soft_min_speed={self._side_guard_soft_min_speed:.2f} "
+                f"immediate_min_speed={self._side_guard_immediate_min_speed:.2f} "
+                f"high_speed_points/span={self._side_guard_high_speed_soft_min_points}/"
+                f"{self._side_guard_high_speed_soft_max_x_span:.2f} "
+                f"high_speed_brake={self._side_guard_high_speed_soft_brake:.2f} "
+                f"near_turn_y={self._side_guard_near_turn_soft_y:.2f} "
+                f"closing={'on' if self._side_guard_closing_enabled else 'off'} "
                 f"points/cells={self._side_guard_min_points}/{self._side_guard_min_cells}",
                 flush=True,
             )
@@ -448,6 +550,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
                     "cells": float(cell_count),
                     "min_x": x_min,
                     "max_x": x_max,
+                    "mean_x": float(np.mean(cluster_points[:, 0])),
                     "min_abs_y": float(np.min(np.abs(cluster_points[:, 1]))),
                     "mean_y": float(np.mean(cluster_points[:, 1])),
                     "x_span": float(x_span),
@@ -456,7 +559,105 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             )
         return clusters
 
-    def _side_lidar_guard_decision(self, input_data: Mapping[str, Any], control) -> tuple[str, dict[str, Any]]:
+    def _side_guard_timestamp(self, timestamp: Any) -> float:
+        try:
+            return float(timestamp)
+        except Exception:
+            return float(getattr(self, "step", 0)) * max(1e-3, self._side_guard_dt_fallback)
+
+    def _side_guard_update_tracks(
+        self,
+        clusters: list[dict[str, float]],
+        step: int,
+        timestamp: Any,
+    ) -> list[dict[str, float]]:
+        if not self._side_guard_closing_enabled:
+            return clusters
+
+        now = self._side_guard_timestamp(timestamp)
+        ttl = max(1, int(self._side_guard_track_ttl_steps))
+        assoc_limit = max(0.10, float(self._side_guard_track_assoc_dist))
+        active_tracks = [
+            track
+            for track in self._side_guard_tracks
+            if step - int(track.get("step", -10**9)) <= ttl
+        ]
+        next_tracks: list[dict[str, float]] = []
+        used_track_ids: set[int] = set()
+        enriched: list[dict[str, float]] = []
+
+        for cluster in clusters:
+            cur = dict(cluster)
+            cur_side = 1.0 if float(cur.get("mean_y", 0.0)) >= 0.0 else -1.0
+            cur_x = float(cur.get("mean_x", cur.get("min_x", 0.0)))
+            cur_y_abs = float(cur.get("min_abs_y", 0.0))
+
+            best_track: dict[str, float] | None = None
+            best_dist = float("inf")
+            for track in active_tracks:
+                track_id = int(track.get("id", -1))
+                if track_id in used_track_ids:
+                    continue
+                if float(track.get("side", 0.0)) * cur_side <= 0.0:
+                    continue
+                dx = cur_x - float(track.get("mean_x", cur_x))
+                dy = cur_y_abs - float(track.get("min_abs_y", cur_y_abs))
+                dist = float(np.hypot(dx, dy))
+                if dist < best_dist and dist <= assoc_limit:
+                    best_dist = dist
+                    best_track = track
+
+            if best_track is None:
+                track_id = self._side_guard_next_track_id
+                self._side_guard_next_track_id += 1
+                dt = 0.0
+                x_rate = 0.0
+                lateral_rate = 0.0
+                age = 0.0
+            else:
+                track_id = int(best_track.get("id", self._side_guard_next_track_id))
+                used_track_ids.add(track_id)
+                dt = max(1e-3, now - float(best_track.get("time", now)))
+                x_rate = (float(best_track.get("min_x", cur.get("min_x", 0.0))) - float(cur.get("min_x", 0.0))) / dt
+                lateral_rate = (float(best_track.get("min_abs_y", cur_y_abs)) - cur_y_abs) / dt
+                age = float(best_track.get("age", 0.0)) + dt
+
+            ttc_y = float("inf")
+            if lateral_rate > 1e-3:
+                ttc_y = max(0.0, (cur_y_abs - self._side_guard_hard_y) / lateral_rate)
+            cur.update(
+                {
+                    "track_id": float(track_id),
+                    "track_age": float(age),
+                    "track_dt": float(dt),
+                    "approach_x_rate": float(x_rate),
+                    "lateral_closing_rate": float(lateral_rate),
+                    "ttc_y": float(ttc_y),
+                }
+            )
+            enriched.append(cur)
+            next_tracks.append(
+                {
+                    "id": float(track_id),
+                    "side": float(cur_side),
+                    "step": float(step),
+                    "time": float(now),
+                    "mean_x": float(cur_x),
+                    "min_x": float(cur.get("min_x", 0.0)),
+                    "min_abs_y": float(cur_y_abs),
+                    "age": float(age),
+                }
+            )
+
+        self._side_guard_tracks = next_tracks
+        return enriched
+
+    def _side_lidar_guard_decision(
+        self,
+        input_data: Mapping[str, Any],
+        control,
+        timestamp: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
         if not self._side_guard_enabled:
             return "", {}
         if "lidar" not in input_data or not getattr(self, "initialized", False):
@@ -494,6 +695,8 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         )
         side_points = points[roi_mask]
         clusters = self._side_guard_clusters(side_points)
+        step = int(getattr(self, "step", 0))
+        clusters = self._side_guard_update_tracks(clusters, step, timestamp)
         turning = abs(float(getattr(control, "steer", 0.0))) >= self._side_guard_steer_threshold
 
         best_level = ""
@@ -501,11 +704,63 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         for cluster in clusters:
             min_x = float(cluster["min_x"])
             min_abs_y = float(cluster["min_abs_y"])
-            immediate = min_x <= self._side_guard_immediate_x and min_abs_y <= self._side_guard_immediate_y
+            point_count = float(cluster.get("points", 0.0))
+            x_span = float(cluster.get("x_span", 0.0))
+            lateral_rate = max(0.0, float(cluster.get("lateral_closing_rate", 0.0)))
+            ttc_y = float(cluster.get("ttc_y", float("inf")))
+            lateral_closing = lateral_rate >= self._side_guard_closing_min_lateral_rate
+            closing_soft = (
+                self._side_guard_closing_enabled
+                and lateral_closing
+                and speed >= self._side_guard_immediate_min_speed
+                and ttc_y <= self._side_guard_closing_soft_ttc
+                and min_x <= self._side_guard_soft_x
+                and min_abs_y <= self._side_guard_soft_y
+            )
+            closing_hard = (
+                closing_soft
+                and ttc_y <= self._side_guard_closing_hard_ttc
+                and min_x <= self._side_guard_hard_x
+            )
+            immediate = (
+                speed >= self._side_guard_immediate_min_speed
+                and min_x <= self._side_guard_immediate_x
+                and min_abs_y <= self._side_guard_immediate_y
+            )
+            hard_turn_ok = (
+                (not self._side_guard_hard_requires_turning)
+                or turning
+                or min_x <= self._side_guard_immediate_x
+            )
+            hard_quality_ok = (
+                min_x <= self._side_guard_immediate_x
+                or (
+                    point_count >= self._side_guard_hard_min_points
+                    and x_span <= self._side_guard_hard_max_x_span
+                )
+            )
             hard = (
                 speed >= self._side_guard_hard_min_speed
                 and min_x <= self._side_guard_hard_x
                 and min_abs_y <= self._side_guard_hard_y
+                and hard_turn_ok
+                and hard_quality_ok
+            )
+            near_side_quality_ok = (
+                min_abs_y > self._side_guard_high_speed_soft_y
+                or (
+                    point_count >= self._side_guard_high_speed_soft_min_points
+                    and x_span <= self._side_guard_high_speed_soft_max_x_span
+                )
+            )
+            high_speed_near_soft = (
+                turning
+                and speed >= self._side_guard_high_speed_soft_min_speed
+                and min_x >= self._side_guard_high_speed_soft_x_min
+                and min_x <= self._side_guard_high_speed_soft_x
+                and min_abs_y <= self._side_guard_high_speed_soft_y
+                and point_count >= self._side_guard_high_speed_soft_min_points
+                and x_span <= self._side_guard_high_speed_soft_max_x_span
             )
             soft = (
                 turning
@@ -513,10 +768,30 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
                 and min_x >= self._side_guard_soft_x_min
                 and min_x <= self._side_guard_soft_x
                 and min_abs_y <= self._side_guard_soft_y
+                and near_side_quality_ok
             )
-            if not (immediate or hard or soft):
+            near_turning_soft = (
+                soft
+                and speed >= self._side_guard_near_turn_soft_min_speed
+                and min_abs_y <= self._side_guard_near_turn_soft_y
+            )
+            if not (immediate or hard or soft or high_speed_near_soft or closing_soft):
                 continue
-            level = "hard" if (immediate or hard) else "soft"
+            level = "hard" if (immediate or hard or closing_hard) else "soft"
+            if immediate:
+                reason = "immediate"
+            elif closing_hard:
+                reason = "closing_hard"
+            elif hard:
+                reason = "hard"
+            elif closing_soft:
+                reason = "closing_soft"
+            elif high_speed_near_soft:
+                reason = "high_speed_near_soft"
+            elif near_turning_soft:
+                reason = "near_turning_soft"
+            else:
+                reason = "turning_soft"
             if best_level != "hard" or level == "hard":
                 best_level = level
                 best_info = {
@@ -524,12 +799,23 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
                     "speed": float(speed),
                     "steer": float(getattr(control, "steer", 0.0)),
                     "turning": bool(turning),
-                    "reason": "immediate" if immediate else ("hard" if hard else "turning_soft"),
+                    "reason": reason,
                 }
+                if level == "hard":
+                    best_info["target_brake"] = float(self._side_guard_lateral_hard_brake)
+                    best_info["target_throttle"] = float(self._side_guard_hard_throttle)
+                elif level == "soft" and high_speed_near_soft:
+                    best_info["target_brake"] = float(self._side_guard_high_speed_soft_brake)
+                    best_info["target_throttle"] = float(self._side_guard_high_speed_soft_throttle)
+                elif level == "soft" and near_turning_soft:
+                    best_info["target_brake"] = float(self._side_guard_near_turn_soft_brake)
+                    best_info["target_throttle"] = float(self._side_guard_near_turn_soft_throttle)
+                elif level == "soft" and closing_soft:
+                    best_info["target_brake"] = float(self._side_guard_caution_brake)
+                    best_info["target_throttle"] = float(self._side_guard_caution_throttle)
             if best_level == "hard":
                 break
 
-        step = int(getattr(self, "step", 0))
         if best_level:
             self._side_guard_hold_until_step = step + max(0, int(self._side_guard_hold_steps))
             self._side_guard_last_level = best_level
@@ -545,17 +831,21 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         self._side_guard_last_info = {}
         return "", {}
 
-    def _apply_side_lidar_guard(self, input_data: Mapping[str, Any], control):
-        level, info = self._side_lidar_guard_decision(input_data, control)
+    def _apply_side_lidar_guard(self, input_data: Mapping[str, Any], control, timestamp: Any = None):
+        level, info = self._side_lidar_guard_decision(input_data, control, timestamp=timestamp)
         if not level:
             return control
 
         if level == "hard":
-            control.throttle = min(float(control.throttle), self._side_guard_hard_throttle)
-            control.brake = max(float(control.brake), self._side_guard_hard_brake)
+            target_throttle = float(info.get("target_throttle", self._side_guard_hard_throttle))
+            target_brake = float(info.get("target_brake", self._side_guard_hard_brake))
+            control.throttle = min(float(control.throttle), target_throttle)
+            control.brake = max(float(control.brake), target_brake)
         else:
-            control.throttle = min(float(control.throttle), self._side_guard_soft_throttle)
-            control.brake = max(float(control.brake), self._side_guard_soft_brake)
+            target_throttle = float(info.get("target_throttle", self._side_guard_soft_throttle))
+            target_brake = float(info.get("target_brake", self._side_guard_soft_brake))
+            control.throttle = min(float(control.throttle), target_throttle)
+            control.brake = max(float(control.brake), target_brake)
         self.control = control
 
         step = int(getattr(self, "step", 0))
@@ -567,6 +857,9 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
                 f"speed={float(info.get('speed', 0.0)):.2f} steer={float(info.get('steer', 0.0)):.2f} "
                 f"x=[{float(info.get('min_x', 0.0)):.2f},{float(info.get('max_x', 0.0)):.2f}] "
                 f"min_abs_y={float(info.get('min_abs_y', 0.0)):.2f} "
+                f"mean_y={float(info.get('mean_y', 0.0)):.2f} "
+                f"lat_rate={float(info.get('lateral_closing_rate', 0.0)):.2f} "
+                f"ttc_y={float(info.get('ttc_y', float('inf'))):.2f} "
                 f"pts/cells={int(float(info.get('points', 0.0)))}/{int(float(info.get('cells', 0.0)))} "
                 f"cmd=({control.steer:.3f},{control.throttle:.3f},{control.brake:.3f})",
                 flush=True,
@@ -576,7 +869,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
     def run_step(self, input_data, timestamp, sensors=None):  # pylint: disable=unused-argument
         self._write_record_frame(input_data)
         control = super().run_step(input_data, timestamp, sensors=sensors)
-        return self._apply_side_lidar_guard(input_data, control)
+        return self._apply_side_lidar_guard(input_data, control, timestamp=timestamp)
 
     def destroy(self, results=None):
         try:

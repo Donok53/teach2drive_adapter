@@ -97,6 +97,12 @@ export OUTPUT_PRIOR_XY_LOSS_WEIGHT=${OUTPUT_PRIOR_XY_LOSS_WEIGHT:-0.0}
 export OUTPUT_PRIOR_SPEED_LOSS_WEIGHT=${OUTPUT_PRIOR_SPEED_LOSS_WEIGHT:-0.0}
 export AUX_HIDDEN_DIM=${AUX_HIDDEN_DIM:-256}
 export CONTROL_LOSS_WEIGHT=${CONTROL_LOSS_WEIGHT:-0.0}
+export OUTPUT_RESIDUAL=${OUTPUT_RESIDUAL:-0}
+export OUTPUT_RESIDUAL_HIDDEN_DIM=${OUTPUT_RESIDUAL_HIDDEN_DIM:-256}
+export OUTPUT_RESIDUAL_CHECKPOINT_SCALE=${OUTPUT_RESIDUAL_CHECKPOINT_SCALE:-0.75}
+export OUTPUT_RESIDUAL_SPEED_LOGIT_SCALE=${OUTPUT_RESIDUAL_SPEED_LOGIT_SCALE:-1.5}
+export OUTPUT_RESIDUAL_GATE_BIAS=${OUTPUT_RESIDUAL_GATE_BIAS:--2.0}
+export OUTPUT_RESIDUAL_DROPOUT=${OUTPUT_RESIDUAL_DROPOUT:-0.0}
 export STOP_STATE_AUX_LOSS_WEIGHT=${STOP_STATE_AUX_LOSS_WEIGHT:-0.0}
 export STOP_REASON_AUX_LOSS_WEIGHT=${STOP_REASON_AUX_LOSS_WEIGHT:-0.0}
 
@@ -263,6 +269,9 @@ fi
 if [[ "$FUSION_ADAPTER_ENABLED" == "0" || "$FUSION_ADAPTER_ENABLED" == "false" || "$FUSION_ADAPTER_ENABLED" == "FALSE" ]]; then
   TRAIN_ARGS+=(--disable-fusion-adapter)
 fi
+if [[ "$OUTPUT_RESIDUAL" == "1" || "$OUTPUT_RESIDUAL" == "true" || "$OUTPUT_RESIDUAL" == "TRUE" ]]; then
+  TRAIN_ARGS+=(--output-residual)
+fi
 
 echo "=== train target-only task feature adapter"
 PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_adapter \
@@ -321,6 +330,11 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --output-prior-speed-loss-weight "$OUTPUT_PRIOR_SPEED_LOSS_WEIGHT" \
   --aux-hidden-dim "$AUX_HIDDEN_DIM" \
   --control-loss-weight "$CONTROL_LOSS_WEIGHT" \
+  --output-residual-hidden-dim "$OUTPUT_RESIDUAL_HIDDEN_DIM" \
+  --output-residual-checkpoint-scale "$OUTPUT_RESIDUAL_CHECKPOINT_SCALE" \
+  --output-residual-speed-logit-scale "$OUTPUT_RESIDUAL_SPEED_LOGIT_SCALE" \
+  --output-residual-gate-bias "$OUTPUT_RESIDUAL_GATE_BIAS" \
+  --output-residual-dropout "$OUTPUT_RESIDUAL_DROPOUT" \
   --stop-state-aux-loss-weight "$STOP_STATE_AUX_LOSS_WEIGHT" \
   --stop-reason-aux-loss-weight "$STOP_REASON_AUX_LOSS_WEIGHT" \
   --moving-sample-weight "$MOVING_SAMPLE_WEIGHT" \
