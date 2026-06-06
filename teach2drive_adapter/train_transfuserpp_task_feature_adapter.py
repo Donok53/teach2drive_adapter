@@ -937,6 +937,14 @@ def _losses(
         + float(args.control_loss_weight) * control
         + float(args.stop_state_aux_loss_weight) * stop_state_aux
         + float(args.stop_reason_aux_loss_weight) * stop_reason_aux
+        + float(args.pdm_behavior_loss_weight) * behavior_proxy
+        + float(args.pdm_lateral_loss_weight) * lateral_error
+        + float(args.pdm_progress_loss_weight) * progress_error
+        + float(args.pdm_hazard_progress_loss_weight) * hazard_progress
+        + float(args.pdm_controller_loss_weight) * controller_metrics["controller_proxy"]
+        + float(args.pdm_plan_steer_loss_weight) * controller_metrics["plan_steer_error"]
+        + float(args.pdm_plan_throttle_loss_weight) * controller_metrics["plan_throttle_error"]
+        + float(args.pdm_plan_brake_loss_weight) * controller_metrics["plan_brake_error"]
     )
     metrics = {
         "loss": total,
@@ -1621,6 +1629,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-prior-speed-loss-weight", type=float, default=0.0)
     parser.add_argument("--aux-hidden-dim", type=int, default=256)
     parser.add_argument("--control-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-behavior-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-lateral-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-progress-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-hazard-progress-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-controller-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-plan-steer-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-plan-throttle-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-plan-brake-loss-weight", type=float, default=0.0)
     parser.add_argument("--output-residual", action="store_true")
     parser.add_argument("--output-residual-hidden-dim", type=int, default=256)
     parser.add_argument("--output-residual-checkpoint-scale", type=float, default=0.75)
