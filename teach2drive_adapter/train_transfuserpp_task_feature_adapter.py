@@ -18,7 +18,13 @@ from .cache_transfuserpp_feature_fusion_features import (
     _capture_backbone_feature_fusion_features,
 )
 from .data import STOP_REASON_NAMES, Teach2DriveIndexDataset, split_by_episode
-from .peft_lora import install_lora_adapters, lora_parameters, lora_state_dict, set_lora_train_mode
+from .peft_lora import (
+    install_lora_adapters,
+    load_lora_state_dict,
+    lora_parameters,
+    lora_state_dict,
+    set_lora_train_mode,
+)
 from .train_adapter import _per_sample_vector, _weighted_mean
 from .train_transfuserpp_feature_then_fusion_adapter import (
     ExtrinsicAwareFeatureThenFusionAdapter,
@@ -1019,6 +1025,52 @@ def _raw_task_model(model: nn.Module) -> _TaskAdapterForward:
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
+def _load_task_checkpoint_extras(model: _TaskAdapterForward, checkpoint_path: str, strict: bool = False) -> dict[str, dict]:
+    if not checkpoint_path:
+        return {}
+    checkpoint = torch.load(Path(checkpoint_path).expanduser(), map_location="cpu")
+    info: dict[str, dict] = {}
+    lora_state = checkpoint.get("peft_lora_state") or {}
+    if lora_state:
+        info["peft_lora_state"] = load_lora_state_dict(model.net, lora_state, strict=strict)
+
+    aux_state = checkpoint.get("aux_state") or {}
+    aux_info: dict[str, dict[str, int]] = {}
+    for key in ("stop_state_head", "stop_reason_head", "control_head", "output_residual_head"):
+        module = getattr(model, key, None)
+        if module is None or key not in aux_state:
+            continue
+        missing, unexpected = module.load_state_dict(aux_state[key], strict=strict)
+        aux_info[key] = {"missing": len(missing), "unexpected": len(unexpected)}
+    if aux_info:
+        info["aux_state"] = aux_info
+    return info
+
+
+def _capture_trainable_anchor(model: nn.Module, weight: float) -> dict[str, torch.Tensor]:
+    if float(weight) <= 0.0:
+        return {}
+    return {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+
+def _trainable_anchor_loss(model: nn.Module, anchor: dict[str, torch.Tensor], device: torch.device) -> torch.Tensor:
+    if not anchor:
+        return torch.zeros((), dtype=torch.float32, device=device)
+    losses = []
+    for name, param in model.named_parameters():
+        ref = anchor.get(name)
+        if ref is None or not param.requires_grad:
+            continue
+        losses.append(nn.functional.smooth_l1_loss(param.float(), ref.to(device=device, dtype=param.dtype).float()))
+    if not losses:
+        return torch.zeros((), dtype=torch.float32, device=device)
+    return torch.stack(losses).mean()
+
+
 def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
     raw_model = _raw_task_model(model)
     raw_model.set_runtime_mode(train)
@@ -1057,6 +1109,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "hazard_ratio",
         "launch_ratio",
         "release_ratio",
+        "anchor",
     )
     rate_metric_names = (
         "stop_hold_recall",
@@ -1098,6 +1151,10 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
                 speed_dim=int(args.speed_dim),
             )
             losses = _losses(pred_target, batch, drift_loss, prior_target, aux, device, args)
+            anchor_loss = _trainable_anchor_loss(model, getattr(args, "_trainable_anchor_state", {}), device)
+            losses["anchor"] = anchor_loss
+            if train and float(args.init_param_anchor_loss_weight) > 0.0:
+                losses["loss"] = losses["loss"] + float(args.init_param_anchor_loss_weight) * anchor_loss
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 losses["loss"].backward()
@@ -1295,6 +1352,7 @@ def train(args: argparse.Namespace) -> None:
         lidar_shift_y_m=float(args.lidar_canonical_shift_y_m),
         lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
     ).to(device)
+    init_extra_load_info = _load_task_checkpoint_extras(model, args.init_checkpoint, strict=False)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
         model = nn.DataParallel(model)
@@ -1321,6 +1379,7 @@ def train(args: argparse.Namespace) -> None:
             }
         )
     optimizer = torch.optim.AdamW(param_groups)
+    args._trainable_anchor_state = _capture_trainable_anchor(model, float(args.init_param_anchor_loss_weight))
 
     metadata = {
         "mode": "transfuserpp_extrinsic_task_feature_then_fusion_adapter" if args.extrinsic_aware else "transfuserpp_task_feature_then_fusion_adapter",
@@ -1331,6 +1390,8 @@ def train(args: argparse.Namespace) -> None:
         "tfpp_load_info": load_info,
         "adapter_init_checkpoint": str(Path(args.init_checkpoint).expanduser()) if args.init_checkpoint else "",
         "adapter_init_load_info": load_adapter_info,
+        "task_init_extra_load_info": init_extra_load_info,
+        "init_param_anchor_loss_weight": float(args.init_param_anchor_loss_weight),
         "peft_lora": {
             "rank": int(args.lora_rank),
             "alpha": float(args.lora_alpha),
@@ -1403,6 +1464,7 @@ def train(args: argparse.Namespace) -> None:
                 "output_residual": metadata["output_residual"],
                 "tfpp_load_info": load_info,
                 "adapter_init_load_info": load_adapter_info,
+                "task_init_extra_load_info": init_extra_load_info,
                 "peft_lora_modules": peft_lora_modules,
                 "unfrozen_tfpp_count": len(unfrozen_tfpp_params),
                 "unfrozen_tfpp_preview": unfrozen_tfpp_params[:20],
@@ -1531,6 +1593,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--team-config", required=True)
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--init-checkpoint", default="")
+    parser.add_argument("--init-param-anchor-loss-weight", type=float, default=0.0)
     parser.add_argument("--cameras", default="left,front,right")
     parser.add_argument("--tfpp-camera", default="front")
     parser.add_argument("--command-mode", choices=["lane_follow", "target_angle"], default="target_angle")

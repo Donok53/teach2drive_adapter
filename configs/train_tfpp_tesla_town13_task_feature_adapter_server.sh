@@ -80,6 +80,7 @@ export FUSION_ADAPTER_ENABLED=${FUSION_ADAPTER_ENABLED:-1}
 export STAGE_FEATURE_ADAPTER_BLEND=${STAGE_FEATURE_ADAPTER_BLEND:-1.0}
 export FUSION_ADAPTER_BLEND=${FUSION_ADAPTER_BLEND:-1.0}
 export INIT_CHECKPOINT=${INIT_CHECKPOINT:-""}
+export INIT_PARAM_ANCHOR_LOSS_WEIGHT=${INIT_PARAM_ANCHOR_LOSS_WEIGHT:-0.0}
 export LORA_RANK=${LORA_RANK:-0}
 export LORA_ALPHA=${LORA_ALPHA:-16.0}
 export LORA_DROPOUT=${LORA_DROPOUT:-0.0}
@@ -319,6 +320,7 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --stage-adapter-modalities "$STAGE_ADAPTER_MODALITIES" \
   --stage-feature-adapter-blend "$STAGE_FEATURE_ADAPTER_BLEND" \
   --fusion-adapter-blend "$FUSION_ADAPTER_BLEND" \
+  --init-param-anchor-loss-weight "$INIT_PARAM_ANCHOR_LOSS_WEIGHT" \
   --lora-rank "$LORA_RANK" \
   --lora-alpha "$LORA_ALPHA" \
   --lora-dropout "$LORA_DROPOUT" \
