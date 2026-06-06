@@ -12,6 +12,9 @@ from torch import nn
 from torch.nn import functional as F
 
 
+_WARP_GRID_CACHE: dict[tuple, torch.Tensor] = {}
+
+
 @dataclass(frozen=True)
 class TransFuserPPBatchSpec:
     image_hw: Tuple[int, int] = (384, 1024)
@@ -204,6 +207,138 @@ def _camera_index(cameras: Sequence[str], target: str) -> int:
     return 0
 
 
+def _pose6(value: Optional[Sequence[float]], default: Sequence[float]) -> tuple[float, float, float, float, float, float]:
+    raw = list(default if value is None else value)
+    if len(raw) < 3:
+        raise ValueError(f"Camera pose must contain at least x,y,z, got {raw}")
+    while len(raw) < 6:
+        raw.append(0.0)
+    return tuple(float(v) for v in raw[:6])  # type: ignore[return-value]
+
+
+def _ground_to_image_homography(
+    width: int,
+    height: int,
+    fov_deg: float,
+    pose: Sequence[float],
+    ground_z_m: float = 0.0,
+) -> torch.Tensor:
+    """Return a ground-plane-to-image homography for the front camera.
+
+    The camera and ego frames use x forward, image x right, and image y down.
+    This is exact for points on the configured ground plane. Non-ground objects
+    are still a single-view approximation because RGB lacks depth.
+    """
+
+    x, y, z, _roll, _pitch, yaw = _pose6(pose, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+    focal = float(width) / (2.0 * math.tan(math.radians(float(fov_deg)) / 2.0))
+    cx = (float(width) - 1.0) * 0.5
+    cy = (float(height) - 1.0) * 0.5
+    k = torch.tensor(
+        [[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]],
+        dtype=torch.float64,
+    )
+
+    # Vehicle ground point P=[X,Y,1] at Z=ground_z.  For yaw=0:
+    # camera_x = Y - camera_y, camera_y_down = camera_z - Z, camera_z = X - camera_x.
+    yaw_rad = math.radians(float(yaw))
+    cos_y = math.cos(yaw_rad)
+    sin_y = math.sin(yaw_rad)
+    ego_to_cam = torch.tensor(
+        [
+            [-sin_y, cos_y, sin_y * x - cos_y * y],
+            [0.0, 0.0, z - float(ground_z_m)],
+            [cos_y, sin_y, -cos_y * x - sin_y * y],
+        ],
+        dtype=torch.float64,
+    )
+    return k @ ego_to_cam
+
+
+def _ground_plane_warp_grid(
+    *,
+    height: int,
+    width: int,
+    fov_deg: float,
+    source_pose: Sequence[float],
+    target_pose: Sequence[float],
+    ground_z_m: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    source_pose6 = _pose6(source_pose, (1.25, 0.0, 1.95, 0.0, 0.0, 0.0))
+    target_pose6 = _pose6(target_pose, (-1.5, 0.0, 2.0, 0.0, 0.0, 0.0))
+    key = (
+        str(device),
+        str(dtype),
+        int(height),
+        int(width),
+        round(float(fov_deg), 6),
+        tuple(round(v, 6) for v in source_pose6),
+        tuple(round(v, 6) for v in target_pose6),
+        round(float(ground_z_m), 6),
+    )
+    cached = _WARP_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    h_source = _ground_to_image_homography(width, height, fov_deg, source_pose6, ground_z_m)
+    h_target = _ground_to_image_homography(width, height, fov_deg, target_pose6, ground_z_m)
+    target_to_source = h_source @ torch.linalg.inv(h_target)
+    target_to_source = target_to_source.to(device=device, dtype=dtype)
+
+    ys, xs = torch.meshgrid(
+        torch.arange(height, dtype=dtype, device=device),
+        torch.arange(width, dtype=dtype, device=device),
+        indexing="ij",
+    )
+    ones = torch.ones_like(xs)
+    flat = torch.stack((xs, ys, ones), dim=0).reshape(3, -1)
+    src = target_to_source @ flat
+    denom = src[2].clamp(min=1e-6)
+    x_src = (src[0] / denom).reshape(height, width)
+    y_src = (src[1] / denom).reshape(height, width)
+    x_norm = 2.0 * x_src / max(width - 1, 1) - 1.0
+    y_norm = 2.0 * y_src / max(height - 1, 1) - 1.0
+    grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0).contiguous()
+    _WARP_GRID_CACHE[key] = grid
+    return grid
+
+
+def ground_plane_warp_rgb(
+    rgb: torch.Tensor,
+    *,
+    enabled: bool,
+    fov_deg: float,
+    source_pose: Sequence[float],
+    target_pose: Sequence[float],
+    ground_z_m: float = 0.0,
+) -> torch.Tensor:
+    if not enabled:
+        return rgb
+    if rgb.ndim != 4:
+        raise ValueError(f"Expected RGB tensor [B,3,H,W], got {tuple(rgb.shape)}")
+    height = int(rgb.shape[-2])
+    width = int(rgb.shape[-1])
+    grid = _ground_plane_warp_grid(
+        height=height,
+        width=width,
+        fov_deg=float(fov_deg),
+        source_pose=source_pose,
+        target_pose=target_pose,
+        ground_z_m=float(ground_z_m),
+        device=rgb.device,
+        dtype=rgb.dtype,
+    )
+    return F.grid_sample(
+        rgb,
+        grid.expand(rgb.shape[0], -1, -1, -1),
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ).contiguous()
+
+
 def camera_to_transfuserpp_rgb(
     camera: torch.Tensor,
     cameras: Sequence[str],
@@ -212,6 +347,10 @@ def camera_to_transfuserpp_rgb(
     crop_shift_x_px: float = 0.0,
     crop_shift_y_px: float = 0.0,
     crop_scale: float = 1.0,
+    ground_plane_warp: bool = False,
+    ground_plane_source_pose: Optional[Sequence[float]] = None,
+    ground_plane_target_pose: Optional[Sequence[float]] = None,
+    ground_plane_z_m: float = 0.0,
 ) -> torch.Tensor:
     """Convert Teach2Drive camera tensors in [0, 1] to TF++ cropped RGB in [0, 255]."""
 
@@ -223,6 +362,14 @@ def camera_to_transfuserpp_rgb(
     resize_w = int(getattr(config, "camera_width", 1024))
     if tuple(rgb.shape[-2:]) != (resize_h, resize_w):
         rgb = F.interpolate(rgb, size=(resize_h, resize_w), mode="bilinear", align_corners=False)
+    rgb = ground_plane_warp_rgb(
+        rgb,
+        enabled=bool(ground_plane_warp),
+        fov_deg=float(getattr(config, "camera_fov", getattr(config, "fov", 110.0))),
+        source_pose=_pose6(ground_plane_source_pose, (1.25, 0.0, 1.95, 0.0, 0.0, 0.0)),
+        target_pose=_pose6(ground_plane_target_pose, (-1.5, 0.0, 2.0, 0.0, 0.0, 0.0)),
+        ground_z_m=float(ground_plane_z_m),
+    )
     scale = float(crop_scale)
     if abs(scale - 1.0) > 1e-6:
         scaled_h = max(1, int(round(resize_h * scale)))
@@ -391,6 +538,10 @@ def prepare_transfuserpp_inputs(
     camera_crop_shift_x_px: float = 0.0,
     camera_crop_shift_y_px: float = 0.0,
     camera_crop_scale: float = 1.0,
+    camera_ground_plane_warp: bool = False,
+    camera_ground_plane_source_pose: Optional[Sequence[float]] = None,
+    camera_ground_plane_target_pose: Optional[Sequence[float]] = None,
+    camera_ground_plane_z_m: float = 0.0,
     lidar_shift_x_m: float = 0.0,
     lidar_shift_y_m: float = 0.0,
     lidar_pixels_per_meter: float = 4.0,
@@ -412,6 +563,10 @@ def prepare_transfuserpp_inputs(
             crop_shift_x_px=float(camera_crop_shift_x_px),
             crop_shift_y_px=float(camera_crop_shift_y_px),
             crop_scale=float(camera_crop_scale),
+            ground_plane_warp=bool(camera_ground_plane_warp),
+            ground_plane_source_pose=camera_ground_plane_source_pose,
+            ground_plane_target_pose=camera_ground_plane_target_pose,
+            ground_plane_z_m=float(camera_ground_plane_z_m),
         ),
         "lidar_bev": lidar_bev,
         "target_point": target_point,

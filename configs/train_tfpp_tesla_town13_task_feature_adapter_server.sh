@@ -48,6 +48,10 @@ export IMAGE_HEIGHT=${IMAGE_HEIGHT:-360}
 export CAMERA_CROP_SHIFT_X_PX=${CAMERA_CROP_SHIFT_X_PX:-0.0}
 export CAMERA_CROP_SHIFT_Y_PX=${CAMERA_CROP_SHIFT_Y_PX:-0.0}
 export CAMERA_CROP_SCALE=${CAMERA_CROP_SCALE:-1.0}
+export CAMERA_GROUND_PLANE_WARP=${CAMERA_GROUND_PLANE_WARP:-0}
+export CAMERA_GROUND_PLANE_SOURCE_POSE=${CAMERA_GROUND_PLANE_SOURCE_POSE:-"1.25 0.0 1.95 0.0 0.0 0.0"}
+export CAMERA_GROUND_PLANE_TARGET_POSE=${CAMERA_GROUND_PLANE_TARGET_POSE:-"-1.5 0.0 2.0 0.0 0.0 0.0"}
+export CAMERA_GROUND_PLANE_Z_M=${CAMERA_GROUND_PLANE_Z_M:-0.0}
 export LIDAR_SIZE=${LIDAR_SIZE:-128}
 export EPOCHS=${EPOCHS:-20}
 export EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-6}
@@ -275,6 +279,9 @@ fi
 if [[ "$OUTPUT_RESIDUAL" == "1" || "$OUTPUT_RESIDUAL" == "true" || "$OUTPUT_RESIDUAL" == "TRUE" ]]; then
   TRAIN_ARGS+=(--output-residual)
 fi
+if [[ "$CAMERA_GROUND_PLANE_WARP" == "1" || "$CAMERA_GROUND_PLANE_WARP" == "true" || "$CAMERA_GROUND_PLANE_WARP" == "TRUE" ]]; then
+  TRAIN_ARGS+=(--camera-ground-plane-warp)
+fi
 
 echo "=== train target-only task feature adapter"
 PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_adapter \
@@ -290,6 +297,9 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --camera-crop-shift-x-px "$CAMERA_CROP_SHIFT_X_PX" \
   --camera-crop-shift-y-px "$CAMERA_CROP_SHIFT_Y_PX" \
   --camera-crop-scale "$CAMERA_CROP_SCALE" \
+  --camera-ground-plane-source-pose $CAMERA_GROUND_PLANE_SOURCE_POSE \
+  --camera-ground-plane-target-pose $CAMERA_GROUND_PLANE_TARGET_POSE \
+  --camera-ground-plane-z-m "$CAMERA_GROUND_PLANE_Z_M" \
   --lidar-size "$LIDAR_SIZE" \
   --source-profile "$SOURCE_PROFILE" \
   --extrinsic-hidden-dim "$EXTRINSIC_HIDDEN_DIM" \

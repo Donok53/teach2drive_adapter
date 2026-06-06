@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import atexit
 import json
+import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -63,6 +64,19 @@ def _truthy(value: str | None, default: bool = False) -> bool:
     if value is None or value == "":
         return bool(default)
     return value.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_pose6(name: str, default: Sequence[float]) -> list[float]:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        raw = list(default)
+    else:
+        raw = [float(part.strip()) for part in value.split(",") if part.strip()]
+    if len(raw) < 3:
+        raise ValueError(f"{name} must contain at least x,y,z")
+    while len(raw) < 6:
+        raw.append(0.0)
+    return [float(v) for v in raw[:6]]
 
 
 def _pose_vec(pose: Mapping[str, Any], keys: tuple[str, str, str]) -> list[float]:
@@ -168,6 +182,23 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             "TFPP_CAMERA_CROP_SCALE",
             float(camera_crop.get("scale", 1.0) or 1.0),
         )
+        camera_warp = metadata.get("camera_ground_plane_warp", {})
+        self._camera_ground_plane_warp = _truthy(
+            os.environ.get("TFPP_CAMERA_GROUND_PLANE_WARP"),
+            bool(camera_warp.get("enabled", False)),
+        )
+        self._camera_ground_plane_source_pose = _env_pose6(
+            "TFPP_CAMERA_GROUND_PLANE_SOURCE_POSE",
+            camera_warp.get("source_pose", [1.25, 0.0, 1.95, 0.0, 0.0, 0.0]),
+        )
+        self._camera_ground_plane_target_pose = _env_pose6(
+            "TFPP_CAMERA_GROUND_PLANE_TARGET_POSE",
+            camera_warp.get("target_pose", [-1.5, 0.0, 2.0, 0.0, 0.0, 0.0]),
+        )
+        self._camera_ground_plane_z_m = _env_float(
+            "TFPP_CAMERA_GROUND_PLANE_Z_M",
+            float(camera_warp.get("ground_z_m", 0.0) or 0.0),
+        )
         lidar_shift = metadata.get("lidar_canonical_shift_m", [0.0, 0.0])
         if not isinstance(lidar_shift, (list, tuple)) or len(lidar_shift) < 2:
             lidar_shift = [0.0, 0.0]
@@ -214,9 +245,68 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             f"stage_modalities={self._stage_adapter_modalities} fusion_enabled={self._fusion_adapter_enabled} "
             f"camera_crop=({self._camera_crop_shift_x_px:.1f},{self._camera_crop_shift_y_px:.1f},"
             f"{self._camera_crop_scale:.3f}) "
+            f"camera_ground_warp={self._camera_ground_plane_warp} "
             f"lidar_shift=({self._lidar_canonical_shift_x_m:.3f},{self._lidar_canonical_shift_y_m:.3f}) "
             f"missing={len(missing)} unexpected={len(unexpected)}",
             flush=True,
+        )
+
+    @staticmethod
+    def _ground_to_image_homography(
+        width: int,
+        height: int,
+        fov_deg: float,
+        pose: Sequence[float],
+        ground_z_m: float,
+    ) -> np.ndarray:
+        raw = list(pose)
+        while len(raw) < 6:
+            raw.append(0.0)
+        x, y, z, _roll, _pitch, yaw = [float(v) for v in raw[:6]]
+        focal = float(width) / (2.0 * math.tan(math.radians(float(fov_deg)) / 2.0))
+        cx = (float(width) - 1.0) * 0.5
+        cy = (float(height) - 1.0) * 0.5
+        k = np.array([[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        yaw_rad = math.radians(float(yaw))
+        cos_y = math.cos(yaw_rad)
+        sin_y = math.sin(yaw_rad)
+        ego_to_cam = np.array(
+            [
+                [-sin_y, cos_y, sin_y * x - cos_y * y],
+                [0.0, 0.0, z - float(ground_z_m)],
+                [cos_y, sin_y, -cos_y * x - sin_y * y],
+            ],
+            dtype=np.float64,
+        )
+        return k @ ego_to_cam
+
+    def _ground_plane_warp_array(self, config, image: np.ndarray) -> np.ndarray:
+        if not self._camera_ground_plane_warp:
+            return image
+        height, width = image.shape[:2]
+        fov = float(getattr(config, "camera_fov", getattr(config, "fov", 110.0)))
+        h_source = self._ground_to_image_homography(
+            width,
+            height,
+            fov,
+            self._camera_ground_plane_source_pose,
+            self._camera_ground_plane_z_m,
+        )
+        h_target = self._ground_to_image_homography(
+            width,
+            height,
+            fov,
+            self._camera_ground_plane_target_pose,
+            self._camera_ground_plane_z_m,
+        )
+        source_to_target = h_target @ np.linalg.inv(h_source)
+        return cv2.warpPerspective(
+            image,
+            source_to_target.astype(np.float32),
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
         )
 
     @staticmethod
@@ -296,16 +386,19 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         return warped
 
     def _setup_input_canonicalization(self) -> None:
-        crop_enabled = (
+        camera_enabled = (
+            bool(self._camera_ground_plane_warp)
+            or
             abs(self._camera_crop_shift_x_px) > 1e-6
             or abs(self._camera_crop_shift_y_px) > 1e-6
             or abs(self._camera_crop_scale - 1.0) > 1e-6
         )
-        if crop_enabled:
+        if camera_enabled:
             if not hasattr(t_u, "_teach2drive_original_crop_array"):
                 t_u._teach2drive_original_crop_array = t_u.crop_array
 
             def canonical_crop(config, image, _self=self):
+                image = _self._ground_plane_warp_array(config, image)
                 return _self._canonical_crop_array(
                     config,
                     image,
@@ -331,7 +424,8 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             self.data.lidar_to_histogram_features = shifted_lidar_histogram
         print(
             "[FeatureThenFusionAdapterSensorRigAgent] input_canonicalization "
-            f"camera_enabled={crop_enabled} "
+            f"camera_enabled={camera_enabled} "
+            f"camera_ground_warp={self._camera_ground_plane_warp} "
             f"camera_shift=({self._camera_crop_shift_x_px:.1f},{self._camera_crop_shift_y_px:.1f}) "
             f"camera_scale={self._camera_crop_scale:.3f} "
             f"lidar_enabled={lidar_enabled} "

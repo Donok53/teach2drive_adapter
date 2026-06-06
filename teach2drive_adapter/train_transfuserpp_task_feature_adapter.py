@@ -503,6 +503,10 @@ class _TaskAdapterForward(nn.Module):
         camera_crop_shift_x_px: float = 0.0,
         camera_crop_shift_y_px: float = 0.0,
         camera_crop_scale: float = 1.0,
+        camera_ground_plane_warp: bool = False,
+        camera_ground_plane_source_pose: tuple[float, ...] = (1.25, 0.0, 1.95, 0.0, 0.0, 0.0),
+        camera_ground_plane_target_pose: tuple[float, ...] = (-1.5, 0.0, 2.0, 0.0, 0.0, 0.0),
+        camera_ground_plane_z_m: float = 0.0,
         lidar_shift_x_m: float = 0.0,
         lidar_shift_y_m: float = 0.0,
         lidar_pixels_per_meter: float = 4.0,
@@ -524,6 +528,10 @@ class _TaskAdapterForward(nn.Module):
         self.camera_crop_shift_x_px = float(camera_crop_shift_x_px)
         self.camera_crop_shift_y_px = float(camera_crop_shift_y_px)
         self.camera_crop_scale = float(camera_crop_scale)
+        self.camera_ground_plane_warp = bool(camera_ground_plane_warp)
+        self.camera_ground_plane_source_pose = tuple(float(v) for v in camera_ground_plane_source_pose)
+        self.camera_ground_plane_target_pose = tuple(float(v) for v in camera_ground_plane_target_pose)
+        self.camera_ground_plane_z_m = float(camera_ground_plane_z_m)
         self.lidar_shift_x_m = float(lidar_shift_x_m)
         self.lidar_shift_y_m = float(lidar_shift_y_m)
         self.lidar_pixels_per_meter = float(lidar_pixels_per_meter)
@@ -623,6 +631,10 @@ class _TaskAdapterForward(nn.Module):
             camera_crop_shift_x_px=self.camera_crop_shift_x_px,
             camera_crop_shift_y_px=self.camera_crop_shift_y_px,
             camera_crop_scale=self.camera_crop_scale,
+            camera_ground_plane_warp=self.camera_ground_plane_warp,
+            camera_ground_plane_source_pose=self.camera_ground_plane_source_pose,
+            camera_ground_plane_target_pose=self.camera_ground_plane_target_pose,
+            camera_ground_plane_z_m=self.camera_ground_plane_z_m,
             lidar_shift_x_m=self.lidar_shift_x_m,
             lidar_shift_y_m=self.lidar_shift_y_m,
             lidar_pixels_per_meter=self.lidar_pixels_per_meter,
@@ -693,6 +705,10 @@ def _infer_feature_shapes(net: nn.Module, config, loader: DataLoader, cameras: l
             camera_crop_shift_x_px=float(args.camera_crop_shift_x_px),
             camera_crop_shift_y_px=float(args.camera_crop_shift_y_px),
             camera_crop_scale=float(args.camera_crop_scale),
+            camera_ground_plane_warp=bool(args.camera_ground_plane_warp),
+            camera_ground_plane_source_pose=tuple(float(v) for v in args.camera_ground_plane_source_pose),
+            camera_ground_plane_target_pose=tuple(float(v) for v in args.camera_ground_plane_target_pose),
+            camera_ground_plane_z_m=float(args.camera_ground_plane_z_m),
             lidar_shift_x_m=float(args.lidar_canonical_shift_x_m),
             lidar_shift_y_m=float(args.lidar_canonical_shift_y_m),
             lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
@@ -1263,6 +1279,10 @@ def train(args: argparse.Namespace) -> None:
         camera_crop_shift_x_px=float(args.camera_crop_shift_x_px),
         camera_crop_shift_y_px=float(args.camera_crop_shift_y_px),
         camera_crop_scale=float(args.camera_crop_scale),
+        camera_ground_plane_warp=bool(args.camera_ground_plane_warp),
+        camera_ground_plane_source_pose=tuple(float(v) for v in args.camera_ground_plane_source_pose),
+        camera_ground_plane_target_pose=tuple(float(v) for v in args.camera_ground_plane_target_pose),
+        camera_ground_plane_z_m=float(args.camera_ground_plane_z_m),
         lidar_shift_x_m=float(args.lidar_canonical_shift_x_m),
         lidar_shift_y_m=float(args.lidar_canonical_shift_y_m),
         lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
@@ -1328,6 +1348,12 @@ def train(args: argparse.Namespace) -> None:
             "shift_y_px": float(args.camera_crop_shift_y_px),
             "scale": float(args.camera_crop_scale),
         },
+        "camera_ground_plane_warp": {
+            "enabled": bool(args.camera_ground_plane_warp),
+            "source_pose": [float(v) for v in args.camera_ground_plane_source_pose],
+            "target_pose": [float(v) for v in args.camera_ground_plane_target_pose],
+            "ground_z_m": float(args.camera_ground_plane_z_m),
+        },
         "lidar_size": int(args.lidar_size),
         "lidar_canonical_shift_m": [float(args.lidar_canonical_shift_x_m), float(args.lidar_canonical_shift_y_m)],
         "lidar_pixels_per_meter": float(args.lidar_pixels_per_meter),
@@ -1373,6 +1399,7 @@ def train(args: argparse.Namespace) -> None:
                 "unfrozen_tfpp_count": len(unfrozen_tfpp_params),
                 "unfrozen_tfpp_preview": unfrozen_tfpp_params[:20],
                 "camera_canonical_crop": metadata["camera_canonical_crop"],
+                "camera_ground_plane_warp": metadata["camera_ground_plane_warp"],
                 "lidar_canonical_shift_m": metadata["lidar_canonical_shift_m"],
                 "data_parallel": metadata["data_parallel"],
             },
@@ -1503,6 +1530,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-crop-shift-x-px", type=float, default=0.0)
     parser.add_argument("--camera-crop-shift-y-px", type=float, default=0.0)
     parser.add_argument("--camera-crop-scale", type=float, default=1.0)
+    parser.add_argument("--camera-ground-plane-warp", action="store_true")
+    parser.add_argument(
+        "--camera-ground-plane-source-pose",
+        type=float,
+        nargs=6,
+        default=[1.25, 0.0, 1.95, 0.0, 0.0, 0.0],
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+    )
+    parser.add_argument(
+        "--camera-ground-plane-target-pose",
+        type=float,
+        nargs=6,
+        default=[-1.5, 0.0, 2.0, 0.0, 0.0, 0.0],
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+    )
+    parser.add_argument("--camera-ground-plane-z-m", type=float, default=0.0)
     parser.add_argument("--lidar-size", type=int, default=128)
     parser.add_argument("--extrinsic-aware", action="store_true")
     parser.add_argument("--source-profile", default="front_triplet_shifted", choices=["front_triplet_shifted", "tfpp_ego"])
