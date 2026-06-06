@@ -209,6 +209,9 @@ def camera_to_transfuserpp_rgb(
     cameras: Sequence[str],
     config,
     tfpp_camera: str = "front",
+    crop_shift_x_px: float = 0.0,
+    crop_shift_y_px: float = 0.0,
+    crop_scale: float = 1.0,
 ) -> torch.Tensor:
     """Convert Teach2Drive camera tensors in [0, 1] to TF++ cropped RGB in [0, 255]."""
 
@@ -220,11 +223,45 @@ def camera_to_transfuserpp_rgb(
     resize_w = int(getattr(config, "camera_width", 1024))
     if tuple(rgb.shape[-2:]) != (resize_h, resize_w):
         rgb = F.interpolate(rgb, size=(resize_h, resize_w), mode="bilinear", align_corners=False)
+    scale = float(crop_scale)
+    if abs(scale - 1.0) > 1e-6:
+        scaled_h = max(1, int(round(resize_h * scale)))
+        scaled_w = max(1, int(round(resize_w * scale)))
+        scaled = F.interpolate(rgb, size=(scaled_h, scaled_w), mode="bilinear", align_corners=False)
+        pad_y_total = max(resize_h - scaled_h, 0)
+        pad_x_total = max(resize_w - scaled_w, 0)
+        if pad_y_total or pad_x_total:
+            scaled = F.pad(
+                scaled,
+                (
+                    pad_x_total // 2,
+                    pad_x_total - pad_x_total // 2,
+                    pad_y_total // 2,
+                    pad_y_total - pad_y_total // 2,
+                ),
+            )
+        if scaled.shape[-2] > resize_h or scaled.shape[-1] > resize_w:
+            start_y = max((scaled.shape[-2] - resize_h) // 2, 0)
+            start_x = max((scaled.shape[-1] - resize_w) // 2, 0)
+            scaled = scaled[:, :, start_y : start_y + resize_h, start_x : start_x + resize_w]
+        rgb = scaled
     if bool(getattr(config, "crop_image", True)):
         crop_h = int(getattr(config, "cropped_height", 384))
         crop_w = int(getattr(config, "cropped_width", 1024))
+        padded_h = max(int(rgb.shape[-2]), crop_h + abs(int(round(float(crop_shift_y_px)))) * 2)
+        padded_w = max(int(rgb.shape[-1]), crop_w + abs(int(round(float(crop_shift_x_px)))) * 2)
+        pad_top = max((padded_h - int(rgb.shape[-2])) // 2, 0)
+        pad_bottom = max(padded_h - int(rgb.shape[-2]) - pad_top, 0)
+        pad_left = max((padded_w - int(rgb.shape[-1])) // 2, 0)
+        pad_right = max(padded_w - int(rgb.shape[-1]) - pad_left, 0)
+        if pad_top or pad_bottom or pad_left or pad_right:
+            rgb = F.pad(rgb, (pad_left, pad_right, pad_top, pad_bottom))
         side_crop = max((rgb.shape[-1] - crop_w) // 2, 0)
-        rgb = rgb[:, :, :crop_h, side_crop : side_crop + crop_w]
+        start_y = pad_top + int(round(float(crop_shift_y_px)))
+        start_x = side_crop + int(round(float(crop_shift_x_px)))
+        start_y = max(0, min(start_y, int(rgb.shape[-2]) - crop_h))
+        start_x = max(0, min(start_x, int(rgb.shape[-1]) - crop_w))
+        rgb = rgb[:, :, start_y : start_y + crop_h, start_x : start_x + crop_w]
     return rgb.contiguous()
 
 
@@ -351,6 +388,9 @@ def prepare_transfuserpp_inputs(
     config,
     command_mode: str = "lane_follow",
     tfpp_camera: str = "front",
+    camera_crop_shift_x_px: float = 0.0,
+    camera_crop_shift_y_px: float = 0.0,
+    camera_crop_scale: float = 1.0,
     lidar_shift_x_m: float = 0.0,
     lidar_shift_y_m: float = 0.0,
     lidar_pixels_per_meter: float = 4.0,
@@ -364,7 +404,15 @@ def prepare_transfuserpp_inputs(
         pixels_per_meter=float(lidar_pixels_per_meter),
     )
     return {
-        "rgb": camera_to_transfuserpp_rgb(camera, cameras=cameras, config=config, tfpp_camera=tfpp_camera),
+        "rgb": camera_to_transfuserpp_rgb(
+            camera,
+            cameras=cameras,
+            config=config,
+            tfpp_camera=tfpp_camera,
+            crop_shift_x_px=float(camera_crop_shift_x_px),
+            crop_shift_y_px=float(camera_crop_shift_y_px),
+            crop_scale=float(camera_crop_scale),
+        ),
         "lidar_bev": lidar_bev,
         "target_point": target_point,
         "ego_vel": scalar[:, :1].contiguous(),

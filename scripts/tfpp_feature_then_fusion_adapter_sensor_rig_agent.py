@@ -94,6 +94,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
         self._rig_source, self._rig_layout = _load_layout()
         self._apply_sensor_rig()
         self._load_adapter()
+        self._setup_input_canonicalization()
         self._patch_backbones()
         self._setup_recording()
         self._setup_side_lidar_guard()
@@ -154,6 +155,28 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             self._stage_adapter_layers = {int(v) for v in raw_stage_layers}
         self._stage_adapter_modalities = str(metadata.get("stage_adapter_modalities", "all"))
         self._fusion_adapter_enabled = bool(metadata.get("fusion_adapter_enabled", True))
+        camera_crop = metadata.get("camera_canonical_crop", {})
+        self._camera_crop_shift_x_px = _env_float(
+            "TFPP_CAMERA_CROP_SHIFT_X_PX",
+            float(camera_crop.get("shift_x_px", 0.0) or 0.0),
+        )
+        self._camera_crop_shift_y_px = _env_float(
+            "TFPP_CAMERA_CROP_SHIFT_Y_PX",
+            float(camera_crop.get("shift_y_px", 0.0) or 0.0),
+        )
+        self._camera_crop_scale = _env_float(
+            "TFPP_CAMERA_CROP_SCALE",
+            float(camera_crop.get("scale", 1.0) or 1.0),
+        )
+        lidar_shift = metadata.get("lidar_canonical_shift_m", [0.0, 0.0])
+        if not isinstance(lidar_shift, (list, tuple)) or len(lidar_shift) < 2:
+            lidar_shift = [0.0, 0.0]
+        self._lidar_canonical_shift_x_m = _env_float("TFPP_LIDAR_CANONICAL_SHIFT_X_M", float(lidar_shift[0]))
+        self._lidar_canonical_shift_y_m = _env_float("TFPP_LIDAR_CANONICAL_SHIFT_Y_M", float(lidar_shift[1]))
+        self._lidar_pixels_per_meter = _env_float(
+            "TFPP_LIDAR_PIXELS_PER_METER",
+            float(metadata.get("lidar_pixels_per_meter", 4.0) or 4.0),
+        )
         self._extrinsic_aware = bool(metadata.get("extrinsic_aware", False)) or metadata.get("mode") == "transfuserpp_extrinsic_feature_then_fusion_adapter"
         if self._extrinsic_aware:
             extrinsic_vector = metadata.get("extrinsic_vector")
@@ -189,7 +212,130 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             f"stage_blend={self._stage_blend:.3f} fusion_blend={self._fusion_blend:.3f} "
             f"stage_layers={self._stage_adapter_layers if self._stage_adapter_layers is not None else 'all'} "
             f"stage_modalities={self._stage_adapter_modalities} fusion_enabled={self._fusion_adapter_enabled} "
+            f"camera_crop=({self._camera_crop_shift_x_px:.1f},{self._camera_crop_shift_y_px:.1f},"
+            f"{self._camera_crop_scale:.3f}) "
+            f"lidar_shift=({self._lidar_canonical_shift_x_m:.3f},{self._lidar_canonical_shift_y_m:.3f}) "
             f"missing={len(missing)} unexpected={len(unexpected)}",
+            flush=True,
+        )
+
+    @staticmethod
+    def _canonical_crop_array(config, image: np.ndarray, shift_x_px: float, shift_y_px: float, scale: float) -> np.ndarray:
+        if not getattr(config, "crop_image", True):
+            return image
+        crop_h = int(config.cropped_height)
+        crop_w = int(config.cropped_width)
+        if abs(float(scale) - 1.0) > 1e-6:
+            height, width = image.shape[:2]
+            scaled_h = max(1, int(round(height * float(scale))))
+            scaled_w = max(1, int(round(width * float(scale))))
+            image = cv2.resize(image, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+            pad_y = max(height - scaled_h, 0)
+            pad_x = max(width - scaled_w, 0)
+            if pad_y or pad_x:
+                image = cv2.copyMakeBorder(
+                    image,
+                    pad_y // 2,
+                    pad_y - pad_y // 2,
+                    pad_x // 2,
+                    pad_x - pad_x // 2,
+                    borderType=cv2.BORDER_CONSTANT,
+                    value=0,
+                )
+            if image.shape[0] > height or image.shape[1] > width:
+                y0 = max((image.shape[0] - height) // 2, 0)
+                x0 = max((image.shape[1] - width) // 2, 0)
+                image = image[y0 : y0 + height, x0 : x0 + width]
+        pad_y_margin = abs(int(round(float(shift_y_px)))) * 2
+        pad_x_margin = abs(int(round(float(shift_x_px)))) * 2
+        if pad_y_margin or pad_x_margin:
+            image = cv2.copyMakeBorder(
+                image,
+                pad_y_margin,
+                pad_y_margin,
+                pad_x_margin,
+                pad_x_margin,
+                borderType=cv2.BORDER_CONSTANT,
+                value=0,
+            )
+            origin_y = pad_y_margin
+            origin_x = pad_x_margin
+        else:
+            origin_y = 0
+            origin_x = 0
+        side_crop = max((image.shape[1] - crop_w) // 2, 0)
+        start_y = origin_y + int(round(float(shift_y_px)))
+        start_x = side_crop + int(round(float(shift_x_px)))
+        start_y = max(0, min(start_y, image.shape[0] - crop_h))
+        start_x = max(0, min(start_x, image.shape[1] - crop_w))
+        if image.ndim > 2:
+            return image[start_y : start_y + crop_h, start_x : start_x + crop_w, :]
+        return image[start_y : start_y + crop_h, start_x : start_x + crop_w]
+
+    @staticmethod
+    def _translate_lidar_histogram(histogram: np.ndarray, shift_x_m: float, shift_y_m: float, pixels_per_meter: float) -> np.ndarray:
+        shift_x_px = float(shift_x_m) * float(pixels_per_meter)
+        shift_y_px = float(shift_y_m) * float(pixels_per_meter)
+        if abs(shift_x_px) < 1e-6 and abs(shift_y_px) < 1e-6:
+            return histogram
+        channels_first = histogram.ndim == 3
+        if not channels_first:
+            return histogram
+        height, width = histogram.shape[-2:]
+        matrix = np.array([[1.0, 0.0, shift_x_px], [0.0, 1.0, shift_y_px]], dtype=np.float32)
+        warped = np.empty_like(histogram)
+        for channel in range(histogram.shape[0]):
+            warped[channel] = cv2.warpAffine(
+                histogram[channel],
+                matrix,
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        return warped
+
+    def _setup_input_canonicalization(self) -> None:
+        crop_enabled = (
+            abs(self._camera_crop_shift_x_px) > 1e-6
+            or abs(self._camera_crop_shift_y_px) > 1e-6
+            or abs(self._camera_crop_scale - 1.0) > 1e-6
+        )
+        if crop_enabled:
+            if not hasattr(t_u, "_teach2drive_original_crop_array"):
+                t_u._teach2drive_original_crop_array = t_u.crop_array
+
+            def canonical_crop(config, image, _self=self):
+                return _self._canonical_crop_array(
+                    config,
+                    image,
+                    _self._camera_crop_shift_x_px,
+                    _self._camera_crop_shift_y_px,
+                    _self._camera_crop_scale,
+                )
+
+            t_u.crop_array = canonical_crop
+        lidar_enabled = abs(self._lidar_canonical_shift_x_m) > 1e-6 or abs(self._lidar_canonical_shift_y_m) > 1e-6
+        if lidar_enabled:
+            original_lidar_to_histogram = self.data.lidar_to_histogram_features
+
+            def shifted_lidar_histogram(lidar, use_ground_plane, _original=original_lidar_to_histogram, _self=self):
+                histogram = _original(lidar, use_ground_plane)
+                return _self._translate_lidar_histogram(
+                    histogram,
+                    _self._lidar_canonical_shift_x_m,
+                    _self._lidar_canonical_shift_y_m,
+                    _self._lidar_pixels_per_meter,
+                )
+
+            self.data.lidar_to_histogram_features = shifted_lidar_histogram
+        print(
+            "[FeatureThenFusionAdapterSensorRigAgent] input_canonicalization "
+            f"camera_enabled={crop_enabled} "
+            f"camera_shift=({self._camera_crop_shift_x_px:.1f},{self._camera_crop_shift_y_px:.1f}) "
+            f"camera_scale={self._camera_crop_scale:.3f} "
+            f"lidar_enabled={lidar_enabled} "
+            f"lidar_shift=({self._lidar_canonical_shift_x_m:.3f},{self._lidar_canonical_shift_y_m:.3f})",
             flush=True,
         )
 

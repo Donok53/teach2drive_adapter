@@ -500,6 +500,9 @@ class _TaskAdapterForward(nn.Module):
         output_residual_speed_logit_scale: float = 1.5,
         output_residual_gate_bias: float = -2.0,
         output_residual_dropout: float = 0.0,
+        camera_crop_shift_x_px: float = 0.0,
+        camera_crop_shift_y_px: float = 0.0,
+        camera_crop_scale: float = 1.0,
         lidar_shift_x_m: float = 0.0,
         lidar_shift_y_m: float = 0.0,
         lidar_pixels_per_meter: float = 4.0,
@@ -518,6 +521,9 @@ class _TaskAdapterForward(nn.Module):
         self.stage_adapter_layers = stage_adapter_layers
         self.stage_adapter_modalities = str(stage_adapter_modalities)
         self.fusion_adapter_enabled = bool(fusion_adapter_enabled)
+        self.camera_crop_shift_x_px = float(camera_crop_shift_x_px)
+        self.camera_crop_shift_y_px = float(camera_crop_shift_y_px)
+        self.camera_crop_scale = float(camera_crop_scale)
         self.lidar_shift_x_m = float(lidar_shift_x_m)
         self.lidar_shift_y_m = float(lidar_shift_y_m)
         self.lidar_pixels_per_meter = float(lidar_pixels_per_meter)
@@ -614,6 +620,9 @@ class _TaskAdapterForward(nn.Module):
             config=self.config,
             command_mode=self.command_mode,
             tfpp_camera=self.tfpp_camera,
+            camera_crop_shift_x_px=self.camera_crop_shift_x_px,
+            camera_crop_shift_y_px=self.camera_crop_shift_y_px,
+            camera_crop_scale=self.camera_crop_scale,
             lidar_shift_x_m=self.lidar_shift_x_m,
             lidar_shift_y_m=self.lidar_shift_y_m,
             lidar_pixels_per_meter=self.lidar_pixels_per_meter,
@@ -681,6 +690,12 @@ def _infer_feature_shapes(net: nn.Module, config, loader: DataLoader, cameras: l
             config=config,
             command_mode=args.command_mode,
             tfpp_camera=args.tfpp_camera,
+            camera_crop_shift_x_px=float(args.camera_crop_shift_x_px),
+            camera_crop_shift_y_px=float(args.camera_crop_shift_y_px),
+            camera_crop_scale=float(args.camera_crop_scale),
+            lidar_shift_x_m=float(args.lidar_canonical_shift_x_m),
+            lidar_shift_y_m=float(args.lidar_canonical_shift_y_m),
+            lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
         )
         captured.clear()
         with torch.no_grad():
@@ -1245,6 +1260,9 @@ def train(args: argparse.Namespace) -> None:
         output_residual_speed_logit_scale=float(args.output_residual_speed_logit_scale),
         output_residual_gate_bias=float(args.output_residual_gate_bias),
         output_residual_dropout=float(args.output_residual_dropout),
+        camera_crop_shift_x_px=float(args.camera_crop_shift_x_px),
+        camera_crop_shift_y_px=float(args.camera_crop_shift_y_px),
+        camera_crop_scale=float(args.camera_crop_scale),
         lidar_shift_x_m=float(args.lidar_canonical_shift_x_m),
         lidar_shift_y_m=float(args.lidar_canonical_shift_y_m),
         lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
@@ -1305,6 +1323,11 @@ def train(args: argparse.Namespace) -> None:
         "tfpp_camera": args.tfpp_camera,
         "command_mode": args.command_mode,
         "image_size": list(args.image_size),
+        "camera_canonical_crop": {
+            "shift_x_px": float(args.camera_crop_shift_x_px),
+            "shift_y_px": float(args.camera_crop_shift_y_px),
+            "scale": float(args.camera_crop_scale),
+        },
         "lidar_size": int(args.lidar_size),
         "lidar_canonical_shift_m": [float(args.lidar_canonical_shift_x_m), float(args.lidar_canonical_shift_y_m)],
         "lidar_pixels_per_meter": float(args.lidar_pixels_per_meter),
@@ -1349,6 +1372,7 @@ def train(args: argparse.Namespace) -> None:
                 "peft_lora_modules": peft_lora_modules,
                 "unfrozen_tfpp_count": len(unfrozen_tfpp_params),
                 "unfrozen_tfpp_preview": unfrozen_tfpp_params[:20],
+                "camera_canonical_crop": metadata["camera_canonical_crop"],
                 "lidar_canonical_shift_m": metadata["lidar_canonical_shift_m"],
                 "data_parallel": metadata["data_parallel"],
             },
@@ -1476,6 +1500,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tfpp-camera", default="front")
     parser.add_argument("--command-mode", choices=["lane_follow", "target_angle"], default="target_angle")
     parser.add_argument("--image-size", type=int, nargs=2, default=[640, 360], metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--camera-crop-shift-x-px", type=float, default=0.0)
+    parser.add_argument("--camera-crop-shift-y-px", type=float, default=0.0)
+    parser.add_argument("--camera-crop-scale", type=float, default=1.0)
     parser.add_argument("--lidar-size", type=int, default=128)
     parser.add_argument("--extrinsic-aware", action="store_true")
     parser.add_argument("--source-profile", default="front_triplet_shifted", choices=["front_triplet_shifted", "tfpp_ego"])

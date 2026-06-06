@@ -45,6 +45,9 @@ export SEED=${SEED:-41}
 
 export IMAGE_WIDTH=${IMAGE_WIDTH:-640}
 export IMAGE_HEIGHT=${IMAGE_HEIGHT:-360}
+export CAMERA_CROP_SHIFT_X_PX=${CAMERA_CROP_SHIFT_X_PX:-0.0}
+export CAMERA_CROP_SHIFT_Y_PX=${CAMERA_CROP_SHIFT_Y_PX:-0.0}
+export CAMERA_CROP_SCALE=${CAMERA_CROP_SCALE:-1.0}
 export LIDAR_SIZE=${LIDAR_SIZE:-128}
 export EPOCHS=${EPOCHS:-20}
 export EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-6}
@@ -284,6 +287,9 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --tfpp-camera front \
   --command-mode target_angle \
   --image-size "$IMAGE_WIDTH" "$IMAGE_HEIGHT" \
+  --camera-crop-shift-x-px "$CAMERA_CROP_SHIFT_X_PX" \
+  --camera-crop-shift-y-px "$CAMERA_CROP_SHIFT_Y_PX" \
+  --camera-crop-scale "$CAMERA_CROP_SCALE" \
   --lidar-size "$LIDAR_SIZE" \
   --source-profile "$SOURCE_PROFILE" \
   --extrinsic-hidden-dim "$EXTRINSIC_HIDDEN_DIM" \
