@@ -1381,6 +1381,11 @@ def train(args: argparse.Namespace) -> None:
     optimizer = torch.optim.AdamW(param_groups)
     args._trainable_anchor_state = _capture_trainable_anchor(model, float(args.init_param_anchor_loss_weight))
 
+    metadata_args = {
+        key: value
+        for key, value in vars(args).items()
+        if not key.startswith("_")
+    }
     metadata = {
         "mode": "transfuserpp_extrinsic_task_feature_then_fusion_adapter" if args.extrinsic_aware else "transfuserpp_task_feature_then_fusion_adapter",
         "index": str(Path(args.index).expanduser()),
@@ -1447,7 +1452,7 @@ def train(args: argparse.Namespace) -> None:
         "train_samples": int(len(train_ds)),
         "val_samples": int(len(val_ds)),
         "data_parallel": bool(args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1),
-        "args": vars(args),
+        "args": metadata_args,
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(
