@@ -94,7 +94,15 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
             checkpoint_scale=float(residual_meta.get("checkpoint_scale", 0.75)),
             speed_logit_scale=float(residual_meta.get("speed_logit_scale", 1.5)),
             gate_bias=float(residual_meta.get("gate_bias", -2.0)),
-            dropout=0.0,
+            gate_max=float(residual_meta.get("gate_max", 1.0)),
+            dropout=float(residual_meta.get("dropout", 0.0)),
+            controller_residual=bool(residual_meta.get("controller_residual", False)),
+            controller_lateral_scale=float(residual_meta.get("controller_lateral_scale", 1.0)),
+            controller_progress_scale=float(residual_meta.get("controller_progress_scale", 1.0)),
+            controller_speed_logit_scale=float(residual_meta.get("controller_speed_logit_scale", 2.0)),
+            controller_gate_bias=float(residual_meta.get("controller_gate_bias", -2.0)),
+            controller_gate_max=float(residual_meta.get("controller_gate_max", 1.0)),
+            speed_class_values=residual_meta.get("speed_class_values"),
         ).to(self.device)
         missing, unexpected = self._output_residual_head.load_state_dict(residual_state, strict=False)
         self._output_residual_head.eval()
@@ -103,7 +111,9 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
             "[FeatureThenFusionPeftAdapterSensorRigAgent] output_residual=on "
             f"missing={len(missing)} unexpected={len(unexpected)} "
             f"checkpoint_scale={float(residual_meta.get('checkpoint_scale', 0.75)):.3f} "
-            f"speed_logit_scale={float(residual_meta.get('speed_logit_scale', 1.5)):.3f}",
+            f"speed_logit_scale={float(residual_meta.get('speed_logit_scale', 1.5)):.3f} "
+            f"gate_max={float(residual_meta.get('gate_max', 1.0)):.3f} "
+            f"controller={int(bool(residual_meta.get('controller_residual', False)))}",
             flush=True,
         )
 

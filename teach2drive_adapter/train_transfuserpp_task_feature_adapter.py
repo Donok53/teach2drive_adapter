@@ -87,7 +87,7 @@ def _unfreeze_matching_tfpp_parameters(net: nn.Module, include: str, exclude: st
     return unfrozen
 
 
-def _hazard_reason_mask(stop_reason: torch.Tensor, names: str) -> torch.Tensor:
+def _hazard_reason_mask(stop_reason: torch.Tensor, names: str, stop_reason_mask: torch.Tensor | None = None) -> torch.Tensor:
     ids = []
     for name in names.split(","):
         name = name.strip()
@@ -98,7 +98,11 @@ def _hazard_reason_mask(stop_reason: torch.Tensor, names: str) -> torch.Tensor:
     mask = torch.zeros_like(stop_reason, dtype=torch.bool)
     for idx in ids:
         mask = mask | (stop_reason == int(idx))
-    return mask.reshape(-1).bool()
+    mask = mask.reshape(-1).bool()
+    if stop_reason_mask is not None:
+        active = _per_sample_vector(stop_reason_mask, int(mask.numel())) > 0.5
+        mask = mask & active
+    return mask
 
 
 def _reason_mask(stop_reason: torch.Tensor, stop_reason_mask: torch.Tensor, name: str) -> torch.Tensor:
@@ -122,6 +126,92 @@ def _miss_rate(metrics: dict[str, float], name: str, weight: float) -> float:
     return float(weight) * max(0.0, 1.0 - float(metrics.get(name, 0.0)))
 
 
+def _reason_list(raw: str) -> list[str]:
+    return [item.strip() for item in str(raw).split(",") if item.strip()]
+
+
+def _split_indices(args) -> tuple[np.ndarray, np.ndarray, dict]:
+    if str(args.split_mode) == "episode":
+        train_indices, val_indices = split_by_episode(args.index, val_ratio=float(args.val_ratio), seed=int(args.seed))
+        return train_indices, val_indices, {
+            "mode": "episode",
+            "val_ratio": float(args.val_ratio),
+            "seed": int(args.seed),
+        }
+
+    arrays = np.load(Path(args.index).expanduser(), allow_pickle=True)
+    sample_episode = arrays["sample_episode_indices"].astype(np.int64)
+    stop_reason = arrays["stop_reason_targets"].astype(np.int64) if "stop_reason_targets" in arrays.files else np.zeros(len(sample_episode), dtype=np.int64)
+    stop_reason_mask = (
+        arrays["stop_reason_masks"].astype(np.float32).reshape(-1) > 0.5
+        if "stop_reason_masks" in arrays.files
+        else np.zeros(len(sample_episode), dtype=bool)
+    )
+    episodes = np.unique(sample_episode)
+    rng = np.random.default_rng(int(args.seed))
+    shuffled = np.array(episodes, copy=True)
+    rng.shuffle(shuffled)
+    val_count = max(1, int(round(len(episodes) * float(args.val_ratio))))
+
+    required_names = _reason_list(args.val_required_stop_reasons)
+    if not required_names:
+        required_names = _reason_list(args.hazard_stop_reasons)
+    required_ids = [STOP_REASON_NAMES.index(name) for name in required_names if name in STOP_REASON_NAMES]
+    min_reason_samples = max(1, int(args.val_min_reason_samples))
+
+    selected: set[int] = set()
+    per_episode_reason_counts: dict[int, dict[int, int]] = {}
+    for episode in episodes:
+        episode_mask = sample_episode == int(episode)
+        per_episode_reason_counts[int(episode)] = {
+            reason_id: int(np.sum(episode_mask & stop_reason_mask & (stop_reason == int(reason_id))))
+            for reason_id in required_ids
+        }
+
+    reason_totals = {
+        reason_id: int(np.sum(stop_reason_mask & (stop_reason == int(reason_id))))
+        for reason_id in required_ids
+    }
+    for reason_id in sorted(required_ids, key=lambda value: reason_totals.get(value, 0)):
+        if reason_totals.get(reason_id, 0) <= 0:
+            continue
+        while sum(per_episode_reason_counts[episode].get(reason_id, 0) for episode in selected) < min_reason_samples:
+            candidates = [int(ep) for ep in shuffled if int(ep) not in selected]
+            if not candidates:
+                break
+            best_count = max(per_episode_reason_counts[ep].get(reason_id, 0) for ep in candidates)
+            if best_count <= 0:
+                break
+            best_candidates = [ep for ep in candidates if per_episode_reason_counts[ep].get(reason_id, 0) == best_count]
+            selected.add(int(rng.choice(best_candidates)))
+
+    for episode in shuffled:
+        if len(selected) >= val_count:
+            break
+        selected.add(int(episode))
+
+    val_episode_set = set(int(ep) for ep in selected)
+    val_mask = np.asarray([int(ep) in val_episode_set for ep in sample_episode], dtype=bool)
+    all_indices = np.arange(len(sample_episode), dtype=np.int64)
+    train_indices = all_indices[~val_mask]
+    val_indices = all_indices[val_mask]
+    val_reason_counts = {
+        STOP_REASON_NAMES[reason_id]: int(np.sum(val_mask & stop_reason_mask & (stop_reason == int(reason_id))))
+        for reason_id in required_ids
+    }
+    return train_indices, val_indices, {
+        "mode": "reason_coverage",
+        "val_ratio": float(args.val_ratio),
+        "seed": int(args.seed),
+        "val_episode_count": int(len(val_episode_set)),
+        "val_episodes": sorted(int(ep) for ep in val_episode_set),
+        "required_stop_reasons": [STOP_REASON_NAMES[reason_id] for reason_id in required_ids],
+        "min_reason_samples": int(min_reason_samples),
+        "reason_totals": {STOP_REASON_NAMES[reason_id]: int(reason_totals.get(reason_id, 0)) for reason_id in required_ids},
+        "val_reason_counts": val_reason_counts,
+    }
+
+
 def _controller_proxy_losses(
     pred_traj: torch.Tensor,
     pred_speed: torch.Tensor,
@@ -141,6 +231,12 @@ def _controller_proxy_losses(
         "plan_steer_error": zero,
         "plan_throttle_error": zero,
         "plan_brake_error": zero,
+        "plan_go_hinge": zero,
+        "plan_throttle_close_hinge": zero,
+        "plan_brake_soft_miss": zero,
+        "plan_go_soft_miss": zero,
+        "plan_steer_close_soft_miss": zero,
+        "plan_throttle_close_soft_miss": zero,
     }
     for name in ("plan_brake_recall", "plan_go_recall", "plan_steer_close", "plan_throttle_close"):
         metrics[f"{name}_num"] = zero
@@ -185,6 +281,18 @@ def _controller_proxy_losses(
     pred_brake = pred_brake_bool.to(dtype=torch.float32)
     pred_throttle = ((desired_speed - current_speed) / max(float(args.speed_floor_mps), 1e-3)).clamp(0.0, 1.0)
     pred_throttle = pred_throttle * (1.0 - pred_brake)
+    soft_stop_prob = torch.sigmoid(pred_stop_logit / max(float(args.controller_soft_stop_temperature), 1e-3))
+    soft_throttle = ((desired_speed - current_speed) / max(float(args.speed_floor_mps), 1e-3)).clamp(0.0, 1.0)
+    soft_throttle = soft_throttle * (1.0 - soft_stop_prob)
+    temp = max(float(getattr(args, "safe_ctrl_surrogate_temperature", 0.25)), 1e-3)
+    soft_brake_correct = soft_stop_prob
+    soft_go_correct = (1.0 - soft_stop_prob) * torch.sigmoid(
+        (soft_throttle - float(args.controller_go_throttle_threshold)) / temp
+    )
+    soft_steer_close = torch.sigmoid((float(args.controller_steer_close_threshold) - (pred_steer - expert_steer).abs()) / temp)
+    soft_throttle_close = torch.sigmoid(
+        (float(args.controller_throttle_close_threshold) - (soft_throttle - expert_throttle).abs()) / temp
+    )
 
     active_weight = effective_weight * control_active_f
     steer_raw = nn.functional.smooth_l1_loss(pred_steer, expert_steer, reduction="none")
@@ -201,12 +309,135 @@ def _controller_proxy_losses(
 
     expert_brake_active = control_active & (expert_brake >= 0.5)
     expert_go_active = control_active & (expert_brake < 0.5) & (expert_throttle >= float(args.controller_go_throttle_threshold))
+    expert_go_f = expert_go_active.to(dtype=torch.float32)
+    go_target = float(args.controller_go_throttle_threshold) + float(args.controller_go_hinge_margin)
+    go_hinge_raw = torch.relu(go_target - soft_throttle) + soft_stop_prob
+    throttle_close_hinge_raw = torch.relu(
+        (soft_throttle - expert_throttle).abs() - float(args.controller_throttle_close_threshold)
+    )
+    metrics["plan_go_hinge"] = _weighted_mean(go_hinge_raw * expert_go_f, active_weight)
+    metrics["plan_throttle_close_hinge"] = _weighted_mean(throttle_close_hinge_raw, active_weight)
     steer_close = (pred_steer - expert_steer).abs() <= float(args.controller_steer_close_threshold)
     throttle_close = (pred_throttle - expert_throttle).abs() <= float(args.controller_throttle_close_threshold)
+    metrics["plan_brake_soft_miss"] = _weighted_mean(
+        (1.0 - soft_brake_correct) * expert_brake_active.to(dtype=torch.float32),
+        active_weight,
+    )
+    metrics["plan_go_soft_miss"] = _weighted_mean((1.0 - soft_go_correct) * expert_go_f, active_weight)
+    metrics["plan_steer_close_soft_miss"] = _weighted_mean((1.0 - soft_steer_close) * control_active_f, active_weight)
+    metrics["plan_throttle_close_soft_miss"] = _weighted_mean((1.0 - soft_throttle_close) * control_active_f, active_weight)
     _count_pair(metrics, "plan_brake_recall", pred_brake_bool, expert_brake_active)
     _count_pair(metrics, "plan_go_recall", ~pred_brake_bool & (pred_throttle >= float(args.controller_go_throttle_threshold)), expert_go_active)
     _count_pair(metrics, "plan_steer_close", steer_close, control_active)
     _count_pair(metrics, "plan_throttle_close", throttle_close, control_active)
+    return metrics
+
+
+def _closed_loop_unroll_losses(
+    pred_traj: torch.Tensor,
+    pred_speed: torch.Tensor,
+    target_traj: torch.Tensor,
+    target_speed: torch.Tensor,
+    stop_active: torch.Tensor,
+    go_active: torch.Tensor,
+    hazard_active: torch.Tensor,
+    effective_weight: torch.Tensor,
+    args,
+) -> dict[str, torch.Tensor]:
+    """Differentiable lightweight rollout proxy for controller-facing outputs."""
+
+    device = pred_traj.device
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    metrics = {
+        "unroll_proxy": zero,
+        "unroll_path_error": zero,
+        "unroll_lateral_error": zero,
+        "unroll_progress_error": zero,
+        "unroll_stop_error": zero,
+        "unroll_go_error": zero,
+        "unroll_hazard_error": zero,
+    }
+    steps = min(int(args.closed_loop_unroll_steps), int(pred_traj.shape[1]), int(target_traj.shape[1]))
+    if steps <= 0:
+        return metrics
+
+    dt = max(float(args.closed_loop_unroll_dt), 1e-3)
+    steer_gain = float(args.closed_loop_unroll_steer_gain)
+    max_speed = max(float(args.closed_loop_unroll_max_speed_mps), 1e-3)
+    pred_speed_cmd = pred_speed.clamp_min(0.0).mean(dim=1).clamp(max=max_speed)
+    target_speed_cmd = target_speed.clamp_min(0.0).mean(dim=1).clamp(max=max_speed)
+    rollout_speed = pred_speed_cmd
+    if float(args.closed_loop_unroll_target_speed_blend) > 0.0:
+        blend = min(max(float(args.closed_loop_unroll_target_speed_blend), 0.0), 1.0)
+        rollout_speed = (1.0 - blend) * pred_speed_cmd + blend * target_speed_cmd.detach()
+
+    x = torch.zeros_like(rollout_speed)
+    y = torch.zeros_like(rollout_speed)
+    heading = torch.zeros_like(rollout_speed)
+    points = []
+    for idx in range(steps):
+        waypoint = pred_traj[:, idx, :2]
+        dx = waypoint[:, 0] - x
+        dy = waypoint[:, 1] - y
+        cos_h = torch.cos(heading)
+        sin_h = torch.sin(heading)
+        local_x = cos_h * dx + sin_h * dy
+        local_y = -sin_h * dx + cos_h * dy
+        steer = torch.atan2(local_y, torch.clamp(local_x, min=0.25)) / (0.5 * torch.pi)
+        steer = steer.clamp(-1.0, 1.0)
+        speed_scale = 0.25 + rollout_speed / torch.clamp(rollout_speed + 2.0, min=1e-3)
+        heading = heading + steer * steer_gain * dt * speed_scale
+        x = x + rollout_speed * dt * torch.cos(heading)
+        y = y + rollout_speed * dt * torch.sin(heading)
+        points.append(torch.stack([x, y], dim=1))
+
+    rollout_xy = torch.stack(points, dim=1)
+    target_xy = target_traj[:, :steps, :2]
+    unroll_path_error = _weighted_mean(
+        torch.mean(nn.functional.smooth_l1_loss(rollout_xy, target_xy, reduction="none"), dim=(1, 2)),
+        effective_weight,
+    )
+
+    final_xy = rollout_xy[:, -1, :]
+    target_final_xy = target_xy[:, -1, :]
+    target_progress = torch.linalg.norm(target_final_xy, dim=1)
+    unit_target = target_final_xy / torch.clamp(target_progress[:, None], min=1e-6)
+    rollout_progress = torch.sum(final_xy * unit_target, dim=1)
+    rollout_lateral = final_xy - rollout_progress[:, None] * unit_target
+    unroll_lateral_error = _weighted_mean(torch.linalg.norm(rollout_lateral, dim=1), effective_weight)
+    unroll_progress_error = _weighted_mean(
+        nn.functional.smooth_l1_loss(rollout_progress, target_progress, reduction="none"),
+        effective_weight,
+    )
+
+    displacement = torch.linalg.norm(final_xy, dim=1)
+    stop_f = stop_active.reshape(-1).to(dtype=torch.float32)
+    go_f = go_active.reshape(-1).to(dtype=torch.float32)
+    hazard_f = hazard_active.reshape(-1).to(dtype=torch.float32)
+    stop_limit = float(args.stop_progress_ceiling_m)
+    go_target = target_progress * float(args.go_progress_ratio)
+    unroll_stop_error = _weighted_mean(torch.relu(displacement - stop_limit) * stop_f, effective_weight)
+    unroll_hazard_error = _weighted_mean(torch.relu(displacement - stop_limit) * hazard_f, effective_weight)
+    unroll_go_error = _weighted_mean(torch.relu(go_target - rollout_progress) * go_f, effective_weight)
+    unroll_proxy = (
+        unroll_path_error
+        + 0.50 * unroll_lateral_error
+        + 0.35 * unroll_progress_error
+        + 1.50 * unroll_stop_error
+        + 1.00 * unroll_go_error
+        + 2.00 * unroll_hazard_error
+    )
+    metrics.update(
+        {
+            "unroll_proxy": unroll_proxy,
+            "unroll_path_error": unroll_path_error,
+            "unroll_lateral_error": unroll_lateral_error,
+            "unroll_progress_error": unroll_progress_error,
+            "unroll_stop_error": unroll_stop_error,
+            "unroll_go_error": unroll_go_error,
+            "unroll_hazard_error": unroll_hazard_error,
+        }
+    )
     return metrics
 
 
@@ -388,7 +619,15 @@ class GatedOutputResidualHead(nn.Module):
         checkpoint_scale: float,
         speed_logit_scale: float,
         gate_bias: float = -2.0,
+        gate_max: float = 1.0,
         dropout: float = 0.0,
+        controller_residual: bool = False,
+        controller_lateral_scale: float = 1.0,
+        controller_progress_scale: float = 1.0,
+        controller_speed_logit_scale: float = 2.0,
+        controller_gate_bias: float = -2.0,
+        controller_gate_max: float = 1.0,
+        speed_class_values: list[float] | tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         self.fused_channels = int(fused_channels)
@@ -396,6 +635,12 @@ class GatedOutputResidualHead(nn.Module):
         self.speed_classes = int(speed_classes)
         self.checkpoint_scale = float(checkpoint_scale)
         self.speed_logit_scale = float(speed_logit_scale)
+        self.gate_max = float(gate_max)
+        self.controller_residual = bool(controller_residual)
+        self.controller_lateral_scale = float(controller_lateral_scale)
+        self.controller_progress_scale = float(controller_progress_scale)
+        self.controller_speed_logit_scale = float(controller_speed_logit_scale)
+        self.controller_gate_max = float(controller_gate_max)
         input_dim = self.fused_channels + self.checkpoint_dim + self.speed_classes
         hidden = int(hidden_dim) if int(hidden_dim) > 0 else max(128, input_dim // 2)
         self.trunk = nn.Sequential(
@@ -409,12 +654,31 @@ class GatedOutputResidualHead(nn.Module):
         self.checkpoint_delta = nn.Linear(hidden, self.checkpoint_dim)
         self.speed_delta = nn.Linear(hidden, self.speed_classes)
         self.gate = nn.Linear(hidden, 2)
+        if self.controller_residual:
+            self.controller = nn.Linear(hidden, 3)
+            self.controller_gate = nn.Linear(hidden, 3)
+        else:
+            self.controller = None
+            self.controller_gate = None
+        if speed_class_values is not None and len(speed_class_values) == self.speed_classes:
+            values = torch.tensor([float(v) for v in speed_class_values], dtype=torch.float32)
+        elif self.speed_classes > 1:
+            values = torch.linspace(0.0, 1.0, self.speed_classes, dtype=torch.float32)
+        else:
+            values = torch.zeros((self.speed_classes,), dtype=torch.float32)
+        self.register_buffer("speed_class_values", values, persistent=False)
         nn.init.zeros_(self.checkpoint_delta.weight)
         nn.init.zeros_(self.checkpoint_delta.bias)
         nn.init.zeros_(self.speed_delta.weight)
         nn.init.zeros_(self.speed_delta.bias)
         nn.init.zeros_(self.gate.weight)
         nn.init.constant_(self.gate.bias, float(gate_bias))
+        if self.controller is not None and self.controller_gate is not None:
+            nn.init.zeros_(self.controller.weight)
+            with torch.no_grad():
+                self.controller.bias.copy_(torch.tensor([0.0, -4.0, -4.0], dtype=self.controller.bias.dtype))
+            nn.init.zeros_(self.controller_gate.weight)
+            nn.init.constant_(self.controller_gate.bias, float(controller_gate_bias))
 
     @staticmethod
     def _pool_fused(fused: torch.Tensor) -> torch.Tensor:
@@ -436,6 +700,42 @@ class GatedOutputResidualHead(nn.Module):
         pad = torch.zeros((x.shape[0], width - x.shape[1]), dtype=x.dtype, device=x.device)
         return torch.cat([x, pad], dim=1)
 
+    def _controller_checkpoint_delta(self, control: torch.Tensor) -> torch.Tensor:
+        pair_count = self.checkpoint_dim // 2
+        if pair_count <= 0:
+            return torch.zeros((control.shape[0], self.checkpoint_dim), dtype=control.dtype, device=control.device)
+        horizon = torch.linspace(
+            1.0 / float(pair_count),
+            1.0,
+            pair_count,
+            dtype=control.dtype,
+            device=control.device,
+        )
+        profile = horizon.square()[None, :]
+        steer = control[:, 0:1]
+        drive = control[:, 1:2] - control[:, 2:3]
+        x_delta = drive * float(self.controller_progress_scale) * profile
+        y_delta = steer * float(self.controller_lateral_scale) * profile
+        delta = torch.stack((x_delta, y_delta), dim=-1).reshape(control.shape[0], pair_count * 2)
+        if delta.shape[1] < self.checkpoint_dim:
+            pad = torch.zeros((control.shape[0], self.checkpoint_dim - delta.shape[1]), dtype=control.dtype, device=control.device)
+            delta = torch.cat([delta, pad], dim=1)
+        return delta
+
+    def _controller_speed_delta(self, control: torch.Tensor) -> torch.Tensor:
+        if self.speed_classes <= 0:
+            return torch.zeros((control.shape[0], 0), dtype=control.dtype, device=control.device)
+        values = self.speed_class_values.to(device=control.device, dtype=control.dtype)
+        if values.numel() != self.speed_classes:
+            values = torch.linspace(0.0, 1.0, self.speed_classes, dtype=control.dtype, device=control.device)
+        span = torch.clamp(values.max() - values.min(), min=torch.tensor(1e-6, dtype=control.dtype, device=control.device))
+        speed_norm = (values - values.min()) / span
+        go_shape = 2.0 * speed_norm - 1.0
+        stop_shape = 1.0 - 2.0 * speed_norm
+        throttle = control[:, 1:2]
+        brake = control[:, 2:3]
+        return float(self.controller_speed_logit_scale) * (throttle * go_shape[None, :] + brake * stop_shape[None, :])
+
     def forward(
         self,
         fused: torch.Tensor,
@@ -456,9 +756,42 @@ class GatedOutputResidualHead(nn.Module):
             speed_logits = self._pad_or_trim(pred_target_speed.float(), self.speed_classes)
 
         hidden = self.trunk(torch.cat([pooled, checkpoint_flat, speed_logits], dim=1))
-        gates = torch.sigmoid(self.gate(hidden))
+        gates = torch.sigmoid(self.gate(hidden)) * float(self.gate_max)
         checkpoint_delta = torch.tanh(self.checkpoint_delta(hidden)) * float(self.checkpoint_scale) * gates[:, :1]
         speed_delta = torch.tanh(self.speed_delta(hidden)) * float(self.speed_logit_scale) * gates[:, 1:2]
+        controller_stats: dict[str, torch.Tensor] = {}
+        if self.controller is not None and self.controller_gate is not None:
+            controller_raw = self.controller(hidden)
+            controller_gates = torch.sigmoid(self.controller_gate(hidden)) * float(self.controller_gate_max)
+            drive_gate = controller_gates[:, 1:3].mean(dim=1)
+            drive_probs = torch.softmax(
+                torch.stack(
+                    (
+                        controller_raw[:, 1],
+                        controller_raw[:, 2],
+                        torch.zeros_like(controller_raw[:, 1]),
+                    ),
+                    dim=1,
+                ),
+                dim=1,
+            )
+            direct_control = torch.stack(
+                (
+                    torch.tanh(controller_raw[:, 0]) * controller_gates[:, 0],
+                    drive_probs[:, 0] * drive_gate,
+                    drive_probs[:, 1] * drive_gate,
+                ),
+                dim=1,
+            )
+            checkpoint_delta = checkpoint_delta + self._controller_checkpoint_delta(direct_control)
+            speed_delta = speed_delta + self._controller_speed_delta(direct_control)
+            controller_stats = {
+                "output_residual_direct_control": direct_control,
+                "output_residual_controller_gate": controller_gates.mean(),
+                "output_residual_controller_steer_abs": direct_control[:, 0].abs().mean(),
+                "output_residual_controller_throttle": direct_control[:, 1].mean(),
+                "output_residual_controller_brake": direct_control[:, 2].mean(),
+            }
 
         adapted_checkpoint = None
         if pred_checkpoint is not None and checkpoint_shape is not None:
@@ -474,7 +807,12 @@ class GatedOutputResidualHead(nn.Module):
             "output_residual_speed_gate": gates[:, 1].mean(),
             "output_residual_checkpoint_norm": checkpoint_delta.abs().mean(),
             "output_residual_speed_norm": speed_delta.abs().mean(),
+            "output_residual_controller_gate": torch.zeros((), dtype=pooled.dtype, device=pooled.device),
+            "output_residual_controller_steer_abs": torch.zeros((), dtype=pooled.dtype, device=pooled.device),
+            "output_residual_controller_throttle": torch.zeros((), dtype=pooled.dtype, device=pooled.device),
+            "output_residual_controller_brake": torch.zeros((), dtype=pooled.dtype, device=pooled.device),
         }
+        stats.update(controller_stats)
         return adapted_checkpoint, adapted_speed, stats
 
 
@@ -505,7 +843,15 @@ class _TaskAdapterForward(nn.Module):
         output_residual_checkpoint_scale: float = 0.75,
         output_residual_speed_logit_scale: float = 1.5,
         output_residual_gate_bias: float = -2.0,
+        output_residual_gate_max: float = 1.0,
         output_residual_dropout: float = 0.0,
+        output_residual_controller: bool = False,
+        output_residual_controller_lateral_scale: float = 1.0,
+        output_residual_controller_progress_scale: float = 1.0,
+        output_residual_controller_speed_logit_scale: float = 2.0,
+        output_residual_controller_gate_bias: float = -2.0,
+        output_residual_controller_gate_max: float = 1.0,
+        freeze_task_adapter: bool = False,
         camera_crop_shift_x_px: float = 0.0,
         camera_crop_shift_y_px: float = 0.0,
         camera_crop_scale: float = 1.0,
@@ -531,6 +877,7 @@ class _TaskAdapterForward(nn.Module):
         self.stage_adapter_layers = stage_adapter_layers
         self.stage_adapter_modalities = str(stage_adapter_modalities)
         self.fusion_adapter_enabled = bool(fusion_adapter_enabled)
+        self.freeze_task_adapter = bool(freeze_task_adapter)
         self.camera_crop_shift_x_px = float(camera_crop_shift_x_px)
         self.camera_crop_shift_y_px = float(camera_crop_shift_y_px)
         self.camera_crop_scale = float(camera_crop_scale)
@@ -548,6 +895,7 @@ class _TaskAdapterForward(nn.Module):
         self.control_head = _AuxHead(fused_channels, 3, int(aux_hidden_dim)) if use_control_aux else None
         checkpoint_len = int(getattr(config, "predict_checkpoint_len", 10) or 10)
         speed_classes = len(getattr(config, "target_speeds", [])) or 1
+        target_speeds = [float(v) for v in getattr(config, "target_speeds", [])]
         self.output_residual_head = (
             GatedOutputResidualHead(
                 fused_channels=fused_channels,
@@ -557,7 +905,15 @@ class _TaskAdapterForward(nn.Module):
                 checkpoint_scale=float(output_residual_checkpoint_scale),
                 speed_logit_scale=float(output_residual_speed_logit_scale),
                 gate_bias=float(output_residual_gate_bias),
+                gate_max=float(output_residual_gate_max),
                 dropout=float(output_residual_dropout),
+                controller_residual=bool(output_residual_controller),
+                controller_lateral_scale=float(output_residual_controller_lateral_scale),
+                controller_progress_scale=float(output_residual_controller_progress_scale),
+                controller_speed_logit_scale=float(output_residual_controller_speed_logit_scale),
+                controller_gate_bias=float(output_residual_controller_gate_bias),
+                controller_gate_max=float(output_residual_controller_gate_max),
+                speed_class_values=target_speeds,
             )
             if use_output_residual
             else None
@@ -565,11 +921,11 @@ class _TaskAdapterForward(nn.Module):
 
     def set_runtime_mode(self, train: bool) -> None:
         self.net.eval()
-        self.adapter.train(train)
+        self.adapter.train(train and not self.freeze_task_adapter)
         for head in (self.stop_state_head, self.stop_reason_head, self.control_head, self.output_residual_head):
             if head is not None:
                 head.train(train)
-        set_lora_train_mode(self.net, train)
+        set_lora_train_mode(self.net, train and not self.freeze_task_adapter)
         if train:
             for module in self.net.modules():
                 if isinstance(module, nn.modules.rnn.RNNBase):
@@ -767,7 +1123,11 @@ def _losses(
     moving = _moving_mask(scalar, target, speed_dim, float(args.moving_speed_threshold))
     launch = _launch_mask(scalar, target_speed, float(args.launch_current_speed_threshold), float(args.launch_target_speed_threshold))
     release = _release_mask(stop_state, target_speed, float(args.release_target_speed_threshold))
-    hazard = _hazard_reason_mask(stop_reason, args.hazard_stop_reasons)
+    hazard = _hazard_reason_mask(stop_reason, args.hazard_stop_reasons, stop_reason_mask)
+    traffic_light_active = _reason_mask(stop_reason, stop_reason_mask, "traffic_light").to(device=device)
+    stop_sign_active = _reason_mask(stop_reason, stop_reason_mask, "stop_sign").to(device=device)
+    front_vehicle_active = _reason_mask(stop_reason, stop_reason_mask, "front_vehicle").to(device=device)
+    junction_yield_active = _reason_mask(stop_reason, stop_reason_mask, "junction_yield").to(device=device)
 
     effective_weight = _per_sample_vector(weight, int(target.shape[0]))
     effective_weight = effective_weight * torch.where(
@@ -780,6 +1140,18 @@ def _losses(
         torch.full_like(effective_weight, float(args.hazard_sample_weight)),
         torch.ones_like(effective_weight),
     )
+    for reason_active, reason_weight in (
+        (traffic_light_active, float(args.trafficlight_sample_weight)),
+        (stop_sign_active, float(args.stopsign_sample_weight)),
+        (front_vehicle_active, float(args.frontvehicle_sample_weight)),
+        (junction_yield_active, float(args.junctionyield_sample_weight)),
+    ):
+        if reason_weight != 1.0:
+            effective_weight = effective_weight * torch.where(
+                reason_active.reshape(-1).bool(),
+                torch.full_like(effective_weight, reason_weight),
+                torch.ones_like(effective_weight),
+            )
     effective_weight = effective_weight * torch.where(
         launch,
         torch.full_like(effective_weight, float(args.launch_sample_weight)),
@@ -867,9 +1239,31 @@ def _losses(
     progress_error_raw = nn.functional.smooth_l1_loss(pred_progress, target_progress, reduction="none")
     progress_error = _weighted_mean(progress_error_raw, effective_weight)
     go_progress_ok = pred_progress >= (target_progress * float(args.go_progress_ratio))
+    go_progress_hinge = _weighted_mean(
+        torch.relu(target_progress * float(args.go_progress_ratio) - pred_progress)
+        * go_active.to(dtype=pred_speed.dtype),
+        effective_weight,
+    )
     stop_progress_ok = pred_displacement <= float(args.stop_progress_ceiling_m)
     hazard_stop_ceiling = _weighted_mean(
         torch.relu(pred_speed - float(args.stop_speed_ceiling_mps)).mean(dim=1) * hazard_active.to(dtype=pred_speed.dtype),
+        effective_weight,
+    )
+    speed_ceiling_raw = torch.relu(pred_speed - float(args.stop_speed_ceiling_mps)).mean(dim=1)
+    trafficlight_stop_ceiling = _weighted_mean(
+        speed_ceiling_raw * traffic_light_active.to(dtype=pred_speed.dtype),
+        effective_weight,
+    )
+    stopsign_stop_ceiling = _weighted_mean(
+        speed_ceiling_raw * stop_sign_active.to(dtype=pred_speed.dtype),
+        effective_weight,
+    )
+    frontvehicle_stop_ceiling = _weighted_mean(
+        speed_ceiling_raw * front_vehicle_active.to(dtype=pred_speed.dtype),
+        effective_weight,
+    )
+    junctionyield_stop_ceiling = _weighted_mean(
+        speed_ceiling_raw * junction_yield_active.to(dtype=pred_speed.dtype),
         effective_weight,
     )
     hazard_progress = _weighted_mean(
@@ -905,16 +1299,105 @@ def _losses(
         effective_weight=effective_weight,
         args=args,
     )
+    unroll_metrics = _closed_loop_unroll_losses(
+        pred_traj=pred_traj,
+        pred_speed=pred_speed,
+        target_traj=target_traj,
+        target_speed=target_speed,
+        stop_active=stop_active,
+        go_active=go_active,
+        hazard_active=hazard_active,
+        effective_weight=effective_weight,
+        args=args,
+    )
+    safe_temp = max(float(args.safe_ctrl_surrogate_temperature), 1e-3)
+
+    def soft_miss(correct_score: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        active_weight = effective_weight * active.reshape(-1).to(dtype=torch.float32)
+        return _weighted_mean(1.0 - correct_score.reshape(-1), active_weight)
+
+    speed_stop_score = torch.sigmoid((float(args.stop_speed_ceiling_mps) - pred_speed_max) / safe_temp)
+    speed_go_score = torch.sigmoid((pred_speed_max - float(args.speed_floor_mps)) / safe_temp)
+    launch_score = torch.sigmoid((pred_speed_max - float(args.launch_speed_floor_mps)) / safe_temp)
+    release_score = torch.sigmoid((pred_speed_max - float(args.release_speed_floor_mps)) / safe_temp)
+    go_progress_score = torch.sigmoid((pred_progress - target_progress * float(args.go_progress_ratio)) / safe_temp)
+    stop_progress_score = torch.sigmoid((float(args.stop_progress_ceiling_m) - pred_displacement) / safe_temp)
+    stop_hold_soft_miss = soft_miss(speed_stop_score, stop_active)
+    go_soft_miss = soft_miss(speed_go_score, go_active)
+    hazard_hold_soft_miss = soft_miss(speed_stop_score, hazard_active)
+    launch_go_soft_miss = soft_miss(launch_score, launch_active)
+    release_go_soft_miss = soft_miss(release_score, release_active)
+    go_progress_soft_miss = soft_miss(go_progress_score, go_active)
+    stop_progress_soft_miss = soft_miss(stop_progress_score, stop_active)
+    hazard_progress_soft_miss = soft_miss(stop_progress_score, hazard_active)
+    trafficlight_hold_soft_miss = soft_miss(speed_stop_score, traffic_light_active.reshape(-1).bool())
+    stopsign_hold_soft_miss = soft_miss(speed_stop_score, stop_sign_active.reshape(-1).bool())
+    frontvehicle_hold_soft_miss = soft_miss(speed_stop_score, front_vehicle_active.reshape(-1).bool())
+    junctionyield_hold_soft_miss = soft_miss(speed_stop_score, junction_yield_active.reshape(-1).bool())
+    closed_loop_surrogate = (
+        0.35 * behavior_proxy
+        + 0.75 * lateral_error
+        + 0.20 * progress_error
+        + 2.00 * stop_hold_soft_miss
+        + 0.50 * go_soft_miss
+        + 3.00 * hazard_hold_soft_miss
+        + 1.00 * launch_go_soft_miss
+        + 1.00 * release_go_soft_miss
+        + 0.50 * go_progress_soft_miss
+        + 2.00 * stop_progress_soft_miss
+        + 3.00 * hazard_progress_soft_miss
+        + 2.00 * trafficlight_hold_soft_miss
+        + 1.00 * stopsign_hold_soft_miss
+    )
+    controller_closed_loop_surrogate = (
+        closed_loop_surrogate
+        + 2.00 * controller_metrics["controller_proxy"]
+        + 0.75 * controller_metrics["plan_steer_error"]
+        + 0.50 * controller_metrics["plan_throttle_error"]
+        + 2.00 * controller_metrics["plan_brake_error"]
+        + 3.00 * controller_metrics["plan_brake_soft_miss"]
+        + 1.50 * controller_metrics["plan_go_soft_miss"]
+        + 1.00 * controller_metrics["plan_steer_close_soft_miss"]
+        + 1.00 * controller_metrics["plan_throttle_close_soft_miss"]
+    )
+    safe_ctrl_surrogate = (
+        controller_closed_loop_surrogate
+        + 4.00 * frontvehicle_hold_soft_miss
+        + 2.00 * junctionyield_hold_soft_miss
+        + 1.00 * trafficlight_hold_soft_miss
+        + 1.00 * stopsign_hold_soft_miss
+    )
     zero = torch.zeros((), dtype=torch.float32, device=device)
     control = zero
     if "control" in aux and control_target.numel() > 0:
         control_raw = torch.mean(nn.functional.smooth_l1_loss(aux["control"], control_target, reduction="none"), dim=1)
         control_active = _per_sample_vector(control_mask, int(control_raw.numel())) * effective_weight
         control = torch.sum(control_raw * control_active) / torch.clamp(torch.sum(control_active), min=1e-6)
+    direct_control = zero
+    direct_control_coactivation = zero
+    if "output_residual_direct_control" in aux and control_target.numel() > 0:
+        pred_direct_control = aux["output_residual_direct_control"]
+        direct_raw = torch.mean(
+            nn.functional.smooth_l1_loss(pred_direct_control, control_target[:, : pred_direct_control.shape[1]], reduction="none"),
+            dim=1,
+        )
+        direct_active = _per_sample_vector(control_mask, int(direct_raw.numel())) * effective_weight
+        direct_control = torch.sum(direct_raw * direct_active) / torch.clamp(torch.sum(direct_active), min=1e-6)
+        if pred_direct_control.shape[1] >= 3:
+            coactivation_raw = pred_direct_control[:, 1] * pred_direct_control[:, 2]
+            direct_control_coactivation = torch.sum(coactivation_raw * direct_active) / torch.clamp(
+                torch.sum(direct_active), min=1e-6
+            )
     residual_checkpoint_gate = aux.get("output_residual_checkpoint_gate", zero)
     residual_speed_gate = aux.get("output_residual_speed_gate", zero)
     residual_checkpoint_norm = aux.get("output_residual_checkpoint_norm", zero)
     residual_speed_norm = aux.get("output_residual_speed_norm", zero)
+    residual_controller_gate = aux.get("output_residual_controller_gate", zero)
+    residual_controller_steer_abs = aux.get("output_residual_controller_steer_abs", zero)
+    residual_controller_throttle = aux.get("output_residual_controller_throttle", zero)
+    residual_controller_brake = aux.get("output_residual_controller_brake", zero)
+    residual_gate_penalty = residual_checkpoint_gate + residual_speed_gate + residual_controller_gate
+    residual_norm_penalty = residual_checkpoint_norm + residual_speed_norm
 
     stop_state_aux = zero
     if "stop_state" in aux:
@@ -936,11 +1419,17 @@ def _losses(
         + float(args.launch_speed_floor_loss_weight) * launch_floor
         + float(args.release_speed_floor_loss_weight) * release_floor
         + float(args.stop_speed_ceiling_loss_weight) * stop_ceiling
+        + float(args.trafficlight_stop_speed_ceiling_loss_weight) * trafficlight_stop_ceiling
+        + float(args.stopsign_stop_speed_ceiling_loss_weight) * stopsign_stop_ceiling
+        + float(args.frontvehicle_stop_speed_ceiling_loss_weight) * frontvehicle_stop_ceiling
+        + float(args.junctionyield_stop_speed_ceiling_loss_weight) * junctionyield_stop_ceiling
         + float(args.stop_loss_weight) * stop
         + float(args.feature_drift_loss_weight) * drift
         + float(args.output_prior_xy_loss_weight) * prior_xy
         + float(args.output_prior_speed_loss_weight) * prior_speed
         + float(args.control_loss_weight) * control
+        + float(args.direct_control_loss_weight) * direct_control
+        + float(args.direct_control_coactivation_loss_weight) * direct_control_coactivation
         + float(args.stop_state_aux_loss_weight) * stop_state_aux
         + float(args.stop_reason_aux_loss_weight) * stop_reason_aux
         + float(args.pdm_behavior_loss_weight) * behavior_proxy
@@ -951,6 +1440,13 @@ def _losses(
         + float(args.pdm_plan_steer_loss_weight) * controller_metrics["plan_steer_error"]
         + float(args.pdm_plan_throttle_loss_weight) * controller_metrics["plan_throttle_error"]
         + float(args.pdm_plan_brake_loss_weight) * controller_metrics["plan_brake_error"]
+        + float(args.controller_go_hinge_loss_weight) * controller_metrics["plan_go_hinge"]
+        + float(args.controller_throttle_close_hinge_loss_weight) * controller_metrics["plan_throttle_close_hinge"]
+        + float(args.pdm_go_progress_hinge_loss_weight) * go_progress_hinge
+        + float(args.closed_loop_unroll_loss_weight) * unroll_metrics["unroll_proxy"]
+        + float(args.safe_ctrl_surrogate_loss_weight) * safe_ctrl_surrogate
+        + float(args.output_residual_gate_loss_weight) * residual_gate_penalty
+        + float(args.output_residual_norm_loss_weight) * residual_norm_penalty
     )
     metrics = {
         "loss": total,
@@ -964,8 +1460,13 @@ def _losses(
         "release_floor": release_floor,
         "stop_ceiling": stop_ceiling,
         "hazard_stop_ceiling": hazard_stop_ceiling,
+        "trafficlight_stop_ceiling": trafficlight_stop_ceiling,
+        "stopsign_stop_ceiling": stopsign_stop_ceiling,
+        "frontvehicle_stop_ceiling": frontvehicle_stop_ceiling,
+        "junctionyield_stop_ceiling": junctionyield_stop_ceiling,
         "lateral_error": lateral_error,
         "progress_error": progress_error,
+        "go_progress_hinge": go_progress_hinge,
         "hazard_progress": hazard_progress,
         "behavior_proxy": behavior_proxy,
         "stop": stop,
@@ -976,11 +1477,36 @@ def _losses(
         "plan_steer_error": controller_metrics["plan_steer_error"],
         "plan_throttle_error": controller_metrics["plan_throttle_error"],
         "plan_brake_error": controller_metrics["plan_brake_error"],
+        "plan_go_hinge": controller_metrics["plan_go_hinge"],
+        "plan_throttle_close_hinge": controller_metrics["plan_throttle_close_hinge"],
+        "safe_ctrl_surrogate": safe_ctrl_surrogate,
+        "closed_loop_surrogate": closed_loop_surrogate,
+        "controller_closed_loop_surrogate": controller_closed_loop_surrogate,
+        "stop_hold_soft_miss": stop_hold_soft_miss,
+        "go_soft_miss": go_soft_miss,
+        "hazard_hold_soft_miss": hazard_hold_soft_miss,
+        "frontvehicle_hold_soft_miss": frontvehicle_hold_soft_miss,
+        "junctionyield_hold_soft_miss": junctionyield_hold_soft_miss,
+        "unroll_proxy": unroll_metrics["unroll_proxy"],
+        "unroll_path_error": unroll_metrics["unroll_path_error"],
+        "unroll_lateral_error": unroll_metrics["unroll_lateral_error"],
+        "unroll_progress_error": unroll_metrics["unroll_progress_error"],
+        "unroll_stop_error": unroll_metrics["unroll_stop_error"],
+        "unroll_go_error": unroll_metrics["unroll_go_error"],
+        "unroll_hazard_error": unroll_metrics["unroll_hazard_error"],
         "control": control,
+        "direct_control": direct_control,
+        "direct_control_coactivation": direct_control_coactivation,
         "output_residual_checkpoint_gate": residual_checkpoint_gate,
         "output_residual_speed_gate": residual_speed_gate,
         "output_residual_checkpoint_norm": residual_checkpoint_norm,
         "output_residual_speed_norm": residual_speed_norm,
+        "output_residual_controller_gate": residual_controller_gate,
+        "output_residual_controller_steer_abs": residual_controller_steer_abs,
+        "output_residual_controller_throttle": residual_controller_throttle,
+        "output_residual_controller_brake": residual_controller_brake,
+        "output_residual_gate_penalty": residual_gate_penalty,
+        "output_residual_norm_penalty": residual_norm_penalty,
         "stop_state_aux": stop_state_aux,
         "stop_reason_aux": stop_reason_aux,
         "moving_ratio": moving.float().mean(),
@@ -1086,8 +1612,13 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "release_floor",
         "stop_ceiling",
         "hazard_stop_ceiling",
+        "trafficlight_stop_ceiling",
+        "stopsign_stop_ceiling",
+        "frontvehicle_stop_ceiling",
+        "junctionyield_stop_ceiling",
         "lateral_error",
         "progress_error",
+        "go_progress_hinge",
         "hazard_progress",
         "behavior_proxy",
         "stop",
@@ -1098,11 +1629,36 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "plan_steer_error",
         "plan_throttle_error",
         "plan_brake_error",
+        "plan_go_hinge",
+        "plan_throttle_close_hinge",
+        "safe_ctrl_surrogate",
+        "closed_loop_surrogate",
+        "controller_closed_loop_surrogate",
+        "stop_hold_soft_miss",
+        "go_soft_miss",
+        "hazard_hold_soft_miss",
+        "frontvehicle_hold_soft_miss",
+        "junctionyield_hold_soft_miss",
+        "unroll_proxy",
+        "unroll_path_error",
+        "unroll_lateral_error",
+        "unroll_progress_error",
+        "unroll_stop_error",
+        "unroll_go_error",
+        "unroll_hazard_error",
         "control",
+        "direct_control",
+        "direct_control_coactivation",
         "output_residual_checkpoint_gate",
         "output_residual_speed_gate",
         "output_residual_checkpoint_norm",
         "output_residual_speed_norm",
+        "output_residual_controller_gate",
+        "output_residual_controller_steer_abs",
+        "output_residual_controller_throttle",
+        "output_residual_controller_brake",
+        "output_residual_gate_penalty",
+        "output_residual_norm_penalty",
         "stop_state_aux",
         "stop_reason_aux",
         "moving_ratio",
@@ -1182,10 +1738,21 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
                 f"risk={totals['behavior_proxy']/samples:.6f} lane={totals['lateral_error']/samples:.6f} "
                 f"ctrl={totals['controller_proxy']/samples:.6f} "
                 f"plan={totals['plan_steer_error']/samples:.6f}/{totals['plan_throttle_error']/samples:.6f}/{totals['plan_brake_error']/samples:.6f} "
+                f"hinge={totals['plan_go_hinge']/samples:.6f}/{totals['plan_throttle_close_hinge']/samples:.6f}/"
+                f"{totals['go_progress_hinge']/samples:.6f} "
+                f"soft={totals['safe_ctrl_surrogate']/samples:.6f}/{totals['go_soft_miss']/samples:.6f}/"
+                f"{totals['hazard_hold_soft_miss']/samples:.6f}/{totals['frontvehicle_hold_soft_miss']/samples:.6f} "
+                f"unroll={totals['unroll_proxy']/samples:.6f}/{totals['unroll_path_error']/samples:.6f}/"
+                f"{totals['unroll_stop_error']/samples:.6f}/{totals['unroll_go_error']/samples:.6f} "
                 f"res={totals['output_residual_checkpoint_gate']/samples:.3f}/{totals['output_residual_speed_gate']/samples:.3f}/"
                 f"{totals['output_residual_checkpoint_norm']/samples:.3f}/{totals['output_residual_speed_norm']/samples:.3f} "
+                f"act={totals['output_residual_controller_gate']/samples:.3f}/{totals['output_residual_controller_steer_abs']/samples:.3f}/"
+                f"{totals['output_residual_controller_throttle']/samples:.3f}/{totals['output_residual_controller_brake']/samples:.3f}/"
+                f"{totals['direct_control_coactivation']/samples:.3f} "
+                f"rpen={totals['output_residual_gate_penalty']/samples:.3f}/{totals['output_residual_norm_penalty']/samples:.3f} "
                 f"prior={totals['prior_xy']/samples:.6f}/{totals['prior_speed']/samples:.6f} "
-                f"aux={totals['control']/samples:.6f}/{totals['stop_state_aux']/samples:.6f}/{totals['stop_reason_aux']/samples:.6f} "
+                f"aux={totals['control']/samples:.6f}/{totals['direct_control']/samples:.6f}/"
+                f"{totals['stop_state_aux']/samples:.6f}/{totals['stop_reason_aux']/samples:.6f} "
                 f"drift={totals['drift']/samples:.6f} moving={totals['moving_ratio']/samples:.3f} "
                 f"samples/s={samples/elapsed:.1f}",
                 flush=True,
@@ -1221,6 +1788,20 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         + _miss_rate(result, "plan_steer_close", 1.0)
         + _miss_rate(result, "plan_throttle_close", 1.0)
     )
+    result["safety_closed_loop_proxy"] = (
+        result["closed_loop_proxy"]
+        + _miss_rate(result, "frontvehicle_hold_recall", 4.0)
+        + _miss_rate(result, "junctionyield_hold_recall", 2.0)
+        + _miss_rate(result, "trafficlight_hold_recall", 1.0)
+        + _miss_rate(result, "stopsign_hold_recall", 1.0)
+    )
+    result["safety_controller_closed_loop_proxy"] = (
+        result["controller_closed_loop_proxy"]
+        + _miss_rate(result, "frontvehicle_hold_recall", 4.0)
+        + _miss_rate(result, "junctionyield_hold_recall", 2.0)
+        + _miss_rate(result, "trafficlight_hold_recall", 1.0)
+        + _miss_rate(result, "stopsign_hold_recall", 1.0)
+    )
     return result
 
 
@@ -1228,7 +1809,7 @@ def train(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     cameras = _camera_list(args.cameras)
-    train_indices, val_indices = split_by_episode(args.index, val_ratio=float(args.val_ratio), seed=int(args.seed))
+    train_indices, val_indices, split_info = _split_indices(args)
     if int(args.max_train_samples) > 0:
         train_indices = train_indices[: int(args.max_train_samples)]
     if int(args.max_val_samples) > 0:
@@ -1340,7 +1921,15 @@ def train(args: argparse.Namespace) -> None:
         output_residual_checkpoint_scale=float(args.output_residual_checkpoint_scale),
         output_residual_speed_logit_scale=float(args.output_residual_speed_logit_scale),
         output_residual_gate_bias=float(args.output_residual_gate_bias),
+        output_residual_gate_max=float(args.output_residual_gate_max),
         output_residual_dropout=float(args.output_residual_dropout),
+        output_residual_controller=bool(args.output_residual_controller),
+        output_residual_controller_lateral_scale=float(args.output_residual_controller_lateral_scale),
+        output_residual_controller_progress_scale=float(args.output_residual_controller_progress_scale),
+        output_residual_controller_speed_logit_scale=float(args.output_residual_controller_speed_logit_scale),
+        output_residual_controller_gate_bias=float(args.output_residual_controller_gate_bias),
+        output_residual_controller_gate_max=float(args.output_residual_controller_gate_max),
+        freeze_task_adapter=bool(args.freeze_task_adapter),
         camera_crop_shift_x_px=float(args.camera_crop_shift_x_px),
         camera_crop_shift_y_px=float(args.camera_crop_shift_y_px),
         camera_crop_scale=float(args.camera_crop_scale),
@@ -1353,6 +1942,13 @@ def train(args: argparse.Namespace) -> None:
         lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
     ).to(device)
     init_extra_load_info = _load_task_checkpoint_extras(model, args.init_checkpoint, strict=False)
+    if bool(args.freeze_task_adapter):
+        for param in model.adapter.parameters():
+            param.requires_grad_(False)
+        set_lora_train_mode(model.net, False)
+        for name, param in model.net.named_parameters():
+            if ".lora_" in name:
+                param.requires_grad_(False)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
         model = nn.DataParallel(model)
@@ -1442,15 +2038,26 @@ def train(args: argparse.Namespace) -> None:
             "checkpoint_scale": float(args.output_residual_checkpoint_scale),
             "speed_logit_scale": float(args.output_residual_speed_logit_scale),
             "gate_bias": float(args.output_residual_gate_bias),
+            "gate_max": float(args.output_residual_gate_max),
             "dropout": float(args.output_residual_dropout),
+            "controller_residual": bool(args.output_residual_controller),
+            "controller_lateral_scale": float(args.output_residual_controller_lateral_scale),
+            "controller_progress_scale": float(args.output_residual_controller_progress_scale),
+            "controller_speed_logit_scale": float(args.output_residual_controller_speed_logit_scale),
+            "controller_gate_bias": float(args.output_residual_controller_gate_bias),
+            "controller_gate_max": float(args.output_residual_controller_gate_max),
+            "controller_action_mode": "exclusive_throttle_brake_softmax",
             "checkpoint_dim": int((getattr(config, "predict_checkpoint_len", 10) or 10) * 2),
             "speed_classes": int(len(getattr(config, "target_speeds", [])) or 1),
+            "speed_class_values": [float(v) for v in getattr(config, "target_speeds", [])],
         },
+        "freeze_task_adapter": bool(args.freeze_task_adapter),
         "extrinsic_aware": bool(args.extrinsic_aware),
         "source_profile": args.source_profile,
         "extrinsic_vector": [float(v) for v in extrinsic_vector],
         "train_samples": int(len(train_ds)),
         "val_samples": int(len(val_ds)),
+        "split": split_info,
         "data_parallel": bool(args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1),
         "args": metadata_args,
     }
@@ -1476,6 +2083,7 @@ def train(args: argparse.Namespace) -> None:
                 "camera_canonical_crop": metadata["camera_canonical_crop"],
                 "camera_ground_plane_warp": metadata["camera_ground_plane_warp"],
                 "lidar_canonical_shift_m": metadata["lidar_canonical_shift_m"],
+                "split": metadata["split"],
                 "data_parallel": metadata["data_parallel"],
             },
             indent=2,
@@ -1536,10 +2144,18 @@ def train(args: argparse.Namespace) -> None:
                 f"select={selection_name}:{selection_value:.6f} best={display_best:.6f} new_best={int(improved)} "
                 f"xy={val_metrics['xy']:.6f} speed={val_metrics['speed']:.6f} "
                 f"closed={val_metrics['closed_loop_proxy']:.6f} risk={val_metrics['behavior_proxy']:.6f} "
+                f"safe={val_metrics['safety_closed_loop_proxy']:.6f} "
                 f"lane={val_metrics['lateral_error']:.6f} prog={val_metrics['progress_error']:.6f} "
                 f"ctrl_closed={val_metrics['controller_closed_loop_proxy']:.6f} "
+                f"safe_ctrl={val_metrics['safety_controller_closed_loop_proxy']:.6f} "
                 f"ctrl={val_metrics['controller_proxy']:.6f} "
                 f"plan={val_metrics['plan_steer_error']:.6f}/{val_metrics['plan_throttle_error']:.6f}/{val_metrics['plan_brake_error']:.6f} "
+                f"hinge={val_metrics['plan_go_hinge']:.6f}/{val_metrics['plan_throttle_close_hinge']:.6f}/"
+                f"{val_metrics['go_progress_hinge']:.6f} "
+                f"soft={val_metrics['safe_ctrl_surrogate']:.6f}/{val_metrics['go_soft_miss']:.6f}/"
+                f"{val_metrics['hazard_hold_soft_miss']:.6f}/{val_metrics['frontvehicle_hold_soft_miss']:.6f} "
+                f"unroll={val_metrics['unroll_proxy']:.6f}/{val_metrics['unroll_path_error']:.6f}/"
+                f"{val_metrics['unroll_stop_error']:.6f}/{val_metrics['unroll_go_error']:.6f} "
                 f"sg={val_metrics['stop_hold_recall']:.3f}/{val_metrics['go_recall']:.3f} "
                 f"hz={val_metrics['hazard_hold_recall']:.3f} "
                 f"plan_sgtb={val_metrics['plan_steer_close']:.3f}/{val_metrics['plan_go_recall']:.3f}/"
@@ -1547,8 +2163,12 @@ def train(args: argparse.Namespace) -> None:
                 f"lr={val_metrics['launch_go_recall']:.3f}/{val_metrics['release_go_recall']:.3f} "
                 f"res={val_metrics['output_residual_checkpoint_gate']:.3f}/{val_metrics['output_residual_speed_gate']:.3f}/"
                 f"{val_metrics['output_residual_checkpoint_norm']:.3f}/{val_metrics['output_residual_speed_norm']:.3f} "
+                f"act={val_metrics['output_residual_controller_gate']:.3f}/{val_metrics['output_residual_controller_steer_abs']:.3f}/"
+                f"{val_metrics['output_residual_controller_throttle']:.3f}/{val_metrics['output_residual_controller_brake']:.3f}/"
+                f"{val_metrics['direct_control_coactivation']:.3f} "
                 f"prior={val_metrics['prior_xy']:.6f}/{val_metrics['prior_speed']:.6f} "
-                f"aux={val_metrics['control']:.6f}/{val_metrics['stop_state_aux']:.6f}/{val_metrics['stop_reason_aux']:.6f} "
+                f"aux={val_metrics['control']:.6f}/{val_metrics['direct_control']:.6f}/"
+                f"{val_metrics['stop_state_aux']:.6f}/{val_metrics['stop_reason_aux']:.6f} "
                 f"drift={val_metrics['drift']:.6f}",
                 flush=True,
             )
@@ -1642,6 +2262,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Which stage token streams are replaced by the learned adapter output.",
     )
     parser.add_argument("--disable-fusion-adapter", action="store_true")
+    parser.add_argument("--freeze-task-adapter", action="store_true")
     parser.add_argument("--stage-feature-adapter-blend", type=float, default=1.0)
     parser.add_argument("--fusion-adapter-blend", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=0)
@@ -1676,6 +2297,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--split-mode", choices=["episode", "reason_coverage"], default="episode")
+    parser.add_argument("--val-required-stop-reasons", default="")
+    parser.add_argument("--val-min-reason-samples", type=int, default=1)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--speed-dim", type=int, default=4)
     parser.add_argument("--xy-loss-weight", type=float, default=0.55)
@@ -1687,6 +2311,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speed-floor-mps", type=float, default=0.8)
     parser.add_argument("--speed-floor-target-threshold", type=float, default=2.0)
     parser.add_argument("--stop-speed-ceiling-loss-weight", type=float, default=0.35)
+    parser.add_argument("--trafficlight-stop-speed-ceiling-loss-weight", type=float, default=0.0)
+    parser.add_argument("--stopsign-stop-speed-ceiling-loss-weight", type=float, default=0.0)
+    parser.add_argument("--frontvehicle-stop-speed-ceiling-loss-weight", type=float, default=0.0)
+    parser.add_argument("--junctionyield-stop-speed-ceiling-loss-weight", type=float, default=0.0)
     parser.add_argument("--stop-speed-ceiling-mps", type=float, default=0.5)
     parser.add_argument("--stop-speed-target-threshold", type=float, default=0.5)
     parser.add_argument("--stop-progress-ceiling-m", type=float, default=1.0)
@@ -1697,6 +2325,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-prior-speed-loss-weight", type=float, default=0.0)
     parser.add_argument("--aux-hidden-dim", type=int, default=256)
     parser.add_argument("--control-loss-weight", type=float, default=0.0)
+    parser.add_argument("--direct-control-loss-weight", type=float, default=0.0)
+    parser.add_argument("--direct-control-coactivation-loss-weight", type=float, default=0.0)
     parser.add_argument("--pdm-behavior-loss-weight", type=float, default=0.0)
     parser.add_argument("--pdm-lateral-loss-weight", type=float, default=0.0)
     parser.add_argument("--pdm-progress-loss-weight", type=float, default=0.0)
@@ -1705,12 +2335,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pdm-plan-steer-loss-weight", type=float, default=0.0)
     parser.add_argument("--pdm-plan-throttle-loss-weight", type=float, default=0.0)
     parser.add_argument("--pdm-plan-brake-loss-weight", type=float, default=0.0)
+    parser.add_argument("--controller-go-hinge-loss-weight", type=float, default=0.0)
+    parser.add_argument("--controller-throttle-close-hinge-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pdm-go-progress-hinge-loss-weight", type=float, default=0.0)
+    parser.add_argument("--closed-loop-unroll-loss-weight", type=float, default=0.0)
+    parser.add_argument("--closed-loop-unroll-steps", type=int, default=6)
+    parser.add_argument("--closed-loop-unroll-dt", type=float, default=0.5)
+    parser.add_argument("--closed-loop-unroll-steer-gain", type=float, default=1.35)
+    parser.add_argument("--closed-loop-unroll-max-speed-mps", type=float, default=8.0)
+    parser.add_argument("--closed-loop-unroll-target-speed-blend", type=float, default=0.0)
+    parser.add_argument("--safe-ctrl-surrogate-loss-weight", type=float, default=0.0)
+    parser.add_argument("--safe-ctrl-surrogate-temperature", type=float, default=0.25)
     parser.add_argument("--output-residual", action="store_true")
     parser.add_argument("--output-residual-hidden-dim", type=int, default=256)
     parser.add_argument("--output-residual-checkpoint-scale", type=float, default=0.75)
     parser.add_argument("--output-residual-speed-logit-scale", type=float, default=1.5)
     parser.add_argument("--output-residual-gate-bias", type=float, default=-2.0)
+    parser.add_argument("--output-residual-gate-max", type=float, default=1.0)
     parser.add_argument("--output-residual-dropout", type=float, default=0.0)
+    parser.add_argument("--output-residual-controller", action="store_true")
+    parser.add_argument("--output-residual-controller-lateral-scale", type=float, default=1.0)
+    parser.add_argument("--output-residual-controller-progress-scale", type=float, default=1.0)
+    parser.add_argument("--output-residual-controller-speed-logit-scale", type=float, default=2.0)
+    parser.add_argument("--output-residual-controller-gate-bias", type=float, default=-2.0)
+    parser.add_argument("--output-residual-controller-gate-max", type=float, default=1.0)
+    parser.add_argument("--output-residual-gate-loss-weight", type=float, default=0.0)
+    parser.add_argument("--output-residual-norm-loss-weight", type=float, default=0.0)
     parser.add_argument("--stop-state-aux-loss-weight", type=float, default=0.0)
     parser.add_argument("--stop-reason-aux-loss-weight", type=float, default=0.0)
     parser.add_argument("--moving-speed-threshold", type=float, default=1.0)
@@ -1718,6 +2368,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stopped-sample-weight", type=float, default=1.0)
     parser.add_argument("--hazard-stop-reasons", default="traffic_light,stop_sign,front_vehicle,junction_yield")
     parser.add_argument("--hazard-sample-weight", type=float, default=2.0)
+    parser.add_argument("--trafficlight-sample-weight", type=float, default=1.0)
+    parser.add_argument("--stopsign-sample-weight", type=float, default=1.0)
+    parser.add_argument("--frontvehicle-sample-weight", type=float, default=1.0)
+    parser.add_argument("--junctionyield-sample-weight", type=float, default=1.0)
     parser.add_argument("--launch-current-speed-threshold", type=float, default=0.8)
     parser.add_argument("--launch-target-speed-threshold", type=float, default=2.0)
     parser.add_argument("--launch-sample-weight", type=float, default=1.4)
@@ -1730,6 +2384,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--controller-steer-close-threshold", type=float, default=0.15)
     parser.add_argument("--controller-throttle-close-threshold", type=float, default=0.20)
     parser.add_argument("--controller-go-throttle-threshold", type=float, default=0.05)
+    parser.add_argument("--controller-go-hinge-margin", type=float, default=0.02)
+    parser.add_argument("--controller-soft-stop-temperature", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int, default=0)
