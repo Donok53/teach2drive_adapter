@@ -24,13 +24,41 @@ import argparse, gzip, json, os, sys, uuid, math
 from pathlib import Path
 import numpy as np
 
-# BEV projection + defaults, identical to teach2drive.carla_collect_tokens collector.
-try:
-    from teach2drive.carla_collect import _points_to_bev
-except Exception as e:  # pragma: no cover
-    print(f"[fatal] cannot import teach2drive.carla_collect._points_to_bev: {e}\n"
-          f"        run with PYTHONPATH including the teach2drive_bootstrap repo.", file=sys.stderr)
-    raise
+
+def _points_to_bev(points, grid_size, x_min, x_max, y_min, y_max, z_min, z_max):
+    """Inlined verbatim from teach2drive.carla_collect._points_to_bev so the
+    converter has no dependency on the (carla-heavy) bootstrap package import.
+    Returns a (3, grid, grid) float16 BEV: [occupancy, height, intensity]."""
+    occ = np.zeros((grid_size, grid_size), dtype=np.float32)
+    height = np.zeros((grid_size, grid_size), dtype=np.float32)
+    intensity = np.zeros((grid_size, grid_size), dtype=np.float32)
+    count = np.zeros((grid_size, grid_size), dtype=np.float32)
+    if points.size == 0:
+        return np.stack([occ, height, intensity], axis=0).astype(np.float16)
+    xs = points[:, 0]; ys = points[:, 1]; zs = points[:, 2]
+    valid = (np.isfinite(xs) & np.isfinite(ys) & np.isfinite(zs)
+             & (xs >= x_min) & (xs < x_max) & (ys >= y_min) & (ys < y_max)
+             & (zs >= z_min) & (zs <= z_max))
+    if not np.any(valid):
+        return np.stack([occ, height, intensity], axis=0).astype(np.float16)
+    xs = xs[valid]; ys = ys[valid]; zs = zs[valid]
+    inten = points[:, 3][valid] if points.shape[1] > 3 else np.ones_like(xs)
+    ix = np.clip(((xs - x_min) * grid_size / max(x_max - x_min, 1e-6)).astype(np.int32), 0, grid_size - 1)
+    iy = np.clip(((ys - y_min) * grid_size / max(y_max - y_min, 1e-6)).astype(np.int32), 0, grid_size - 1)
+    rows = grid_size - 1 - ix; cols = iy
+    flat = rows * grid_size + cols
+    np.add.at(occ.reshape(-1), flat, 1.0)
+    np.add.at(count.reshape(-1), flat, 1.0)
+    np.maximum.at(height.reshape(-1), flat, (zs - z_min) / max(z_max - z_min, 1e-6))
+    np.add.at(intensity.reshape(-1), flat, inten)
+    occ = np.clip(np.log1p(occ) / np.log(16.0), 0.0, 1.0)
+    nonzero = count > 0
+    if np.any(nonzero):
+        intensity[nonzero] = intensity[nonzero] / count[nonzero]
+        hi = np.percentile(intensity[nonzero], 95)
+        if hi > 1e-6:
+            intensity = np.clip(intensity / hi, 0.0, 1.0)
+    return np.stack([occ, height, intensity], axis=0).astype(np.float16)
 
 BEV = dict(grid_size=128, x_min=-8.0, x_max=20.0, y_min=-14.0, y_max=14.0, z_min=-2.0, z_max=4.0)
 CAMERAS = ("left", "front", "right")
