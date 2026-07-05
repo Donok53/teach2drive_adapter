@@ -39,18 +39,26 @@ GPU=${GPU:-0}
 
 mkdir -p "$PREP_ROOT/profile_views" "$PREP_ROOT/indexes" "$RUN_ROOT" "$LOG_DIR"
 
-# --- 1) export profile view + build token index (once) --------------------------
+# --- 1) build token index (once) -------------------------------------------------
+# PREBUILT_TOKENS=1 : SOURCE_DATA_ROOT is already token_dataset-ready t2d episodes
+#                     (produced by scripts/convert_pdm_lite_to_t2d.py) -> skip export.
+# PREBUILT_TOKENS=0 : SOURCE_DATA_ROOT is a paired t2d dataset -> run export first.
 if [[ "${SKIP_PREP:-0}" != "1" ]]; then
-  echo "=== export $PROFILE profile view from $SOURCE_DATA_ROOT"
-  export_args=()
-  [[ "${EXPORT_OVERWRITE:-0}" == "1" ]] && export_args+=(--overwrite)
-  "$PY" -m teach2drive_adapter.export_paired_profile_view \
-    --input-root "$SOURCE_DATA_ROOT" \
-    --output-root "$TARGET_VIEW" \
-    --profile "$PROFILE" \
-    --require-cameras "$CAMERAS" \
-    --skip-invalid-motion \
-    "${export_args[@]}"
+  if [[ "${PREBUILT_TOKENS:-1}" == "1" ]]; then
+    echo "=== prebuilt t2d tokens; using $SOURCE_DATA_ROOT directly"
+    TARGET_VIEW="$SOURCE_DATA_ROOT"
+  else
+    echo "=== export $PROFILE profile view from $SOURCE_DATA_ROOT"
+    export_args=()
+    [[ "${EXPORT_OVERWRITE:-0}" == "1" ]] && export_args+=(--overwrite)
+    "$PY" -m teach2drive_adapter.export_paired_profile_view \
+      --input-root "$SOURCE_DATA_ROOT" \
+      --output-root "$TARGET_VIEW" \
+      --profile "$PROFILE" \
+      --require-cameras "$CAMERAS" \
+      --skip-invalid-motion \
+      "${export_args[@]}"
+  fi
 
   if [[ -f "$TARGET_INDEX" && "${INDEX_OVERWRITE:-0}" != "1" ]]; then
     echo "=== reuse index $TARGET_INDEX"
