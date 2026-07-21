@@ -17,3 +17,7 @@ checkpoints/
 .venv/
 venv/
 
+
+# runtime outputs (not code)
+logs/
+runs_deleted_summaries_*/

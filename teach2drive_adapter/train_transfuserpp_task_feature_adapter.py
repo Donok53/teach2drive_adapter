@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -99,6 +100,66 @@ def _hazard_reason_mask(stop_reason: torch.Tensor, names: str) -> torch.Tensor:
     for idx in ids:
         mask = mask | (stop_reason == int(idx))
     return mask.reshape(-1).bool()
+
+
+def _recovery_perturb_config() -> dict:
+    """ChauffeurNet-style yaw recovery augmentation (view-synthesis-free).
+    Enabled via env: T2D_PERTURB_PROB (0..1), T2D_PERTURB_PSI_MAX_DEG, T2D_PERTURB_FOCAL_PX."""
+    prob = float(os.environ.get("T2D_PERTURB_PROB", "0") or 0.0)
+    psi_max = float(os.environ.get("T2D_PERTURB_PSI_MAX_DEG", "6") or 6.0) * 3.141592653589793 / 180.0
+    focal = float(os.environ.get("T2D_PERTURB_FOCAL_PX", "224") or 224.0)
+    return {"prob": prob, "psi": psi_max, "focal": focal}
+
+
+def _xmodal_config() -> dict:
+    """Cross-modal (camera<->lidar) alignment loss. Re-anchors the shifted camera
+    to the (near-stationary) lidar via a per-frame InfoNCE consistency between the
+    adapter's camera and lidar stage features. Env: T2D_XMODAL_WEIGHT, T2D_XMODAL_TEMP."""
+    w = float(os.environ.get("T2D_XMODAL_WEIGHT", "0") or 0.0)
+    t = float(os.environ.get("T2D_XMODAL_TEMP", "0.1") or 0.1)
+    return {"weight": w, "temp": t}
+
+
+def _apply_recovery_perturbation(camera, scalar, target, cfg):
+    """Pan the front camera (crop-shift approximates a yaw) and re-express the
+    expert trajectory + navigation target_point in the perturbed ego frame, so
+    the model learns to steer back onto the expert path from an off-heading
+    state. LiDAR is left unchanged (small yaw-only inconsistency; camera drives
+    steering). Sign convention is verified against the pretrained model before use."""
+    B = camera.shape[0]
+    dev = camera.device
+    do = (torch.rand(B, device=dev) < float(cfg["prob"]))
+    psi = (torch.rand(B, device=dev) * 2.0 - 1.0) * float(cfg["psi"]) * do.to(camera.dtype)
+    # camera pan: +psi (yaw left) makes scene appear shifted right -> roll +du (content toward +width)
+    du = torch.round(-float(cfg["focal"]) * psi).to(torch.long)  # sign verified against pretrained model oracle
+    cam = camera.clone()
+    for b in range(B):
+        s = int(du[b].item())
+        if s == 0:
+            continue
+        cam[b] = torch.roll(camera[b], shifts=s, dims=-1)
+        if s > 0:
+            cam[b, ..., :s] = 0.0
+        else:
+            cam[b, ..., s:] = 0.0
+    c = torch.cos(psi)
+    s2 = torch.sin(psi)
+    # rotate a set of (x,y) into the perturbed ego frame via R(-psi): x'=x c + y s2 ; y'=-x s2 + y c
+    sc = scalar.clone()
+    tx = sc[:, 10].clone()
+    ty = sc[:, 11].clone()
+    sc[:, 10] = tx * c + ty * s2
+    sc[:, 11] = -tx * s2 + ty * c
+    tgt = target.clone()
+    pts = tgt[:, :12].reshape(B, 4, 3).clone()
+    px = pts[:, :, 0].clone()
+    py = pts[:, :, 1].clone()
+    c1 = c.unsqueeze(1)
+    s1 = s2.unsqueeze(1)
+    pts[:, :, 0] = px * c1 + py * s1
+    pts[:, :, 1] = -px * s1 + py * c1
+    tgt[:, :12] = pts.reshape(B, 12)
+    return cam, sc, tgt
 
 
 def _reason_mask(stop_reason: torch.Tensor, stop_reason_mask: torch.Tensor, name: str) -> torch.Tensor:
@@ -238,17 +299,45 @@ class _BackboneTaskPatch:
         self.original_forward = backbone.forward
         self.enabled = True
         self.records: list[torch.Tensor] = []
+        self.xmodal_records: list[torch.Tensor] = []
+        _xm = _xmodal_config()
+        self.xmodal_temp = float(_xm["temp"]) if float(_xm["weight"]) > 0.0 else None
         self.last_fused: torch.Tensor | None = None
         self._install()
 
     def clear(self) -> None:
         self.records.clear()
+        self.xmodal_records.clear()
         self.last_fused = None
 
     def drift_loss(self, device: torch.device) -> torch.Tensor:
         if not self.records:
             return torch.zeros((), dtype=torch.float32, device=device)
         return torch.stack(self.records).mean()
+
+    def xmodal_loss(self, device: torch.device) -> torch.Tensor:
+        if not self.xmodal_records:
+            return torch.zeros((), dtype=torch.float32, device=device)
+        return torch.stack(self.xmodal_records).mean()
+
+    def _record_xmodal(self, image_feat: torch.Tensor, lidar_feat: torch.Tensor, temp: float) -> None:
+        # Per-frame InfoNCE between camera and lidar stage features: same-frame pairs
+        # align (positives), cross-frame repel. Pulls the shifted camera to encode the
+        # same scene content as the stable lidar. Global-pool -> [B, C] (C matches per layer).
+        b = int(image_feat.shape[0])
+        if b < 2:
+            return
+        zi = nn.functional.adaptive_avg_pool2d(image_feat.float(), 1).flatten(1)
+        zl = nn.functional.adaptive_avg_pool2d(lidar_feat.float(), 1).flatten(1)
+        zi = nn.functional.normalize(zi, dim=1)
+        zl = nn.functional.normalize(zl, dim=1)
+        logits = (zi @ zl.t()) / max(float(temp), 1e-4)
+        labels = torch.arange(b, device=logits.device)
+        loss = 0.5 * (
+            nn.functional.cross_entropy(logits, labels)
+            + nn.functional.cross_entropy(logits.t(), labels)
+        )
+        self.xmodal_records.append(loss)
 
     def restore(self) -> None:
         self.backbone.fuse_features = self.original_fuse_features
@@ -301,6 +390,9 @@ class _BackboneTaskPatch:
             if patch.stage_blend < 1.0:
                 adapted_image = image_embd_layer + patch.stage_blend * (adapted_image - image_embd_layer)
                 adapted_lidar = lidar_embd_layer + patch.stage_blend * (adapted_lidar - lidar_embd_layer)
+
+            if patch.xmodal_temp is not None:
+                patch._record_xmodal(adapted_image, adapted_lidar, patch.xmodal_temp)
 
             image_features_layer, lidar_features_layer = backbone.transformers[idx](adapted_image, adapted_lidar)
             lidar_features_layer = backbone.img_channel_to_lidar[idx](lidar_features_layer)
@@ -574,6 +666,11 @@ class _TaskAdapterForward(nn.Module):
             for module in self.net.modules():
                 if isinstance(module, nn.modules.rnn.RNNBase):
                     module.train(True)
+            # v5: let BatchNorm track target-domain stats during training (AdaBN-in-the-loop)
+            if os.environ.get("T2D_BN_TRAIN_MODE", "0") == "1":
+                for module in self.net.modules():
+                    if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
+                        module.train(True)
 
     def _ensure_patch(self) -> _BackboneTaskPatch:
         if self._patch is None:
@@ -663,6 +760,11 @@ class _TaskAdapterForward(nn.Module):
         patch.clear()
         outputs = self.net(**inputs)
         aux: dict[str, torch.Tensor] = {}
+        # v12: expose the adapted (patch-enabled) perspective depth prediction so the
+        # training loop can supervise it against lidar-projected depth. outputs[5] is
+        # pred_depth = sigmoid(depth_decoder(image_feature_grid)) in [0, 1], shape [B,Hd,Wd].
+        if len(outputs) > 5 and outputs[5] is not None:
+            aux["pred_depth"] = outputs[5]
         pred_target_speed = outputs[1]
         pred_checkpoint = outputs[2]
         if self.output_residual_head is not None and patch.last_fused is not None:
@@ -1071,7 +1173,7 @@ def _trainable_anchor_loss(model: nn.Module, anchor: dict[str, torch.Tensor], de
     return torch.stack(losses).mean()
 
 
-def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
+def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int, force_perturb: bool = False):
     raw_model = _raw_task_model(model)
     raw_model.set_runtime_mode(train)
     metric_names = (
@@ -1110,6 +1212,8 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         "launch_ratio",
         "release_ratio",
         "anchor",
+        "xmodal",
+        "depth",
     )
     rate_metric_names = (
         "stop_hold_recall",
@@ -1138,23 +1242,68 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
         totals[f"{name}_den"] = 0.0
     totals["samples"] = 0
     start = time.time()
+    perturb_cfg = _recovery_perturb_config()
+    if force_perturb:
+        # deterministic off-pose validation metric: same perturbation every epoch -> comparable,
+        # and (unlike expert-pose metrics) it reflects off-distribution robustness that predicts
+        # closed-loop. prob=1.0 so every val sample is evaluated off-pose.
+        perturb_cfg = dict(perturb_cfg)
+        perturb_cfg["prob"] = 1.0
+        torch.manual_seed(20260713)
     for step, batch in enumerate(loader, start=1):
         scalar = batch["scalar"].to(device, non_blocking=True)
         camera = batch["camera"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
+        loss_batch = batch
+        if (train or force_perturb) and float(perturb_cfg["prob"]) > 0.0:
+            camera, scalar, _pt = _apply_recovery_perturbation(
+                camera, scalar, batch["target"].to(device, non_blocking=True), perturb_cfg
+            )
+            loss_batch = dict(batch)
+            loss_batch["target"] = _pt
         with torch.set_grad_enabled(train):
             pred_target, drift_loss, prior_target, aux = model(
                 scalar,
                 camera,
                 lidar,
-                target_dim=batch["target"].shape[1],
+                target_dim=loss_batch["target"].shape[1],
                 speed_dim=int(args.speed_dim),
             )
-            losses = _losses(pred_target, batch, drift_loss, prior_target, aux, device, args)
+            losses = _losses(pred_target, loss_batch, drift_loss, prior_target, aux, device, args)
             anchor_loss = _trainable_anchor_loss(model, getattr(args, "_trainable_anchor_state", {}), device)
             losses["anchor"] = anchor_loss
             if train and float(args.init_param_anchor_loss_weight) > 0.0:
                 losses["loss"] = losses["loss"] + float(args.init_param_anchor_loss_weight) * anchor_loss
+            # v11: cross-modal (camera<->lidar) alignment -- re-anchor shifted camera to stable lidar
+            _xm_w = float(_xmodal_config()["weight"])
+            _raw = _raw_task_model(model)
+            _xm_loss = _raw._patch.xmodal_loss(device) if (_xm_w > 0.0 and getattr(_raw, "_patch", None) is not None) else torch.zeros((), device=device)
+            losses["xmodal"] = _xm_loss.detach()
+            if train and _xm_w > 0.0:
+                losses["loss"] = losses["loss"] + _xm_w * _xm_loss
+            # v12: HARD lidar-distance injection. Supervise the camera perspective-depth
+            # head against lidar-projected sparse depth GT (0 == invalid). This re-teaches
+            # the camera correct metric distances from the shifted (2.75 m forward) viewpoint
+            # -- especially oncoming-vehicle distance, the left-turn failure mode. The frozen
+            # depth head acts as a fixed distance readout, so the gradient shapes the (unfrozen)
+            # backbone + fusion to encode geometrically correct distance.
+            _depth_w = float(os.environ.get("T2D_DEPTH_WEIGHT", "0") or 0.0)
+            _depth_loss = torch.zeros((), device=device)
+            _pred_depth = aux.get("pred_depth") if isinstance(aux, dict) else None
+            if _depth_w > 0.0 and _pred_depth is not None and "depth_gt" in loss_batch:
+                _dg = loss_batch["depth_gt"].to(device, non_blocking=True).float()  # [B,Hg,Wg]
+                _pd = _pred_depth.float()
+                if _pd.dim() == 4:
+                    _pd = _pd.squeeze(1)
+                _pd = nn.functional.interpolate(
+                    _pd.unsqueeze(1), size=_dg.shape[-2:], mode="bilinear", align_corners=False
+                ).squeeze(1)
+                _mask = _dg > 0
+                if bool(_mask.any()):
+                    _depth_loss = nn.functional.l1_loss(_pd[_mask], _dg[_mask])
+            losses["depth"] = _depth_loss.detach()
+            if train and _depth_w > 0.0:
+                losses["loss"] = losses["loss"] + _depth_w * _depth_loss
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 losses["loss"].backward()
@@ -1186,7 +1335,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int):
                 f"{totals['output_residual_checkpoint_norm']/samples:.3f}/{totals['output_residual_speed_norm']/samples:.3f} "
                 f"prior={totals['prior_xy']/samples:.6f}/{totals['prior_speed']/samples:.6f} "
                 f"aux={totals['control']/samples:.6f}/{totals['stop_state_aux']/samples:.6f}/{totals['stop_reason_aux']/samples:.6f} "
-                f"drift={totals['drift']/samples:.6f} moving={totals['moving_ratio']/samples:.3f} "
+                f"drift={totals['drift']/samples:.6f} xmodal={totals['xmodal']/samples:.4f} depth={totals['depth']/samples:.4f} moving={totals['moving_ratio']/samples:.3f} "
                 f"samples/s={samples/elapsed:.1f}",
                 flush=True,
             )
@@ -1256,7 +1405,7 @@ def train(args: argparse.Namespace) -> None:
         shuffle=True,
         num_workers=int(args.num_workers),
         pin_memory=torch.cuda.is_available(),
-        drop_last=False,
+        drop_last=True,  # v5: avoid size-1 last batch breaking BatchNorm train mode
     )
     val_loader = DataLoader(
         val_ds,
@@ -1497,30 +1646,60 @@ def train(args: argparse.Namespace) -> None:
     if bool(args.save_epoch_checkpoints):
         epoch_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    def _cpu_state(sd: dict) -> dict:
+        # Pickling large GPU state dicts has intermittently raised a torch internal error
+        # during torch.save; moving to CPU first avoids it and is cheaper to serialize.
+        return {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in sd.items()}
+
     def save_task_checkpoint(path: Path, epoch: int, train_metrics: dict, val_metrics: dict, selection_value: float) -> None:
         raw_model = _raw_task_model(model)
-        torch.save(
-            {
-                "model_state": raw_model.adapter.state_dict(),
-                "peft_lora_state": lora_state_dict(raw_model.net) if int(args.lora_rank) > 0 else {},
-                "aux_state": raw_model.aux_state_dict(),
-                "stage_feature_shapes": stage_feature_shapes,
-                "fused_feature_shape": fused_feature_shape,
-                "metadata": metadata,
-                "epoch": int(epoch),
-                "selection_metric": selection_name,
-                "selection_mode": selection_mode,
-                "selection_value": float(selection_value),
-                "val_metrics": val_metrics,
-                "train_metrics": train_metrics,
-            },
-            path,
-        )
+        payload = {
+            "model_state": _cpu_state(raw_model.adapter.state_dict()),
+            "peft_lora_state": _cpu_state(lora_state_dict(raw_model.net)) if int(args.lora_rank) > 0 else {},
+            # v5: persist the FULL TF++ net (trained/unfrozen backbone + adapted BatchNorm
+            # running stats + LoRA base), so backbone-unfreeze and BN adaptation actually
+            # transfer to closed-loop eval instead of reverting to the frozen base weights.
+            "tfpp_state": _cpu_state(raw_model.net.state_dict()),
+            "aux_state": raw_model.aux_state_dict(),
+            "stage_feature_shapes": stage_feature_shapes,
+            "fused_feature_shape": fused_feature_shape,
+            "metadata": metadata,
+            "epoch": int(epoch),
+            "selection_metric": selection_name,
+            "selection_mode": selection_mode,
+            "selection_value": float(selection_value),
+            "val_metrics": val_metrics,
+            "train_metrics": train_metrics,
+        }
+        # Atomic + fault-tolerant: a transient save failure must not kill the whole run.
+        tmp = Path(str(path) + ".tmp")
+        try:
+            torch.save(payload, tmp)
+            os.replace(tmp, path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] checkpoint save failed for {path} (epoch {epoch}): {exc!r} -- continuing", flush=True)
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
 
     try:
         for epoch in range(1, int(args.epochs) + 1):
             train_metrics = _run_epoch(model, train_loader, optimizer, device, args, train=True, epoch=epoch)
             val_metrics = _run_epoch(model, val_loader, optimizer, device, args, train=False, epoch=epoch)
+            # v9/v10: off-pose (perturbed) validation metric -- predicts closed-loop where expert-pose
+            # metrics fail. Enabled by T2D_PERTURB_VAL=1 (selection metric only, independent of whether
+            # training uses perturbation) OR whenever recovery-perturbation training is on.
+            if os.environ.get("T2D_PERTURB_VAL", "0") == "1" or float(_recovery_perturb_config()["prob"]) > 0.0:
+                _cpu_rng = torch.get_rng_state()
+                _cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                pv = _run_epoch(model, val_loader, optimizer, device, args, train=False, epoch=epoch, force_perturb=True)
+                torch.set_rng_state(_cpu_rng)
+                if _cuda_rng is not None:
+                    torch.cuda.set_rng_state_all(_cuda_rng)
+                val_metrics["perturbed_loss"] = pv["loss"]
+                val_metrics["perturbed_xy"] = pv["xy"]
             history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics})
             val_loss = float(val_metrics["loss"])
             if selection_name not in val_metrics:
@@ -1549,9 +1728,16 @@ def train(args: argparse.Namespace) -> None:
                 f"{val_metrics['output_residual_checkpoint_norm']:.3f}/{val_metrics['output_residual_speed_norm']:.3f} "
                 f"prior={val_metrics['prior_xy']:.6f}/{val_metrics['prior_speed']:.6f} "
                 f"aux={val_metrics['control']:.6f}/{val_metrics['stop_state_aux']:.6f}/{val_metrics['stop_reason_aux']:.6f} "
-                f"drift={val_metrics['drift']:.6f}",
+                f"drift={val_metrics['drift']:.6f} xmodal={val_metrics.get('xmodal', 0.0):.4f}",
                 flush=True,
             )
+            if "perturbed_loss" in val_metrics:
+                print(
+                    f"  [offpose] perturbed_loss={float(val_metrics['perturbed_loss']):.6f} "
+                    f"perturbed_xy={float(val_metrics['perturbed_xy']):.6f} "
+                    f"(clean val_loss={val_loss:.6f} xy={val_metrics['xy']:.6f})",
+                    flush=True,
+                )
             if bool(args.save_epoch_checkpoints):
                 epoch_path = epoch_checkpoint_dir / f"epoch_{epoch:03d}.pt"
                 save_task_checkpoint(epoch_path, epoch, train_metrics, val_metrics, selection_value)

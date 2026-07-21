@@ -1,4 +1,5 @@
 import argparse
+from collections import deque
 import json
 import math
 import queue
@@ -126,6 +127,8 @@ def _video_camera_transform(carla, view):
         return carla.Transform(carla.Location(x=-6.0, z=14.0), carla.Rotation(pitch=-68.0))
     if view == "birdview":
         return carla.Transform(carla.Location(z=22.0), carla.Rotation(pitch=-90.0))
+    if view == "front_topdown":
+        return _video_camera_transform(carla, "topdown")
     raise ValueError(f"Unknown video view: {view}")
 
 
@@ -270,6 +273,7 @@ def _load_transfuserpp_baseline(args, device):
         "command_mode": command_mode,
         "control_mode": control_mode,
         "tfpp_speed_mode": args.tfpp_speed_mode,
+        "official_stop_control": bool(args.official_stop_control),
         "target_dim": target_dim,
         "speed_dim": speed_dim,
         "checkpoint_dim": checkpoint_dim,
@@ -386,6 +390,7 @@ def _load_cached_adapter(args, device):
         "command_mode": command_mode,
         "control_mode": _resolve_control_mode(args, baseline=False),
         "tfpp_speed_mode": args.tfpp_speed_mode,
+        "official_stop_control": bool(args.official_stop_control),
         "target_dim": target_dim,
         "speed_dim": speed_dim,
         "checkpoint_dim": checkpoint_dim,
@@ -448,12 +453,94 @@ def _target_speed_scalar(pred_target_speed: torch.Tensor, config, mode: str) -> 
     if pred_target_speed is None or len(target_speeds) == 0:
         return 0.0
     logits = pred_target_speed[0]
-    if mode == "expected":
+    if mode in {"expected", "official"}:
         probs = torch.softmax(logits, dim=0).detach().cpu().numpy()
+        if mode == "official":
+            brake_threshold = float(getattr(config, "brake_uncertainty_threshold", 0.9))
+            if float(probs[0]) > brake_threshold:
+                return float(target_speeds[0])
         return float(np.sum(probs * np.asarray(target_speeds, dtype=np.float32)))
     index = int(torch.argmax(logits).item())
     index = min(max(index, 0), len(target_speeds) - 1)
     return float(target_speeds[index])
+
+
+def _convert_tfpp_boxes(model_info, pred_bb_features):
+    if pred_bb_features is None or not bool(getattr(model_info["prior_config"], "detect_boxes", False)):
+        return []
+    try:
+        boxes = model_info["prior_net"].convert_features_to_bb_metric(pred_bb_features)
+    except Exception as exc:
+        if not model_info.get("_box_warning_printed", False):
+            print(f"warning: TransFuser++ bbox conversion failed once: {exc}", flush=True)
+            model_info["_box_warning_printed"] = True
+        return []
+    if boxes is None:
+        return []
+    try:
+        from transfuser_utils import non_maximum_suppression  # type: ignore
+
+        return non_maximum_suppression([boxes], float(getattr(model_info["prior_config"], "iou_treshold_nms", 0.2)))
+    except Exception:
+        return list(boxes)
+
+
+def _stop_sign_should_brake(carla, model_info, aux, current_speed, control_state) -> bool:
+    if not model_info.get("official_stop_control", False):
+        return False
+    if "bb_buffer" not in control_state:
+        control_state["bb_buffer"] = deque(maxlen=1)
+        control_state["stop_sign_buffer"] = deque(maxlen=1)
+        control_state["clear_stop_sign"] = 0
+
+    boxes = aux.get("bounding_boxes") or []
+    control_state["bb_buffer"].append(boxes)
+    if control_state["clear_stop_sign"] > 0:
+        control_state["clear_stop_sign"] -= 1
+    if not control_state["bb_buffer"]:
+        return False
+
+    try:
+        from transfuser_utils import check_obb_intersection  # type: ignore
+    except Exception:
+        return False
+
+    config = model_info["prior_config"]
+    car_box = carla.BoundingBox(
+        carla.Location(x=0.0, y=0.0, z=0.0),
+        carla.Vector3D(
+            float(getattr(config, "ego_extent_x", 1.0)),
+            float(getattr(config, "ego_extent_y", 1.0)),
+            float(getattr(config, "ego_extent_z", 1.0)),
+        ),
+    )
+
+    for box in control_state["bb_buffer"][-1]:
+        if len(box) > 7 and int(box[7]) == 3:
+            control_state["stop_sign_buffer"].append(box)
+
+    if not control_state["stop_sign_buffer"]:
+        return False
+
+    stop_box = control_state["stop_sign_buffer"][0]
+    stop_carla_box = carla.BoundingBox(
+        carla.Location(x=float(stop_box[0]), y=float(stop_box[1]), z=0.0),
+        carla.Vector3D(float(stop_box[2]), float(stop_box[3]), 1.0),
+    )
+    stop_carla_box.rotation = carla.Rotation(0.0, float(np.rad2deg(stop_box[4])), 0.0)
+
+    should_stop = False
+    if check_obb_intersection(stop_carla_box, car_box) and control_state["clear_stop_sign"] <= 0:
+        if current_speed > 0.01:
+            should_stop = True
+        else:
+            control_state["stop_sign_buffer"].pop()
+            control_state["clear_stop_sign"] = 100
+
+    if control_state["stop_sign_buffer"]:
+        if np.linalg.norm(np.asarray(control_state["stop_sign_buffer"][0][:2], dtype=np.float32)) > abs(float(getattr(config, "max_x", 20.0))):
+            control_state["stop_sign_buffer"].pop()
+    return should_stop
 
 
 def _apply_tfpp_pid_control(carla, vehicle, model_info, aux, current_speed, control_state):
@@ -467,6 +554,9 @@ def _apply_tfpp_pid_control(carla, vehicle, model_info, aux, current_speed, cont
     device = next(model_info["prior_net"].parameters()).device
     speed_t = torch.tensor([float(current_speed)], dtype=torch.float32, device=device)
     steer, throttle, brake = model_info["prior_net"].control_pid_direct(pred_checkpoint, target_speed, speed_t)
+    if _stop_sign_should_brake(carla, model_info, aux, float(current_speed), control_state):
+        throttle = 0.0
+        brake = True
     control_state["desired_speed"] = target_speed
     control_state["steer"] = float(steer)
     control_state["throttle"] = float(throttle)
@@ -496,6 +586,8 @@ def _predict(model_info, device, scalar, layout, image_by_name, lidar_bev):
         outputs = model_info["prior_net"](**inputs)
         pred_target_speed = outputs[1]
         pred_checkpoint = outputs[2]
+        pred_bb_features = outputs[6] if len(outputs) > 6 else None
+        bounding_boxes = _convert_tfpp_boxes(model_info, pred_bb_features)
         base_target = base_target_from_checkpoint(
             pred_checkpoint=pred_checkpoint,
             pred_target_speed=pred_target_speed,
@@ -531,6 +623,7 @@ def _predict(model_info, device, scalar, layout, image_by_name, lidar_bev):
             aux = {
                 "pred_checkpoint": pred_checkpoint[0].detach().cpu().numpy() if pred_checkpoint is not None else None,
                 "target_speed_mps": target_speed_mps,
+                "bounding_boxes": bounding_boxes,
             }
         elif model_info["is_visual"]:
             visual_images = np.stack([_resize_rgb(image_by_name[name], model_info["visual_size"]) for name in cameras], axis=0)
@@ -551,12 +644,14 @@ def _predict(model_info, device, scalar, layout, image_by_name, lidar_bev):
             aux = {
                 "pred_checkpoint": pred_checkpoint[0].detach().cpu().numpy() if pred_checkpoint is not None else None,
                 "target_speed_mps": target_speed_mps,
+                "bounding_boxes": bounding_boxes,
             }
         else:
             out = model_info["adapter"](scalar_t, layout_t, base_target, checkpoint_flat, speed_logits, expected_speed)
             aux = {
                 "pred_checkpoint": pred_checkpoint[0].detach().cpu().numpy() if pred_checkpoint is not None else None,
                 "target_speed_mps": target_speed_mps,
+                "bounding_boxes": bounding_boxes,
             }
 
     pred = out["target"].detach().cpu()[0]
@@ -581,33 +676,10 @@ def _red_light_infraction(carla, vehicle, odom_speed, seen_red_lights, infractio
         infractions["red_light"].append(f"Agent moved through red light {traffic_light.id} at {_location_text(location)}")
 
 
-def _spawn_ego_near_route_start(carla, world, vehicle_bp, route: np.ndarray, args):
-    base_index = min(max(int(args.start_index), 0), len(route) - 1)
-    seen = set()
-    offsets = [0]
-    for offset in range(10, min(len(route), 220), 10):
-        offsets.extend([offset, -offset])
-
-    for offset in offsets:
-        route_index = min(max(base_index + offset, 0), len(route) - 1)
-        if route_index in seen:
-            continue
-        seen.add(route_index)
-        start = route[route_index]
-        spawn = carla.Transform(
-            carla.Location(x=float(start[0]), y=float(start[1]), z=args.spawn_z),
-            carla.Rotation(yaw=math.degrees(float(start[2]))),
-        )
-        vehicle = world.try_spawn_actor(vehicle_bp, spawn)
-        if vehicle is not None:
-            if route_index != base_index:
-                print(f"warning: route start index {base_index} was occupied; spawned at index {route_index}", flush=True)
-            return vehicle, spawn, route_index
-
-    raise RuntimeError(
-        f"Could not spawn ego vehicle near route index {base_index}. "
-        "Restart CARLA or stop other CARLA clients if the route is still occupied."
-    )
+def _compose_front_topdown(front_image: np.ndarray, topdown_image: np.ndarray, video_size: Sequence[int]) -> np.ndarray:
+    front = _resize_rgb(front_image, video_size)
+    topdown = _resize_rgb(topdown_image, video_size)
+    return np.concatenate([front, topdown], axis=1)
 
 
 def rollout(args):
@@ -641,7 +713,12 @@ def rollout(args):
 
         blueprints = world.get_blueprint_library()
         vehicle_bp = blueprints.filter(args.vehicle_filter)[0]
-        vehicle, spawn, selected_start_index = _spawn_ego_near_route_start(carla, world, vehicle_bp, route, args)
+        start = route[min(args.start_index, len(route) - 1)]
+        spawn = carla.Transform(
+            carla.Location(x=float(start[0]), y=float(start[1]), z=args.spawn_z),
+            carla.Rotation(yaw=math.degrees(float(start[2]))),
+        )
+        vehicle = world.spawn_actor(vehicle_bp, spawn)
         actors.append(vehicle)
         vehicle.apply_control(carla.VehicleControl(brake=1.0))
 
@@ -651,13 +728,16 @@ def rollout(args):
 
         video_camera_q = None
         video_size = args.video_image_size or args.image_size
+        writer_size = video_size
+        if args.video_view == "front_topdown":
+            writer_size = [int(video_size[0]) * 2, int(video_size[1])]
         if args.video_output and args.video_image_size:
             video_bp = _camera_blueprint(blueprints, video_size, args.camera_fov, args.hz)
             video_camera = world.spawn_actor(video_bp, _video_camera_transform(carla, args.video_view), attach_to=vehicle)
             actors.append(video_camera)
             video_camera_q = queue.Queue()
             video_camera.listen(video_camera_q.put)
-        video_writer = _open_video_writer(args.video_output, video_size, args.hz, args.video_scale, args.video_codec)
+        video_writer = _open_video_writer(args.video_output, writer_size, args.hz, args.video_scale, args.video_codec)
 
         infractions = _new_infraction_log()
         seen_red_lights = set()
@@ -683,7 +763,7 @@ def rollout(args):
         progress_values = []
         success = False
         route_deviation = False
-        previous_route_idx = selected_start_index
+        previous_route_idx = args.start_index
         control_state = {}
         stop_probs = []
         stop_states = []
@@ -696,11 +776,14 @@ def rollout(args):
             }
             lidar_bev = _carla_lidar_to_bev(_get_matching(lidar_q, frame), args).astype(np.float32)
             imu_data = _get_matching(imu_q, frame)
-            video_image = (
-                _carla_image_to_rgb(_get_matching(video_camera_q, frame), video_size)
-                if video_camera_q is not None
-                else image_by_name["front"]
-            )
+            if video_camera_q is not None:
+                camera_video_image = _carla_image_to_rgb(_get_matching(video_camera_q, frame), video_size)
+                if args.video_view == "front_topdown":
+                    video_image = _compose_front_topdown(image_by_name["front"], camera_video_image, video_size)
+                else:
+                    video_image = camera_video_image
+            else:
+                video_image = image_by_name["front"]
 
             transform = vehicle.get_transform()
             location = transform.location
@@ -737,9 +820,16 @@ def rollout(args):
             scores_now = _score_like_leaderboard(route_completion_pct, infractions)
             if video_writer is not None:
                 frame_bgr = _render_video_frame(video_image, route, odom, traj, progress_m, route_len, route_dist, scores_now, step, args)
+                if args.video_view == "front_topdown":
+                    split_x = int(video_size[0] * args.video_scale)
+                    cv2.line(frame_bgr, (split_x, 0), (split_x, frame_bgr.shape[0] - 1), (255, 255, 255), 2)
+                    cv2.putText(frame_bgr, "front camera", (12, frame_bgr.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(frame_bgr, "front camera", (12, frame_bgr.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame_bgr, "top-down", (split_x + 12, frame_bgr.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(frame_bgr, "top-down", (split_x + 12, frame_bgr.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
                 line = (
                     f"{model_info['mode']}  {model_info['control_mode']}  stop {stop_prob:.2f} state {stop_state} reason {stop_reason} "
-                    f"cmd_v {control_state.get('desired_speed', 0.0):.2f}"
+                    f"cmd_v {control_state.get('desired_speed', 0.0):.2f} throttle {control_state.get('throttle', 0.0):.2f} brake {control_state.get('brake', 0.0):.2f}"
                 )
                 cv2.putText(frame_bgr, line, (12, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(frame_bgr, line, (12, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
@@ -757,8 +847,10 @@ def rollout(args):
                 break
             if route_dist > args.failure_distance_m:
                 route_deviation = True
-                infractions["route_dev"].append(f"Agent deviated from route at {_location_text(location)} distance={route_dist:.2f}m")
-                break
+                if not infractions["route_dev"]:
+                    infractions["route_dev"].append(f"Agent deviated from route at {_location_text(location)} distance={route_dist:.2f}m")
+                if not args.continue_on_route_deviation:
+                    break
 
         if not success and not route_deviation and len(cross_track_errors) >= max_steps:
             infractions["route_timeout"].append(f"Route timeout after {args.duration_sec:.1f}s")
@@ -824,7 +916,8 @@ def build_arg_parser():
     parser.add_argument("--tfpp-camera", default="")
     parser.add_argument("--command-mode", choices=["", "lane_follow", "target_angle"], default="")
     parser.add_argument("--control-mode", choices=["auto", "teach2drive", "tfpp_pid"], default="auto")
-    parser.add_argument("--tfpp-speed-mode", choices=["argmax", "expected"], default="argmax")
+    parser.add_argument("--tfpp-speed-mode", choices=["argmax", "expected", "official"], default="argmax")
+    parser.add_argument("--official-stop-control", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--duration-sec", type=float, default=60.0)
     parser.add_argument("--warmup-sec", type=float, default=1.0)
     parser.add_argument("--hz", type=int, default=10)
@@ -869,13 +962,14 @@ def build_arg_parser():
     parser.add_argument("--stop-prob-threshold", type=float, default=0.85)
     parser.add_argument("--goal-tolerance-m", type=float, default=5.0)
     parser.add_argument("--failure-distance-m", type=float, default=12.0)
+    parser.add_argument("--continue-on-route-deviation", action="store_true")
     parser.add_argument("--route-search-back", type=int, default=15)
     parser.add_argument("--route-search-ahead", type=int, default=300)
     parser.add_argument("--count-red-lights", action="store_true")
     parser.add_argument("--red-light-speed-threshold", type=float, default=0.3)
     parser.add_argument("--report-every-sec", type=float, default=5.0)
     parser.add_argument("--video-output", default="")
-    parser.add_argument("--video-view", choices=["front", "chase", "topdown", "birdview"], default="topdown")
+    parser.add_argument("--video-view", choices=["front", "chase", "topdown", "birdview", "front_topdown"], default="topdown")
     parser.add_argument("--video-image-size", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--video-scale", type=float, default=1.0)
     parser.add_argument("--video-codec", default="mp4v")

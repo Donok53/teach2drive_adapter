@@ -51,7 +51,7 @@ stop_carla() {
   fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
   mapfile -t pids < <(
     ps -eo pid=,comm=,args= | awk -v port="-carla-rpc-port=${PORT}" '
-      ($2 ~ /CarlaUE4/ || $0 ~ /CarlaUE4-Linux-Shipping/) && index($0, port) > 0 {print $1}
+      $2 ~ /^CarlaUE4/ && index($0, port) > 0 {print $1}
     '
   )
   if (( ${#pids[@]} > 0 )); then
