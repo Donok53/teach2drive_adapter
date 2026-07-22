@@ -191,7 +191,11 @@ def build_cache(args: argparse.Namespace) -> None:
         image_size=tuple(args.image_size),
         lidar_size=args.lidar_size,
         episode_root_override=args.episode_root_override,
+        teacher_view_root=(args.teacher_view_root or None),
+        teacher_view_dirname=args.teacher_view_dirname,
+        teacher_view_camera=args.tfpp_camera,
     )
+    _use_teacher_view = bool(args.teacher_view_root)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     net, config, load_info = load_transfuserpp(args.garage_root, args.team_config, device=device, checkpoint=args.checkpoint)
     feature_then_fusion_adapter, feature_then_fusion_info = _load_feature_then_fusion_adapter(
@@ -242,10 +246,16 @@ def build_cache(args: argparse.Namespace) -> None:
     speed_classes = len(getattr(config, "target_speeds", []))
     start = time.time()
     seen = 0
+    _tfpp_idx = cameras.index(args.tfpp_camera) if args.tfpp_camera in cameras else 0
     for step, batch in enumerate(loader, start=1):
         scalar = batch["scalar"].to(device, non_blocking=True)
         camera = batch["camera"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
+        if _use_teacher_view and "camera_teacher" in batch:
+            # replace the tfpp_camera channel with the reprojected x=-1.5 teacher view
+            camera_teacher = batch["camera_teacher"].to(device, non_blocking=True)  # [B,1,3,H,W]
+            camera = camera.clone()
+            camera[:, _tfpp_idx] = camera_teacher[:, 0]
         inputs = prepare_transfuserpp_inputs(
             scalar=scalar,
             camera=camera,
@@ -332,6 +342,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-root-override", default="")
     parser.add_argument("--cameras", default="front,left,right")
     parser.add_argument("--tfpp-camera", default="front")
+    # v5: build the TEACHER prior cache from the reprojected x=-1.5 view instead of
+    # the real (shifted) camera. When set, the tfpp_camera channel is replaced by
+    # the reprojected view loaded from <teacher-view-root>/<source_route>/<dirname>/<step>.jpg
+    parser.add_argument("--teacher-view-root", default="")
+    parser.add_argument("--teacher-view-dirname", default="rgb_front_teacher_xm15")
     parser.add_argument("--command-mode", choices=["lane_follow", "target_angle"], default="target_angle")
     parser.add_argument("--image-size", type=int, nargs=2, default=[640, 360], metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--lidar-size", type=int, default=128)
