@@ -315,7 +315,10 @@ class _BackboneTaskPatch:
         self.records.clear()
         self.xmodal_records.clear()
         self.last_fused = None
-        self.teacher_feats = {}
+        # NOTE: do NOT clear teacher_feats here. clear() is called between the
+        # prior pass and the student pass (see forward), and the student pass needs
+        # the teacher features captured earlier. teacher_feats is (re)initialized at
+        # the top of forward() instead.
         self._capture_teacher = False
 
     def drift_loss(self, device: torch.device) -> torch.Tensor:
