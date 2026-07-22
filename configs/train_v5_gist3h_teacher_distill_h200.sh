@@ -56,7 +56,11 @@ STOP_NEGATIVE_LOSS_SCALE=${STOP_NEGATIVE_LOSS_SCALE:-2.0}
 STOP_LOSS_AFTER_EPOCH=${STOP_LOSS_AFTER_EPOCH:-4}
 TEACHER_TRAJ_BLEND=${TEACHER_TRAJ_BLEND:-$TEACHER_TARGET_BLEND}
 TEACHER_SPEED_TARGET_BLEND=${TEACHER_SPEED_TARGET_BLEND:-$TEACHER_TARGET_BLEND}
-TEACHER_STOP_TARGET_BLEND=${TEACHER_STOP_TARGET_BLEND:-$TEACHER_TARGET_BLEND}
+# teacher base_target[:, -1] is a RAW stop logit (range ~-39..1), NOT a binary
+# flag. Blending it into the BCE stop target makes the target leave [0,1] and
+# the stop BCE unbounded-negative -> loss diverges to -inf. Camera viewpoint does
+# not change the stop flag, so keep stop supervision purely on the binary target.
+TEACHER_STOP_TARGET_BLEND=${TEACHER_STOP_TARGET_BLEND:-0.0}
 
 echo "=== v5 reprojection-teacher distillation ==="
 echo "student=$STUDENT_CACHE"
