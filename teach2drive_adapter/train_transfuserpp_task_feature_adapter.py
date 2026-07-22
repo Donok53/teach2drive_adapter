@@ -303,12 +303,20 @@ class _BackboneTaskPatch:
         _xm = _xmodal_config()
         self.xmodal_temp = float(_xm["temp"]) if float(_xm["weight"]) > 0.0 else None
         self.last_fused: torch.Tensor | None = None
+        # v4 geometric-teacher distillation: when _capture_teacher is True the
+        # original fuse path stores per-layer image features (from the reprojected
+        # x=-1.5 view) into teacher_feats; the student pass then uses those as the
+        # `_record` reference instead of its own un-adapted features.
+        self.teacher_feats: dict[int, torch.Tensor] = {}
+        self._capture_teacher = False
         self._install()
 
     def clear(self) -> None:
         self.records.clear()
         self.xmodal_records.clear()
         self.last_fused = None
+        self.teacher_feats = {}
+        self._capture_teacher = False
 
     def drift_loss(self, device: torch.device) -> torch.Tensor:
         if not self.records:
@@ -352,6 +360,12 @@ class _BackboneTaskPatch:
 
         def adapted_fuse_features(image_features, lidar_features, layer_idx):
             if not patch.enabled:
+                if patch._capture_teacher:
+                    # teacher pass (adapter off): store the x=-1.5 view's per-layer
+                    # image feature (same avgpool as the student path) as the
+                    # distillation target for this fusion layer.
+                    tidx = int(layer_idx)
+                    patch.teacher_feats[tidx] = backbone.avgpool_img(image_features).detach()
                 return patch.original_fuse_features(image_features, lidar_features, layer_idx)
 
             idx = int(layer_idx)
@@ -378,7 +392,10 @@ class _BackboneTaskPatch:
 
             adapted_image, adapted_lidar = patch.adapter.adapt_layer(idx, image_embd_layer.float(), lidar_embd_layer.float())
             if patch.stage_adapter_modalities in {"all", "camera"}:
-                patch._record(adapted_image, image_embd_layer)
+                # v4: distill toward the teacher (x=-1.5 reprojected view) feature when
+                # available; otherwise fall back to the original self-reference (drift reg).
+                cam_ref = patch.teacher_feats.get(idx, image_embd_layer)
+                patch._record(adapted_image, cam_ref)
             else:
                 adapted_image = image_embd_layer.float()
             if patch.stage_adapter_modalities in {"all", "lidar"}:
@@ -721,6 +738,7 @@ class _TaskAdapterForward(nn.Module):
         lidar: torch.Tensor,
         target_dim: int,
         speed_dim: int,
+        camera_teacher: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         patch = self._ensure_patch()
         inputs = prepare_transfuserpp_inputs(
@@ -742,6 +760,40 @@ class _TaskAdapterForward(nn.Module):
             lidar_shift_y_m=self.lidar_shift_y_m,
             lidar_pixels_per_meter=self.lidar_pixels_per_meter,
         )
+
+        # v4: capture geometric-teacher features from the reprojected x=-1.5 view.
+        # Only the camera(rgb) is swapped; lidar/scalar identical -> the fusion
+        # layers' image branch encodes the pretrained-rig viewpoint, which becomes
+        # the _record distillation target for the student pass below.
+        patch.teacher_feats = {}
+        if camera_teacher is not None:
+            teacher_inputs = prepare_transfuserpp_inputs(
+                scalar=scalar,
+                camera=camera_teacher,
+                lidar=lidar,
+                cameras=[self.tfpp_camera],
+                config=self.config,
+                command_mode=self.command_mode,
+                tfpp_camera=self.tfpp_camera,
+                camera_crop_shift_x_px=self.camera_crop_shift_x_px,
+                camera_crop_shift_y_px=self.camera_crop_shift_y_px,
+                camera_crop_scale=self.camera_crop_scale,
+                camera_ground_plane_warp=self.camera_ground_plane_warp,
+                camera_ground_plane_source_pose=self.camera_ground_plane_source_pose,
+                camera_ground_plane_target_pose=self.camera_ground_plane_target_pose,
+                camera_ground_plane_z_m=self.camera_ground_plane_z_m,
+                lidar_shift_x_m=self.lidar_shift_x_m,
+                lidar_shift_y_m=self.lidar_shift_y_m,
+                lidar_pixels_per_meter=self.lidar_pixels_per_meter,
+            )
+            patch.enabled = False
+            patch._capture_teacher = True
+            try:
+                with torch.no_grad():
+                    self.net(**teacher_inputs)
+            finally:
+                patch._capture_teacher = False
+                patch.enabled = True
 
         patch.enabled = False
         try:
@@ -1254,6 +1306,9 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int, 
         scalar = batch["scalar"].to(device, non_blocking=True)
         camera = batch["camera"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
+        camera_teacher = batch.get("camera_teacher")
+        if camera_teacher is not None:
+            camera_teacher = camera_teacher.to(device, non_blocking=True)
         loss_batch = batch
         if (train or force_perturb) and float(perturb_cfg["prob"]) > 0.0:
             camera, scalar, _pt = _apply_recovery_perturbation(
@@ -1268,6 +1323,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int, 
                 lidar,
                 target_dim=loss_batch["target"].shape[1],
                 speed_dim=int(args.speed_dim),
+                camera_teacher=camera_teacher,
             )
             losses = _losses(pred_target, loss_batch, drift_loss, prior_target, aux, device, args)
             anchor_loss = _trainable_anchor_loss(model, getattr(args, "_trainable_anchor_state", {}), device)
@@ -1383,6 +1439,7 @@ def train(args: argparse.Namespace) -> None:
     if int(args.max_val_samples) > 0:
         val_indices = val_indices[: int(args.max_val_samples)]
 
+    _teacher_root = args.teacher_view_root or None
     train_ds = Teach2DriveIndexDataset(
         args.index,
         indices=train_indices,
@@ -1390,6 +1447,9 @@ def train(args: argparse.Namespace) -> None:
         image_size=tuple(args.image_size),
         lidar_size=int(args.lidar_size),
         episode_root_override=args.episode_root_override,
+        teacher_view_root=_teacher_root,
+        teacher_view_dirname=args.teacher_view_dirname,
+        teacher_view_camera=args.tfpp_camera,
     )
     val_ds = Teach2DriveIndexDataset(
         args.index,
@@ -1398,6 +1458,9 @@ def train(args: argparse.Namespace) -> None:
         image_size=tuple(args.image_size),
         lidar_size=int(args.lidar_size),
         episode_root_override=args.episode_root_override,
+        teacher_view_root=_teacher_root,
+        teacher_view_dirname=args.teacher_view_dirname,
+        teacher_view_camera=args.tfpp_camera,
     )
     train_loader = DataLoader(
         train_ds,
@@ -1779,6 +1842,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a target-only task-driven TransFuser++ feature-then-fusion adapter.")
     parser.add_argument("--index", required=True)
     parser.add_argument("--episode-root-override", default="")
+    # v4 geometric-teacher distillation: root that holds <source_route>/<dirname>/<step>.jpg
+    # reprojected x=-1.5 views. Empty -> disabled (drift stays a self-reference regularizer).
+    parser.add_argument("--teacher-view-root", default="")
+    parser.add_argument("--teacher-view-dirname", default="rgb_front_teacher_xm15")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--garage-root", required=True)
     parser.add_argument("--team-config", required=True)

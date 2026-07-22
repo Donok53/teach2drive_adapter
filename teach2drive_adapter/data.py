@@ -87,7 +87,17 @@ class Teach2DriveIndexDataset(Dataset):
         image_size: Tuple[int, int] = (320, 180),
         lidar_size: int = 128,
         episode_root_override: Optional[str] = None,
+        teacher_view_root: Optional[str] = None,
+        teacher_view_dirname: str = "rgb_front_teacher_xm15",
+        teacher_view_camera: str = "front",
     ) -> None:
+        # v4 geometric-teacher distillation: if teacher_view_root is set, __getitem__
+        # additionally loads the reprojected x=-1.5 view for `teacher_view_camera`
+        # from  <teacher_view_root>/<source_route>/<teacher_view_dirname>/<step>.jpg
+        # and returns it as "camera_teacher" [1,3,H,W]. Disabled (None) by default.
+        self.teacher_view_root = Path(teacher_view_root).expanduser() if teacher_view_root else None
+        self.teacher_view_dirname = str(teacher_view_dirname)
+        self.teacher_view_camera = str(teacher_view_camera)
         self.index_path = Path(index_path).expanduser()
         arrays = np.load(self.index_path, allow_pickle=True)
         self.scalar = arrays["scalar_features"].astype(np.float32)
@@ -178,7 +188,22 @@ class Teach2DriveIndexDataset(Dataset):
                 if loaded.shape == DEPTH_GT_HW:
                     depth_gt = loaded
 
-        return {
+        result_extra = {}
+        if self.teacher_view_root is not None:
+            src_route = frame.get("source_route")
+            step = frame.get("step")
+            teacher_img = None
+            if src_route is not None and step is not None:
+                tpath = (self.teacher_view_root / str(src_route) / self.teacher_view_dirname / f"{int(step):04d}.jpg")
+                if tpath.exists():
+                    teacher_img = _load_image(tpath, self.image_size)
+            if teacher_img is None:
+                # fallback: use the real front view so the distill loss is a no-op (self-ref)
+                fi = self.cameras.index(self.teacher_view_camera) if self.teacher_view_camera in self.cameras else 0
+                teacher_img = images[fi]
+            result_extra["camera_teacher"] = torch.from_numpy(teacher_img[None])  # [1,3,H,W]
+
+        sample = {
             "index": torch.tensor(idx, dtype=torch.long),
             "episode_idx": torch.tensor(episode_idx, dtype=torch.long),
             "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
@@ -195,6 +220,10 @@ class Teach2DriveIndexDataset(Dataset):
             "sample_weight": torch.from_numpy(self.sample_weight[idx]),
             "layout": torch.from_numpy(self.layouts[episode_idx]),
         }
+        # only include the key when enabled, so default collate is unaffected otherwise
+        if "camera_teacher" in result_extra:
+            sample["camera_teacher"] = result_extra["camera_teacher"]
+        return sample
 
 
 def split_by_episode(index_path: str, val_ratio: float = 0.15, seed: int = 41) -> Tuple[np.ndarray, np.ndarray]:
