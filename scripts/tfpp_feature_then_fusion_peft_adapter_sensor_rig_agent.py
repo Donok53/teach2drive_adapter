@@ -63,6 +63,24 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
             modules_per_net.append(modules)
             load_infos.append(load_info)
 
+        # v5: restore the full trained TF++ net (unfrozen backbone + adapted BatchNorm running
+        # stats + LoRA base) on top of the base ensemble. Must run AFTER LoRA is installed so the
+        # LoRA-wrapped keys exist. Backward compatible: legacy checkpoints have no "tfpp_state".
+        tfpp_state = checkpoint.get("tfpp_state", {})
+        if tfpp_state:
+            tf_missing = tf_unexpected = 0
+            for net in self.nets:
+                m, u = net.load_state_dict(tfpp_state, strict=False)
+                tf_missing += len(m)
+                tf_unexpected += len(u)
+            print(
+                "[FeatureThenFusionPeftAdapterSensorRigAgent] tfpp_state=on (backbone+BN restored) "
+                f"nets={len(self.nets)} missing={tf_missing} unexpected={tf_unexpected}",
+                flush=True,
+            )
+        else:
+            print("[FeatureThenFusionPeftAdapterSensorRigAgent] tfpp_state=off (legacy checkpoint)", flush=True)
+
         first_modules = modules_per_net[0] if modules_per_net else []
         unexpected = sum(len(info.get("unexpected", [])) for info in load_infos)
         missing = sum(len(info.get("missing", [])) for info in load_infos)
@@ -95,15 +113,21 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
             speed_logit_scale=float(residual_meta.get("speed_logit_scale", 1.5)),
             gate_bias=float(residual_meta.get("gate_bias", -2.0)),
             dropout=0.0,
+            checkpoint_lateral_only=bool(residual_meta.get("checkpoint_lateral_only", False)),
         ).to(self.device)
         missing, unexpected = self._output_residual_head.load_state_dict(residual_state, strict=False)
         self._output_residual_head.eval()
+        self._output_residual_blend = min(
+            1.0, max(0.0, float(os.environ.get("TFPP_OUTPUT_RESIDUAL_BLEND", "1.0")))
+        )
         self._patch_output_residual_for_nets()
         print(
             "[FeatureThenFusionPeftAdapterSensorRigAgent] output_residual=on "
             f"missing={len(missing)} unexpected={len(unexpected)} "
             f"checkpoint_scale={float(residual_meta.get('checkpoint_scale', 0.75)):.3f} "
-            f"speed_logit_scale={float(residual_meta.get('speed_logit_scale', 1.5)):.3f}",
+            f"speed_logit_scale={float(residual_meta.get('speed_logit_scale', 1.5)):.3f} "
+            f"lateral_only={int(bool(residual_meta.get('checkpoint_lateral_only', False)))} "
+            f"blend={self._output_residual_blend:.3f}",
             flush=True,
         )
 
@@ -130,9 +154,11 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
                     )
                 out = list(output)
                 if adapted_speed is not None:
-                    out[1] = adapted_speed
+                    blend = float(getattr(self, "_output_residual_blend", 1.0))
+                    out[1] = pred_target_speed + blend * (adapted_speed - pred_target_speed)
                 if adapted_checkpoint is not None:
-                    out[2] = adapted_checkpoint
+                    blend = float(getattr(self, "_output_residual_blend", 1.0))
+                    out[2] = pred_checkpoint + blend * (adapted_checkpoint - pred_checkpoint)
                 return tuple(out) if isinstance(output, tuple) else out
 
             net.forward = residual_forward

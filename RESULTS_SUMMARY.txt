@@ -1,0 +1,187 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║        TEACH2DRIVE 성능 비교 — 최종 정리  (20 미션, 180s, 2026-07-28)          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+세 가지 구성 비교
+┌────────────┬───────────┬──────────────┬──────────────┬────────────────────────┐
+│ 구성       │ 차량      │ 센서(카메라) │ 어댑터       │ 의미                   │
+├────────────┼───────────┼──────────────┼──────────────┼────────────────────────┤
+│ native     │ Lincoln   │ canonical    │ 없음         │ 원본 TF++ (기준/상한)  │
+│ test1      │ Tesla     │ canonical    │ 없음         │ 차량만 바뀜 (센서 원래)│
+│ v4 (best)  │ Tesla     │ shifted      │ feature-dist │ 우리 배포 + 최고 어댑터│
+└────────────┴───────────┴──────────────┴──────────────┴────────────────────────┘
+
+성능 (높을수록 좋음)
+┌────────────┬────────────┬──────────────┬───────────────┐
+│ 구성       │ PASS /20   │ mean_route   │ mean_composed │
+├────────────┼────────────┼──────────────┼───────────────┤
+│ native     │   14       │   100.0      │     94.4      │
+│ test1      │    7       │    90.1      │     78.1      │
+│ v4 (best)  │   10       │    81.5      │     70.5      │
+└────────────┴────────────┴──────────────┴───────────────┘
+
+gap 분해  (composed 기준, native 94.4 이 상한)
+┌────────────────────────────────┬───────────┬────────────────────────────────┐
+│ 구간                           │ Δcomposed │ 원인                           │
+├────────────────────────────────┼───────────┼────────────────────────────────┤
+│ native → test1                 │  -16.3    │ 차량 변경 (Lincoln→Tesla)      │
+│  (같은 canonical 카메라)       │  (~68%)   │ = 교차로 충돌 ↑                │
+│ test1 → v4                     │   -7.6    │ 센서 이동 (canonical→shifted)  │
+│  (어댑터가 일부 회복)          │  (~32%)   │ = 완주/내비 저하               │
+├────────────────────────────────┼───────────┼────────────────────────────────┤
+│ native → v4  (전체 gap)        │  -23.9    │ 차량 + 카메라                  │
+└────────────────────────────────┴───────────┴────────────────────────────────┘
+
+─ 핵심 결론 ────────────────────────────────────────────────────────────────────
+  • 전체 gap(-23.9)의 약 2/3(-16.3)는 "Tesla 차량", 1/3(-7.6)은 "shifted 카메라".
+    → 지배적 요인은 카메라가 아니라 **차량(Tesla)**.
+  • test1(차량만 바뀜)이 canonical 카메라인데도 78.1까지 떨어짐 = 카메라와 무관하게
+    Tesla가 교차로에서 충돌. (같은 문제가 수집에선 CARLA 크래시로 나타남)
+  • v4 어댑터는 shifted 카메라 손실을 부분 회복(PASS 7→10)했으나, 차량 축은 못 고침.
+  • 후속 변형 v4c/v4d/v4e/v5 는 전부 v4보다 나빴음 → v4가 이 접근의 천장.
+
+  주의: 20미션 single-run 이라 ±수치 노이즈 있음 (빠른 점검용 벤치마크).
+
+─ v6: 차량 적응 격리 실험 (canonical 카메라 + Tesla, 2026-07-30) ────────────────
+  목적 : 카메라 문제 제거(canonical)한 채 "차량 적응만" 얹으면 test1(78)을 넘어
+         native(94)에 다가가는지 측정.
+  방법 : canonical 입력 + Tesla 전문가 imitation LoRA fine-tune, feature-distill=0.
+  결과 (composed):
+    native (적응X)            94.4
+    test1  (적응X, 기준선)    78.1
+    v6-vb  (rank16)           50.15   pass 1
+    v6-vd  (rank16+speed-res) 29.64   pass 0
+    v6-va  (rank8)            28.60   pass 0
+    v6-vc  (rank16+강한 모방) 19.91   pass 0
+  결론 : 4개 변형 전부 test1(적응X)보다 크게 나쁨 → "차량 적응 LoRA를 3h로 얹으면
+         아무것도 안 한 것보다 더 망가진다." 강하게 imitate할수록(vc) 더 붕괴.
+         카메라가 canonical(정상)인데도 무너짐 = 순수 "3h LoRA 과적합"이 TF++ 파괴.
+
+─ 전체 적응 시도 종합 ──────────────────────────────────────────────────────────
+  카메라 적응   v4 (feature-distill + 앵커)     70.5  ✅ 유일한 성공(천장 78 근접)
+  카메라 강화   v5 (drift↑)                     16    ❌ 붕괴
+  차량(행동)    v4c/v4d/v4e (residual/perturb)  <v4   ❌ 다 나빠짐
+  차량(격리)    v6 va/vb/vc/vd                  <50   ❌ 전부 test1보다 나쁨
+  => v4(70.5)가 실질 최종 결과. 차량 축은 3h 단일차량 적응으로 해결 불가(오히려 독).
+
+─ 돌파구: 컨트롤러 파라미터 오프라인 보정 (system-ID, 학습 아님, 2026-07-31) ──────
+  발상 : 차량 갭 = "컨트롤러 미스매치"(웨이포인트는 맞는데 Lincoln튜닝 컨트롤러로
+         Tesla를 실행). 컨트롤러 상수는 아는/측정가능 값 → 오프라인 데이터로 system-ID.
+  system-ID (CARLA 안 씀, 순수 오프라인):
+    steering_gain      0.368 -> 0.530  (Tesla가 1.44x 더 꺾임)
+    brake_acceleration -4.95 -> -5.68  (15% 강한 제동)
+    throttle_accel      0.56 -> 3.87   (원래값이 비현실적으로 낮았음)
+  결과 (composed):
+    native                         94.4  (14 pass)
+    test1c (steer+brake+throttle)  진행중
+    test1b (steer_gain만)          82.23 (10 pass)   ← +4.1 / +3pass vs test1
+    test1  (보정 전)               78.10 ( 7 pass)
+  => "차량 종류도 오프라인 컨트롤러 보정으로 적응 가능" 첫 증명. 벽 아님.
+     v6(LoRA 학습)은 과적합해 실패했지만, system-ID(파라미터 보정)는 성공.
+
+─ 다회(3-seed) 평균으로 재검증: steering 보정 효과 (2026-08-08) ─────────────────
+  목적 : test1b의 단발 "+4.1"이 진짜인지 seed 노이즈인지 판정. GPU1 순차, seed 0/1/2.
+  집계 : 러너 mean_composed (test1/test1b와 동일 방식).
+                        seed0   seed1   seed2   평균     평균pass
+    baseline(steer0.37) 78.10   74.42   80.85   77.79    8.0 (7/8/9)
+    steering(steer0.53) 82.23   75.45   79.96   79.21    9.3 (10/8/10)
+    델타                +4.1    +1.0    -0.9    +1.42    +1.3
+    seed간 std ≈ 2.7 (composed)
+  결론 : composed +1.4 는 노이즈(±2.7) 안에 묻힘 → seed0의 +4.1은 운이 섞인 과장값.
+         단 pass는 3 seed 모두 steering >= baseline (평균 +1.3 pass) = 작지만 실재하는
+         완주율 개선. => steering_gain 오프라인 보정 효과는 REAL but SMALL.
+         "차량=벽 아님"의 방향은 유지되나 파라미터 1개로 회복되는 폭은 제한적.
+
+─ 오프라인 컨트롤러 보정의 천장 확정 (미분가능 system-ID, 3-seed, 2026-08-08) ────
+  목적 : "canonical이라 perception은 native와 동일 → 오프라인 컨트롤러/plant 보정으로
+         차량 갭(-16)을 native까지 회복 가능한가"를 끝까지 검증.
+  방법 : 페어드 3h로 배포 컨트롤러/추정기 상수를 미분가능하게 오프라인 피팅.
+  발견 (각 레버의 실체):
+    steering_gain : UKF predict에만 쓰이고 R_angle=1e-15(측정지배)라 주행 무영향 = 죽은 레버.
+                    엄밀 피팅값 0.246 (예전 0.53은 오류; heading RMSE 최악). +1.3은 노이즈.
+    lateral k_p   : 실제 steer 레버. 전문가 steer는 heading_error에 corr 0.981 순수비례.
+                    Lincoln k_p=3.118 이미 근접 → 오프라인 최적 3.47 (+11%, 작음).
+    lateral k_d,ki: 4Hz 저장 vs 20Hz 배포 timestep 불일치로 오프라인 식별 불가.
+    throttle/brake: 다항식 재피팅 RMSE 0.56->0.50 / brake 개선 0 = 미미.
+  평가 (k_p 3.47 + throttle 재피팅, Tesla+canonical, 3-seed 60미션):
+                        seed0  seed1  seed2   평균    pass   std
+    k_p 보정            77.5   82.1   72.2    77.3    8.7   4.05
+    baseline(보정 전)   78.1   74.4   80.9    77.8    8.0   2.63
+    native(상한)                             94.4    14
+    델타(보정-baseline) = -0.5 composed / +0.7 pass  → 노이즈(±4) 안, 무차별.
+  결론 : 오프라인으로 방어가능한 모든 보정을 다 해도 차량 갭 회복 = 0 (native까지 -17 잔존).
+         배포 컨트롤러는 이미 Tesla 전문가 명령을 corr 0.95~0.98로 재현 → 명령은 안 틀림.
+         갭은 "같은 명령에 Tesla가 CARLA에서 다르게 반응(plant)"하는 closed-loop 현상이라
+         open-loop 오프라인 보정으로 원리적으로 불가. (v6 LoRA 실패와 동일 근원.)
+         => 차량축 적응은 closed-loop 데이터 없이는 못 닫는다는 것이 정량적으로 확정됨.
+
+─ 차량 dynamics inverse adapter v1 (Tesla+canonical, 2026-08-14) ───────────────
+  이전 결론 수정:
+    단순 controller 상수/전문가 steer 모방으로는 차량 gap을 닫지 못하지만, 기록 pose로
+    steer→yaw-rate plant를 직접 식별하면 closed-loop 시뮬레이터 학습 없이도 개선 가능.
+
+  학습:
+    입력  = speed_t, causal yaw_rate_t, expert steer_t
+    정답  = yaw_rate_(t+0.25s)
+    모델  = 7계수 speed-conditioned polynomial forward dynamics
+    실행  = TF++ checkpoint에서 pure-pursuit desired yaw-rate 계산 후 원본 steer ±0.12
+            범위의 bounded inverse search. 저속/직진은 identity, 평가 blend=0.5.
+    주의  = 전문가 steer와 TF++ steer를 직접 맞추지 않으므로 planner/timing label 혼입 없음.
+            yaw-rate는 실제 차량 IMU에서도 얻을 수 있어 simulator privileged feedback가 아님.
+
+  오프라인 검증:
+    validation MAE 0.0367(persistence) → 0.0180 rad/s, R²=0.897.
+    보정 활성 41.1%, 활성구간 평균 |Δsteer|=0.0318 (blend 전), p95=0.09.
+
+  closed-loop 결과 (single 20-mission run, mission13 INVALID 별도 재평가 반영):
+                          PASS    mean_route   mean_composed
+    native Lincoln        14/20     100.0          94.4
+    Tesla canonical        7/20      90.1          78.1
+    dynamics v1            10/20    100.0          83.74
+
+    FAIL→PASS: mission 2, 11, 15, 17
+    PASS→FAIL: mission 4
+    route 부분/timeout→100% 완주: mission 5, 8, 13 (단 collision penalty로 FAIL)
+
+  해석:
+    차량 적응은 실제로 개선됐지만 native 14/20에는 아직 4 pass 부족.
+    forward plant 식별보다 남은 병목은 TF++ checkpoint→desired yaw-rate 변환과 회전의
+    진입/이탈 phase. 남은 주요 FAIL은 vehicle collision이며, steer 변경이 공간 경로와
+    교차로 도착 timing을 함께 바꾼 영향도 포함됨. 단일 run 변동이 있으므로 동일 seed의
+    matched baseline과 3-seed 재검증 전에는 +3 pass를 확정 효과로 과해석하지 말 것.
+
+  다음 우선순위:
+    1) dynamics 모델은 고정하고 desired yaw-rate generator만 튜닝/학습.
+       expert future pose로 정의한 geometric curvature를 정답으로 사용하되 expert steer는
+       사용하지 않는다. speed + turn-entry/apex/exit 조건의 작은 bounded gain을 학습한다.
+    2) correction trace(heading, desired/actual yaw-rate, base/adapted steer)를 저장해
+       mission 2(개선)와 4(회귀)의 turn phase를 직접 비교한다.
+    3) v2 후보를 0.25/0.5 blend paired A/B로 선별 후 같은 baseline과 3-seed 평가한다.
+    4) vehicle dynamics v2가 확정된 뒤에만 shifted-camera Stage 2와 결합한다.
+
+─ 차량 dynamics inverse adapter v2 선별 평가 (2026-08-14) ─────────────────────
+  변경:
+    • frozen v1 plant는 유지하고, TF++ checkpoint curvature에 곱할 bounded gain
+      [0.75, 1.15]의 5계수 calibrator만 전문가 future pose의 공간 curvature로 학습.
+      전문가 steer는 yaw-rate calibrator 정답에 사용하지 않음.
+    • brake, target speed < 2 m/s, turn exit, actual yaw-rate overshoot에서 보정을
+      줄이거나 identity로 복귀.
+    • compass heading, heading error, desired/actual yaw-rate, base/final steer,
+      각 gate와 turn phase를 JSONL trace로 저장.
+
+  calibrator validation:
+    checkpoint curvature MAE 0.01798 → 0.01354 (24.7% 감소)
+    gain mean: entry 0.804, apex 0.851, exit 0.885
+    v2 offline active 34.2% (v1 41.1%), mean |Δsteer| 0.0105 (v1 0.0131),
+    p95 0.0595 (v1 0.0900). risk/overshoot gate-off 구간은 Δsteer 정확히 0.
+
+  문제 미션 2,4,5,8,11,15,17 single-seed 선별:
+                PASS    mean_route   mean_composed   infractions
+    baseline     3/7       70.80          66.77           3
+    blend 0.25   2/7       78.26          63.64           4
+    blend 0.50   4/7       93.77          86.54           2
+
+  결론:
+    blend 0.50을 20미션 × seed 0/1/2 확정 평가 후보로 선택.
+    결과 경로: runs/eval_vehicle_dynamics_v2_selected_ab_20260814
+    3-seed 경로: runs/eval_vehicle_dynamics_v2_b050_20x3seed_20260814 (진행 중)

@@ -1,5 +1,12 @@
 # Teach2Drive Adapter
 
+## Current experiment handoff
+
+The latest vehicle-adaptation status, successful and failed experiments, the
+fixed TF++ checkpoint/speed LoRA setup, and DL2 continuation commands are in
+[`EXPERIMENT_HANDOFF_20260816.md`](EXPERIMENT_HANDOFF_20260816.md).  The deeper
+design audit is in [`VEHICLE_ADAPTATION_AUDIT.md`](VEHICLE_ADAPTATION_AUDIT.md).
+
 This folder is the second-stage research codebase for Teach2Drive.
 
 The old `teach2drive_bootstrap` project answers:
@@ -246,6 +253,26 @@ This track should compare:
 | action adapter only | Whether output correction alone is enough. |
 | layout adapter | Whether camera/LiDAR pose metadata improves small-data adaptation. |
 | partial/full fine-tune | Upper-bound comparison when compute and data are enough. |
+
+### Exact TransFuser++ sensor preprocessing
+
+TF++ adapter experiments must preserve the pretrained model's sensor input
+contract. The target vehicle and sensor extrinsics may change, but RGB
+resolution/intrinsics and the LiDAR representation must not be approximated.
+
+Convert the PDM-Lite subset with:
+
+```bash
+python scripts/convert_pdm_lite_to_t2d.py \
+  --src-root /data/dataset/byeongjae/datasets/pdm_lite_front_triplet_shifted_3h_subset/data \
+  --out-root /data/dataset/byeongjae/datasets/t2d_pdm_lite_front_triplet_shifted_3h_tfpp_exact
+```
+
+The converter keeps the original 1024x512 JPEGs and stores CARLA Garage's
+pretrained TF++ LiDAR input exactly: a float32, 1x256x256 above-ground density
+histogram over `[-32, 32]` meters at 4 pixels/meter, clipped at 5 hits/pixel.
+TF++ training and cache commands now reject resized RGB or legacy 128x128
+occupancy/height/intensity BEVs instead of silently adapting them.
 
 ## Quick Start
 

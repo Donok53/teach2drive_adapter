@@ -80,6 +80,7 @@ export FUSION_ADAPTER_ENABLED=${FUSION_ADAPTER_ENABLED:-1}
 export STAGE_FEATURE_ADAPTER_BLEND=${STAGE_FEATURE_ADAPTER_BLEND:-1.0}
 export FUSION_ADAPTER_BLEND=${FUSION_ADAPTER_BLEND:-1.0}
 export INIT_CHECKPOINT=${INIT_CHECKPOINT:-""}
+export INIT_PARAM_ANCHOR_LOSS_WEIGHT=${INIT_PARAM_ANCHOR_LOSS_WEIGHT:-0.0}
 export LORA_RANK=${LORA_RANK:-0}
 export LORA_ALPHA=${LORA_ALPHA:-16.0}
 export LORA_DROPOUT=${LORA_DROPOUT:-0.0}
@@ -104,6 +105,14 @@ export OUTPUT_PRIOR_XY_LOSS_WEIGHT=${OUTPUT_PRIOR_XY_LOSS_WEIGHT:-0.0}
 export OUTPUT_PRIOR_SPEED_LOSS_WEIGHT=${OUTPUT_PRIOR_SPEED_LOSS_WEIGHT:-0.0}
 export AUX_HIDDEN_DIM=${AUX_HIDDEN_DIM:-256}
 export CONTROL_LOSS_WEIGHT=${CONTROL_LOSS_WEIGHT:-0.0}
+export PDM_BEHAVIOR_LOSS_WEIGHT=${PDM_BEHAVIOR_LOSS_WEIGHT:-0.0}
+export PDM_LATERAL_LOSS_WEIGHT=${PDM_LATERAL_LOSS_WEIGHT:-0.0}
+export PDM_PROGRESS_LOSS_WEIGHT=${PDM_PROGRESS_LOSS_WEIGHT:-0.0}
+export PDM_HAZARD_PROGRESS_LOSS_WEIGHT=${PDM_HAZARD_PROGRESS_LOSS_WEIGHT:-0.0}
+export PDM_CONTROLLER_LOSS_WEIGHT=${PDM_CONTROLLER_LOSS_WEIGHT:-0.0}
+export PDM_PLAN_STEER_LOSS_WEIGHT=${PDM_PLAN_STEER_LOSS_WEIGHT:-0.0}
+export PDM_PLAN_THROTTLE_LOSS_WEIGHT=${PDM_PLAN_THROTTLE_LOSS_WEIGHT:-0.0}
+export PDM_PLAN_BRAKE_LOSS_WEIGHT=${PDM_PLAN_BRAKE_LOSS_WEIGHT:-0.0}
 export OUTPUT_RESIDUAL=${OUTPUT_RESIDUAL:-0}
 export OUTPUT_RESIDUAL_HIDDEN_DIM=${OUTPUT_RESIDUAL_HIDDEN_DIM:-256}
 export OUTPUT_RESIDUAL_CHECKPOINT_SCALE=${OUTPUT_RESIDUAL_CHECKPOINT_SCALE:-0.75}
@@ -311,6 +320,7 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --stage-adapter-modalities "$STAGE_ADAPTER_MODALITIES" \
   --stage-feature-adapter-blend "$STAGE_FEATURE_ADAPTER_BLEND" \
   --fusion-adapter-blend "$FUSION_ADAPTER_BLEND" \
+  --init-param-anchor-loss-weight "$INIT_PARAM_ANCHOR_LOSS_WEIGHT" \
   --lora-rank "$LORA_RANK" \
   --lora-alpha "$LORA_ALPHA" \
   --lora-dropout "$LORA_DROPOUT" \
@@ -346,6 +356,14 @@ PYTHONUNBUFFERED=1 "$PY" -m teach2drive_adapter.train_transfuserpp_task_feature_
   --output-prior-speed-loss-weight "$OUTPUT_PRIOR_SPEED_LOSS_WEIGHT" \
   --aux-hidden-dim "$AUX_HIDDEN_DIM" \
   --control-loss-weight "$CONTROL_LOSS_WEIGHT" \
+  --pdm-behavior-loss-weight "$PDM_BEHAVIOR_LOSS_WEIGHT" \
+  --pdm-lateral-loss-weight "$PDM_LATERAL_LOSS_WEIGHT" \
+  --pdm-progress-loss-weight "$PDM_PROGRESS_LOSS_WEIGHT" \
+  --pdm-hazard-progress-loss-weight "$PDM_HAZARD_PROGRESS_LOSS_WEIGHT" \
+  --pdm-controller-loss-weight "$PDM_CONTROLLER_LOSS_WEIGHT" \
+  --pdm-plan-steer-loss-weight "$PDM_PLAN_STEER_LOSS_WEIGHT" \
+  --pdm-plan-throttle-loss-weight "$PDM_PLAN_THROTTLE_LOSS_WEIGHT" \
+  --pdm-plan-brake-loss-weight "$PDM_PLAN_BRAKE_LOSS_WEIGHT" \
   --output-residual-hidden-dim "$OUTPUT_RESIDUAL_HIDDEN_DIM" \
   --output-residual-checkpoint-scale "$OUTPUT_RESIDUAL_CHECKPOINT_SCALE" \
   --output-residual-speed-logit-scale "$OUTPUT_RESIDUAL_SPEED_LOGIT_SCALE" \

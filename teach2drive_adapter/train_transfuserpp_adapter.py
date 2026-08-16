@@ -186,6 +186,7 @@ def train(args: argparse.Namespace) -> None:
         image_size=tuple(args.image_size),
         lidar_size=args.lidar_size,
         episode_root_override=args.episode_root_override,
+        strict_sensor_geometry=True,
     )
     val_ds = Teach2DriveIndexDataset(
         args.index,
@@ -194,6 +195,7 @@ def train(args: argparse.Namespace) -> None:
         image_size=tuple(args.image_size),
         lidar_size=args.lidar_size,
         episode_root_override=args.episode_root_override,
+        strict_sensor_geometry=True,
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
@@ -289,7 +291,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--team-config", required=True)
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--episode-root-override", default="")
-    parser.add_argument("--cameras", default="front,left,right")
+    parser.add_argument("--cameras", default="front")
     parser.add_argument("--tfpp-camera", default="front")
     parser.add_argument("--command-mode", choices=["lane_follow", "target_angle"], default="lane_follow")
     parser.add_argument("--epochs", type=int, default=10)
@@ -305,8 +307,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Comma-separated TransFuser++ parameter-name substrings to unfreeze. Leave empty for adapter-only training.",
     )
-    parser.add_argument("--image-size", type=int, nargs=2, default=[640, 360], metavar=("WIDTH", "HEIGHT"))
-    parser.add_argument("--lidar-size", type=int, default=128)
+    parser.add_argument("--image-size", type=int, nargs=2, default=[1024, 512], metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--lidar-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--val-ratio", type=float, default=0.15)

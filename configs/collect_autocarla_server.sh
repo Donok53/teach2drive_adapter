@@ -14,6 +14,7 @@ export PORT=${PORT:-2000}
 export CARLA_ROOT=${CARLA_ROOT:-"$HOME/dataset/byeongjae/carla-simulator"}
 export CARLA_LOG=${CARLA_LOG:-"$HOME/teach2drive/logs/carla_collect.log"}
 export CARLA_READY_TIMEOUT_SEC=${CARLA_READY_TIMEOUT_SEC:-180}
+export CARLA_CHECK_TIMEOUT_SEC=${CARLA_CHECK_TIMEOUT_SEC:-8}
 export CARLA_EXTRA_ARGS=${CARLA_EXTRA_ARGS:-"-stdout -FullStdOutLogOutput"}
 export FORCE_RESTART_CARLA=${FORCE_RESTART_CARLA:-0}
 export CARLA_PRELOAD_MAP=${CARLA_PRELOAD_MAP:-0}
@@ -29,14 +30,32 @@ export NVIDIA_RUNTIME_ROOT=${NVIDIA_RUNTIME_ROOT:-"/"}
 export CARLA_SDL_VIDEODRIVER=${CARLA_SDL_VIDEODRIVER:-x11}
 export CARLA_DISPLAY=${CARLA_DISPLAY:-:1}
 export CARLA_GRAPHICS_ADAPTER=${CARLA_GRAPHICS_ADAPTER:-0}
+# Epic matches PDM-Lite/carla_garage original collection (no -quality-level flag => Epic default).
+# Do NOT use Low: Town03's M_BuildingMaterial mesh triggers a null VertexDeclaration SIGSEGV
+# in UE4.26 Vulkan under the Low scalability path (FVulkanVertexInputStateInfo::Generate).
+export CARLA_QUALITY=${CARLA_QUALITY:-Epic}
 export CARLA_GLX_VENDOR=${CARLA_GLX_VENDOR:-}
 export CARLA_NV_PRIME_RENDER_OFFLOAD=${CARLA_NV_PRIME_RENDER_OFFLOAD:-}
+export CARLA_RUN_AS_UID=${CARLA_RUN_AS_UID:-}
+export CARLA_RUN_AS_GID=${CARLA_RUN_AS_GID:-$CARLA_RUN_AS_UID}
+export CARLA_RUN_AS_GROUPS=${CARLA_RUN_AS_GROUPS:-44,109}
+export CARLA_RUNTIME_HOME=${CARLA_RUNTIME_HOME:-"/tmp/carla-home-${CARLA_RUN_AS_UID:-$USER}"}
 export COLLECT_CONFIG=${COLLECT_CONFIG:-configs/collect_tesla_front_triplet_target_3h.sh}
 export PATH="$HOME/.local/bin:$PATH"
+
+for carla_egg in "$CARLA_ROOT"/PythonAPI/carla/dist/carla-*-py3*.egg "$CARLA_ROOT"/PythonAPI/carla/dist/carla-*.egg; do
+  if [[ -f "$carla_egg" ]]; then
+    export PYTHONPATH="$carla_egg:$CARLA_ROOT/PythonAPI/carla:${PYTHONPATH:-}"
+    break
+  fi
+done
 
 mkdir -p "$(dirname "$CARLA_LOG")" "$PYTHON_EGG_CACHE" "$XDG_RUNTIME_DIR" "$HOME/.local/bin"
 chmod 700 "$PYTHON_EGG_CACHE" 2>/dev/null || true
 chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+if [[ -n "$CARLA_RUN_AS_UID" && "$(id -u)" == "0" ]]; then
+  chown "$CARLA_RUN_AS_UID:$CARLA_RUN_AS_GID" "$XDG_RUNTIME_DIR" 2>/dev/null || true
+fi
 mkdir -p "$HOME/Desktop" "$HOME/Downloads" "$HOME/Documents" "$HOME/Music" "$HOME/Pictures" "$HOME/Videos"
 
 if ! command -v xdg-user-dir >/dev/null 2>&1; then
@@ -110,7 +129,7 @@ setup_nvidia_runtime() {
 setup_nvidia_runtime
 
 check_carla() {
-  "$PY" - "$HOST" "$PORT" <<'PY'
+  timeout --kill-after=2s "${CARLA_CHECK_TIMEOUT_SEC}s" "$PY" - "$HOST" "$PORT" <<'PY'
 import sys
 import carla
 
@@ -118,7 +137,7 @@ host = sys.argv[1]
 port = int(sys.argv[2])
 client = carla.Client(host, port)
 client.set_timeout(3.0)
-client.get_world()
+client.get_world().get_map().name
 PY
 }
 
@@ -148,6 +167,11 @@ kill_carla_on_port() {
 
 start_carla() {
   echo "=== start CARLA host=$HOST port=$PORT"
+  mkdir -p "$CARLA_ROOT/CarlaUE4/Saved" "$CARLA_RUNTIME_HOME"
+  chmod 777 "$CARLA_ROOT/CarlaUE4/Saved" "$CARLA_RUNTIME_HOME" 2>/dev/null || true
+  if [[ -n "$CARLA_RUN_AS_UID" && "$(id -u)" == "0" ]]; then
+    chown "$CARLA_RUN_AS_UID:$CARLA_RUN_AS_GID" "$CARLA_RUNTIME_HOME" 2>/dev/null || true
+  fi
   (
     cd "$CARLA_ROOT"
     carla_env=(
@@ -159,10 +183,18 @@ start_carla() {
     [[ -n "${LD_LIBRARY_PATH:-}" ]] && carla_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
     [[ -n "${VK_ICD_FILENAMES:-}" ]] && carla_env+=("VK_ICD_FILENAMES=$VK_ICD_FILENAMES")
     [[ -n "${VK_LAYER_PATH:-}" ]] && carla_env+=("VK_LAYER_PATH=$VK_LAYER_PATH")
+    [[ -n "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ]] && carla_env+=("__EGL_VENDOR_LIBRARY_FILENAMES=$__EGL_VENDOR_LIBRARY_FILENAMES")
     [[ -n "${__GLX_VENDOR_LIBRARY_NAME:-}" ]] && carla_env+=("__GLX_VENDOR_LIBRARY_NAME=$__GLX_VENDOR_LIBRARY_NAME")
     [[ -n "${__NV_PRIME_RENDER_OFFLOAD:-}" ]] && carla_env+=("__NV_PRIME_RENDER_OFFLOAD=$__NV_PRIME_RENDER_OFFLOAD")
-    nohup env "${carla_env[@]}" \
-      ./CarlaUE4.sh -RenderOffScreen -nosound -quality-level=Low -graphicsadapter="$CARLA_GRAPHICS_ADAPTER" -carla-rpc-port="$PORT" $CARLA_EXTRA_ARGS > "$CARLA_LOG" 2>&1 &
+    if [[ -n "$CARLA_RUN_AS_UID" && "$(id -u)" == "0" ]]; then
+      carla_env+=("HOME=$CARLA_RUNTIME_HOME")
+      nohup setpriv --reuid="$CARLA_RUN_AS_UID" --regid="$CARLA_RUN_AS_GID" --groups="$CARLA_RUN_AS_GROUPS" \
+        env "${carla_env[@]}" \
+        ./CarlaUE4.sh -RenderOffScreen -nosound -quality-level="$CARLA_QUALITY" -graphicsadapter="$CARLA_GRAPHICS_ADAPTER" -carla-rpc-port="$PORT" $CARLA_EXTRA_ARGS > "$CARLA_LOG" 2>&1 &
+    else
+      nohup env "${carla_env[@]}" \
+        ./CarlaUE4.sh -RenderOffScreen -nosound -quality-level="$CARLA_QUALITY" -graphicsadapter="$CARLA_GRAPHICS_ADAPTER" -carla-rpc-port="$PORT" $CARLA_EXTRA_ARGS > "$CARLA_LOG" 2>&1 &
+    fi
     echo "$!" > "$CARLA_LOG.pid"
   )
   CARLA_PID=$(cat "$CARLA_LOG.pid")

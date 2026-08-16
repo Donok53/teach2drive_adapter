@@ -23,6 +23,7 @@ def evaluate(args: argparse.Namespace) -> None:
         image_size=tuple(args.image_size),
         lidar_size=args.lidar_size,
         episode_root_override=args.episode_root_override,
+        strict_sensor_geometry=True,
     )
     if args.sample_stride > 1:
         sample_ids = list(range(0, len(dataset), args.sample_stride))
@@ -82,7 +83,7 @@ def evaluate(args: argparse.Namespace) -> None:
         "notes": [
             "This is a zero-shot open-loop diagnostic for frozen TransFuser++ before adapter fitting.",
             "TransFuser++ predicts route checkpoints, so the first four checkpoints are compared to Teach2Drive horizons as a coarse sanity check.",
-            "The current Teach2Drive dataset stores BEV arrays rather than raw point clouds, so LiDAR input is an approximation.",
+            "RGB and LiDAR use the exact pretrained TF++ preprocessing contract.",
         ],
     }
     out_dir = Path(args.out_dir).expanduser()
@@ -99,11 +100,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--episode-root-override", default="")
-    parser.add_argument("--cameras", default="front,left,right")
+    parser.add_argument("--cameras", default="front")
     parser.add_argument("--tfpp-camera", default="front")
     parser.add_argument("--command-mode", choices=["lane_follow", "target_angle"], default="lane_follow")
-    parser.add_argument("--image-size", type=int, nargs=2, default=[640, 360], metavar=("WIDTH", "HEIGHT"))
-    parser.add_argument("--lidar-size", type=int, default=128)
+    parser.add_argument("--image-size", type=int, nargs=2, default=[1024, 512], metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--lidar-size", type=int, default=256)
     parser.add_argument("--max-samples", type=int, default=256)
     parser.add_argument("--sample-stride", type=int, default=20)
     parser.add_argument("--save-samples", type=int, default=8)
@@ -118,4 +119,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

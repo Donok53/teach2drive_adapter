@@ -361,7 +361,11 @@ def camera_to_transfuserpp_rgb(
     resize_h = int(getattr(config, "camera_height", 512))
     resize_w = int(getattr(config, "camera_width", 1024))
     if tuple(rgb.shape[-2:]) != (resize_h, resize_w):
-        rgb = F.interpolate(rgb, size=(resize_h, resize_w), mode="bilinear", align_corners=False)
+        raise ValueError(
+            "TF++ RGB preprocessing must receive the original camera resolution "
+            f"{(resize_w, resize_h)}; got {(int(rgb.shape[-1]), int(rgb.shape[-2]))}. "
+            "Load the raw image without resizing."
+        )
     rgb = ground_plane_warp_rgb(
         rgb,
         enabled=bool(ground_plane_warp),
@@ -413,22 +417,19 @@ def camera_to_transfuserpp_rgb(
 
 
 def lidar_to_transfuserpp_bev(lidar: torch.Tensor, config) -> torch.Tensor:
-    """Map Teach2Drive BEV tensors to the TF++ LiDAR histogram shape."""
+    """Validate an already exact TF++ LiDAR density histogram."""
 
     channels = int(getattr(config, "lidar_seq_len", 1)) * (1 + int(getattr(config, "use_ground_plane", 0)))
-    if lidar.shape[1] < channels:
-        pad = torch.zeros(
-            (lidar.shape[0], channels - lidar.shape[1], lidar.shape[2], lidar.shape[3]),
-            dtype=lidar.dtype,
-            device=lidar.device,
-        )
-        lidar = torch.cat([lidar, pad], dim=1)
-    elif lidar.shape[1] > channels:
-        lidar = lidar[:, :channels]
     lidar_h = int(getattr(config, "lidar_resolution_height", 256))
     lidar_w = int(getattr(config, "lidar_resolution_width", 256))
-    if tuple(lidar.shape[-2:]) != (lidar_h, lidar_w):
-        lidar = F.interpolate(lidar, size=(lidar_h, lidar_w), mode="bilinear", align_corners=False)
+    expected = (channels, lidar_h, lidar_w)
+    actual = (int(lidar.shape[1]), int(lidar.shape[2]), int(lidar.shape[3]))
+    if actual != expected:
+        raise ValueError(
+            f"TF++ LiDAR preprocessing requires [C,H,W]={expected}, got {actual}. "
+            "The legacy occupancy/height/intensity BEV is not compatible; "
+            "re-run scripts/convert_pdm_lite_to_t2d.py."
+        )
     return lidar.contiguous()
 
 
@@ -545,6 +546,7 @@ def prepare_transfuserpp_inputs(
     lidar_shift_x_m: float = 0.0,
     lidar_shift_y_m: float = 0.0,
     lidar_pixels_per_meter: float = 4.0,
+    command_override: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     target_point = target_point_from_scalar(scalar)
     lidar_bev = lidar_to_transfuserpp_bev(lidar, config=config)
@@ -571,5 +573,9 @@ def prepare_transfuserpp_inputs(
         "lidar_bev": lidar_bev,
         "target_point": target_point,
         "ego_vel": scalar[:, :1].contiguous(),
-        "command": command_from_target_point(target_point, mode=command_mode),
+        "command": (
+            command_override.to(device=scalar.device, dtype=scalar.dtype)
+            if command_override is not None
+            else command_from_target_point(target_point, mode=command_mode)
+        ),
     }

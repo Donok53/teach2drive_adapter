@@ -11,56 +11,26 @@ Source route dir (carla_garage):
 Output episode (t2d, single-profile, token_dataset-ready):
     episode_XXXXXX/
         camera/{left,front,right}/NNNNNN_<tok>.jpg   (symlink to source jpg)
-        lidar_bev/NNNNNN_<tok>.npy                   (3xHxW BEV via _points_to_bev)
+        lidar_bev/NNNNNN_<tok>.npy                   (exact TF++ density histogram)
         frames.jsonl                                 (one record per frame)
         rigs/<profile>/sensor_layout.json            (extrinsics, for EXTRINSIC_AWARE training)
         episode_meta.json, episode_summary.json
 
-FIRST DRAFT — validate against real data:
-  * lidar frame / axis convention (see --flip-y, --lidar-to-ego)
-  * theta units (assumed radians, carla_garage convention)
+The source `.laz` is the ego-frame 360-degree point cloud saved by CARLA
+Garage's DataAgent. It is converted with the exact histogram constants and
+operations used by the pretrained TF++ model.
 """
 import argparse, gzip, json, os, sys, uuid, math
 from pathlib import Path
 import numpy as np
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-def _points_to_bev(points, grid_size, x_min, x_max, y_min, y_max, z_min, z_max):
-    """Inlined verbatim from teach2drive.carla_collect._points_to_bev so the
-    converter has no dependency on the (carla-heavy) bootstrap package import.
-    Returns a (3, grid, grid) float16 BEV: [occupancy, height, intensity]."""
-    occ = np.zeros((grid_size, grid_size), dtype=np.float32)
-    height = np.zeros((grid_size, grid_size), dtype=np.float32)
-    intensity = np.zeros((grid_size, grid_size), dtype=np.float32)
-    count = np.zeros((grid_size, grid_size), dtype=np.float32)
-    if points.size == 0:
-        return np.stack([occ, height, intensity], axis=0).astype(np.float16)
-    xs = points[:, 0]; ys = points[:, 1]; zs = points[:, 2]
-    valid = (np.isfinite(xs) & np.isfinite(ys) & np.isfinite(zs)
-             & (xs >= x_min) & (xs < x_max) & (ys >= y_min) & (ys < y_max)
-             & (zs >= z_min) & (zs <= z_max))
-    if not np.any(valid):
-        return np.stack([occ, height, intensity], axis=0).astype(np.float16)
-    xs = xs[valid]; ys = ys[valid]; zs = zs[valid]
-    inten = points[:, 3][valid] if points.shape[1] > 3 else np.ones_like(xs)
-    ix = np.clip(((xs - x_min) * grid_size / max(x_max - x_min, 1e-6)).astype(np.int32), 0, grid_size - 1)
-    iy = np.clip(((ys - y_min) * grid_size / max(y_max - y_min, 1e-6)).astype(np.int32), 0, grid_size - 1)
-    rows = grid_size - 1 - ix; cols = iy
-    flat = rows * grid_size + cols
-    np.add.at(occ.reshape(-1), flat, 1.0)
-    np.add.at(count.reshape(-1), flat, 1.0)
-    np.maximum.at(height.reshape(-1), flat, (zs - z_min) / max(z_max - z_min, 1e-6))
-    np.add.at(intensity.reshape(-1), flat, inten)
-    occ = np.clip(np.log1p(occ) / np.log(16.0), 0.0, 1.0)
-    nonzero = count > 0
-    if np.any(nonzero):
-        intensity[nonzero] = intensity[nonzero] / count[nonzero]
-        hi = np.percentile(intensity[nonzero], 95)
-        if hi > 1e-6:
-            intensity = np.clip(intensity / hi, 0.0, 1.0)
-    return np.stack([occ, height, intensity], axis=0).astype(np.float16)
+from teach2drive_adapter.tfpp_preprocessing import TFPP_HISTOGRAM_CONFIG, lidar_to_tfpp_histogram
 
-BEV = dict(grid_size=128, x_min=-8.0, x_max=20.0, y_min=-14.0, y_max=14.0, z_min=-2.0, z_max=4.0)
+
 CAMERAS = ("left", "front", "right")
 SAVE_HZ = 4.0  # data_save_freq=5, carla_fps=20
 
@@ -70,21 +40,13 @@ def _read_meas(p: Path) -> dict:
         return json.load(f)
 
 
-def _read_laz_points(p: Path, flip_y: bool) -> np.ndarray:
-    """Return (N,4) float32 [x,y,z,intensity] from a carla_garage .laz lidar file."""
+def _read_laz_points(p: Path) -> np.ndarray:
+    """Return the ego-frame xyz saved by CARLA Garage's DataAgent."""
     import laspy
     las = laspy.read(str(p))
-    xyz = np.stack([np.asarray(las.x, np.float32),
-                    np.asarray(las.y, np.float32),
-                    np.asarray(las.z, np.float32)], axis=1)
-    if flip_y:
-        xyz[:, 1] = -xyz[:, 1]
-    try:
-        inten = np.asarray(las.intensity, np.float32)
-        inten = inten / max(float(inten.max()), 1.0)
-    except Exception:
-        inten = np.ones(len(xyz), np.float32)
-    return np.concatenate([xyz, inten[:, None]], axis=1).astype(np.float32)
+    return np.stack([np.asarray(las.x, np.float64),
+                     np.asarray(las.y, np.float64),
+                     np.asarray(las.z, np.float64)], axis=1)
 
 
 def _frame_indices(route: Path) -> list:
@@ -112,8 +74,7 @@ def _sensor_layout(route: Path, profile: str) -> dict:
     return {"profile": profile, "cameras": {}}
 
 
-def convert_route(route: Path, out_root: Path, ep_idx: int, profile: str,
-                  flip_y: bool, link: bool) -> dict:
+def convert_route(route: Path, out_root: Path, ep_idx: int, profile: str, link: bool) -> dict:
     ep_token = uuid.uuid4().hex
     ep = out_root / f"episode_{ep_idx:06d}"
     for c in CAMERAS:
@@ -128,7 +89,12 @@ def convert_route(route: Path, out_root: Path, ep_idx: int, profile: str,
     with (ep / "frames.jsonl").open("w", encoding="utf-8") as fout:
         for step, i in enumerate(idxs):
             stem = f"{i:04d}"
-            cam_src = {c: route / f"rgb_{c}" / f"{stem}.jpg" for c in CAMERAS}
+            cam_src = {}
+            for _c in CAMERAS:
+                _p = route / f"rgb_{_c}" / f"{stem}.jpg"
+                if not _p.exists():
+                    _p = route / "rgb" / f"{stem}.jpg"
+                cam_src[_c] = _p
             laz = route / "lidar" / f"{stem}.laz"
             meas = route / "measurements" / f"{stem}.json.gz"
             if not (laz.exists() and meas.exists() and all(p.exists() for p in cam_src.values())):
@@ -143,12 +109,11 @@ def convert_route(route: Path, out_root: Path, ep_idx: int, profile: str,
                     else:
                         import shutil; shutil.copy2(cam_src[c], dst)
                 camera_tokens[c] = str(dst.relative_to(ep))
-            # lidar BEV
-            pts = _read_laz_points(laz, flip_y)
-            bev = _points_to_bev(pts, BEV["grid_size"], BEV["x_min"], BEV["x_max"],
-                                 BEV["y_min"], BEV["y_max"], BEV["z_min"], BEV["z_max"])
+            # Exact pretrained TF++ LiDAR input: above-ground density histogram.
+            pts = _read_laz_points(laz)
+            bev = lidar_to_tfpp_histogram(pts)
             lpath = ep / "lidar_bev" / f"{step:06d}_{tok}.npy"
-            np.save(lpath, bev.astype(np.float16))
+            np.save(lpath, bev)
             m = _read_meas(meas)
             rec = {
                 "episode_token": ep_token,
@@ -182,7 +147,8 @@ def convert_route(route: Path, out_root: Path, ep_idx: int, profile: str,
 
     (ep / "episode_meta.json").write_text(json.dumps(
         {"episode_token": ep_token, "profile": profile, "source_route": route.name,
-         "cameras": list(CAMERAS), "save_hz": SAVE_HZ, "bev": BEV}, indent=2))
+         "cameras": list(CAMERAS), "save_hz": SAVE_HZ,
+         "bev": TFPP_HISTOGRAM_CONFIG.metadata()}, indent=2))
     (ep / "episode_summary.json").write_text(json.dumps(
         {"episode_token": ep_token, "frames": n_written,
          "sim_seconds": n_written / SAVE_HZ}, indent=2))
@@ -194,10 +160,8 @@ def main():
     ap.add_argument("--src-root", default=os.path.expanduser(
         "~/dataset/byeongjae/datasets/pdm_lite_front_triplet_shifted_3h_subset/data"))
     ap.add_argument("--out-root", default=os.path.expanduser(
-        "~/dataset/byeongjae/datasets/t2d_pdm_lite_front_triplet_shifted_3h"))
+        "~/dataset/byeongjae/datasets/t2d_pdm_lite_front_triplet_shifted_3h_tfpp_exact"))
     ap.add_argument("--profile", default="front_triplet_shifted")
-    ap.add_argument("--flip-y", action="store_true",
-                    help="negate lidar y (validate against a real BEV first)")
     ap.add_argument("--copy", action="store_true", help="copy images instead of symlink")
     ap.add_argument("--limit", type=int, default=0, help="convert only N routes (debug)")
     ap.add_argument("--overwrite", action="store_true")
@@ -217,7 +181,7 @@ def main():
     summaries, total = [], 0
     for k, route in enumerate(routes):
         try:
-            s = convert_route(route, out_root, k, args.profile, args.flip_y, not args.copy)
+            s = convert_route(route, out_root, k, args.profile, not args.copy)
         except Exception as e:
             print(f"[skip] {route.name}: {e}", flush=True)
             continue
