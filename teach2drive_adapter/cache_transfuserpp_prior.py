@@ -194,21 +194,41 @@ def build_cache(args: argparse.Namespace) -> None:
         teacher_view_root=(args.teacher_view_root or None),
         teacher_view_dirname=args.teacher_view_dirname,
         teacher_view_camera=args.tfpp_camera,
+        strict_sensor_geometry=True,
     )
     _use_teacher_view = bool(args.teacher_view_root)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False)
     net, config, load_info = load_transfuserpp(args.garage_root, args.team_config, device=device, checkpoint=args.checkpoint)
+    nets = [net]
+    load_infos = [load_info]
+    if bool(args.ensemble_all_checkpoints):
+        checkpoint_paths = sorted(Path(args.team_config).expanduser().glob("model_*.pth"))
+        loaded_path = Path(load_info["checkpoint"]).expanduser().resolve()
+        for checkpoint_path in checkpoint_paths:
+            if checkpoint_path.resolve() == loaded_path:
+                continue
+            ensemble_net, ensemble_config, ensemble_info = load_transfuserpp(
+                args.garage_root,
+                args.team_config,
+                device=device,
+                checkpoint=str(checkpoint_path),
+            )
+            if list(getattr(ensemble_config, "target_speeds", [])) != list(getattr(config, "target_speeds", [])):
+                raise ValueError(f"Ensemble config mismatch for {checkpoint_path}")
+            nets.append(ensemble_net)
+            load_infos.append(ensemble_info)
     feature_then_fusion_adapter, feature_then_fusion_info = _load_feature_then_fusion_adapter(
         args.feature_then_fusion_adapter_checkpoint,
         device,
     )
     if feature_then_fusion_adapter is not None:
-        _patch_feature_then_fusion_backbone(
-            net,
-            feature_then_fusion_adapter,
-            stage_blend=float(args.stage_feature_adapter_blend),
-            fusion_blend=float(args.fusion_adapter_blend),
-        )
+        for ensemble_net in nets:
+            _patch_feature_then_fusion_backbone(
+                ensemble_net,
+                feature_then_fusion_adapter,
+                stage_blend=float(args.stage_feature_adapter_blend),
+                fusion_blend=float(args.fusion_adapter_blend),
+            )
         print(
             json.dumps(
                 {
@@ -221,10 +241,14 @@ def build_cache(args: argparse.Namespace) -> None:
             ),
             flush=True,
         )
+    if args.data_parallel and len(nets) > 1:
+        raise ValueError("--data-parallel and --ensemble-all-checkpoints cannot be combined")
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs for prior caching", flush=True)
         net = nn.DataParallel(net)
-    net.eval()
+        nets = [net]
+    for ensemble_net in nets:
+        ensemble_net.eval()
 
     chunks = {
         "sample_index": [],
@@ -236,6 +260,8 @@ def build_cache(args: argparse.Namespace) -> None:
         "stop_state": [],
         "stop_reason": [],
         "stop_reason_mask": [],
+        "control_target": [],
+        "control_mask": [],
         "sample_weight": [],
         "base_target": [],
         "checkpoint_flat": [],
@@ -266,9 +292,19 @@ def build_cache(args: argparse.Namespace) -> None:
             tfpp_camera=args.tfpp_camera,
         )
         with torch.no_grad():
-            outputs = net(**inputs)
-            pred_target_speed = outputs[1]
-            pred_checkpoint = outputs[2]
+            ensemble_outputs = [ensemble_net(**inputs) for ensemble_net in nets]
+            raw_speed_logits = [outputs[1] for outputs in ensemble_outputs if outputs[1] is not None]
+            raw_checkpoints = [outputs[2] for outputs in ensemble_outputs if outputs[2] is not None]
+            if raw_speed_logits:
+                ensemble_speed_probs = torch.stack(
+                    [torch.softmax(logits, dim=1) for logits in raw_speed_logits], dim=0
+                ).mean(dim=0)
+                # A synthetic logit representation whose softmax is exactly the
+                # probability ensemble used by the leaderboard agent.
+                pred_target_speed = torch.log(ensemble_speed_probs.clamp_min(1e-8))
+            else:
+                pred_target_speed = None
+            pred_checkpoint = torch.stack(raw_checkpoints, dim=0).mean(dim=0) if raw_checkpoints else None
             base_target = base_target_from_checkpoint(
                 pred_checkpoint=pred_checkpoint,
                 pred_target_speed=pred_target_speed,
@@ -296,6 +332,8 @@ def build_cache(args: argparse.Namespace) -> None:
         chunks["stop_state"].append(batch["stop_state"].numpy().astype(np.int64))
         chunks["stop_reason"].append(batch["stop_reason"].numpy().astype(np.int64))
         chunks["stop_reason_mask"].append(batch["stop_reason_mask"].numpy().astype(np.float32))
+        chunks["control_target"].append(batch["control_target"].numpy().astype(np.float32))
+        chunks["control_mask"].append(batch["control_mask"].numpy().astype(np.float32))
         chunks["sample_weight"].append(batch["sample_weight"].numpy().astype(np.float32))
         chunks["base_target"].append(base_target.detach().cpu().numpy().astype(np.float32))
         chunks["checkpoint_flat"].append(checkpoint_flat.detach().cpu().numpy().astype(np.float32))
@@ -318,6 +356,8 @@ def build_cache(args: argparse.Namespace) -> None:
         "command_mode": args.command_mode,
         "samples": int(len(arrays["sample_index"])),
         "load_info": load_info,
+        "load_infos": load_infos,
+        "ensemble_size": len(nets),
         "feature_then_fusion_adapter": feature_then_fusion_info,
         "stage_feature_adapter_blend": float(args.stage_feature_adapter_blend),
         "fusion_adapter_blend": float(args.fusion_adapter_blend),
@@ -340,7 +380,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage-feature-adapter-blend", type=float, default=1.0)
     parser.add_argument("--fusion-adapter-blend", type=float, default=1.0)
     parser.add_argument("--episode-root-override", default="")
-    parser.add_argument("--cameras", default="front,left,right")
+    parser.add_argument("--cameras", default="front")
     parser.add_argument("--tfpp-camera", default="front")
     # v5: build the TEACHER prior cache from the reprojected x=-1.5 view instead of
     # the real (shifted) camera. When set, the tfpp_camera channel is replaced by
@@ -348,11 +388,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-view-root", default="")
     parser.add_argument("--teacher-view-dirname", default="rgb_front_teacher_xm15")
     parser.add_argument("--command-mode", choices=["lane_follow", "target_angle"], default="target_angle")
-    parser.add_argument("--image-size", type=int, nargs=2, default=[640, 360], metavar=("WIDTH", "HEIGHT"))
-    parser.add_argument("--lidar-size", type=int, default=128)
+    parser.add_argument("--image-size", type=int, nargs=2, default=[1024, 512], metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--lidar-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--data-parallel", action="store_true")
+    parser.add_argument(
+        "--ensemble-all-checkpoints",
+        action="store_true",
+        help="Cache the same probability/checkpoint ensemble used by the leaderboard agent.",
+    )
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--speed-dim", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=20)

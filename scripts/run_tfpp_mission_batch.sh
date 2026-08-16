@@ -36,6 +36,8 @@ TFPP_SENSOR_CAMERA="${TFPP_SENSOR_CAMERA:-front}"
 TFPP_SENSOR_LIDAR="${TFPP_SENSOR_LIDAR:-top}"
 TFPP_ADAPTER_CHECKPOINT="${TFPP_ADAPTER_CHECKPOINT:-}"
 TFPP_FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT="${TFPP_FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT:-}"
+TFPP_VEHICLE_STEER_ADAPTER_CHECKPOINT="${TFPP_VEHICLE_STEER_ADAPTER_CHECKPOINT:-}"
+TFPP_VEHICLE_STEER_ADAPTER_BLEND="${TFPP_VEHICLE_STEER_ADAPTER_BLEND:-1.0}"
 TFPP_FEATURE_ADAPTER_BLEND="${TFPP_FEATURE_ADAPTER_BLEND:-}"
 TFPP_STAGE_FEATURE_ADAPTER_BLEND="${TFPP_STAGE_FEATURE_ADAPTER_BLEND:-}"
 TFPP_FUSION_ADAPTER_BLEND="${TFPP_FUSION_ADAPTER_BLEND:-}"
@@ -270,6 +272,7 @@ while IFS= read -r ROUTE_XML || [[ -n "${ROUTE_XML}" ]]; do
     env
       ROUTE_XML="${ROUTE_XML}" \
       RUN_DIR="${RUN_DIR}" \
+      TFPP_DYNAMICS_ROUTE_INDEX="${idx}" \
       PORT="${PORT}" \
       TM_PORT="${TM_PORT}" \
       VIDEO_OUTPUT="${video}" \
@@ -301,6 +304,8 @@ while IFS= read -r ROUTE_XML || [[ -n "${ROUTE_XML}" ]]; do
       TFPP_SENSOR_LIDAR="${TFPP_SENSOR_LIDAR}" \
       TFPP_ADAPTER_CHECKPOINT="${TFPP_ADAPTER_CHECKPOINT}" \
       TFPP_FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT="${TFPP_FEATURE_THEN_FUSION_ADAPTER_CHECKPOINT}" \
+      TFPP_VEHICLE_STEER_ADAPTER_CHECKPOINT="${TFPP_VEHICLE_STEER_ADAPTER_CHECKPOINT}" \
+      TFPP_VEHICLE_STEER_ADAPTER_BLEND="${TFPP_VEHICLE_STEER_ADAPTER_BLEND}" \
       TFPP_FEATURE_ADAPTER_BLEND="${TFPP_FEATURE_ADAPTER_BLEND}" \
       TFPP_STAGE_FEATURE_ADAPTER_BLEND="${TFPP_STAGE_FEATURE_ADAPTER_BLEND}" \
       TFPP_FUSION_ADAPTER_BLEND="${TFPP_FUSION_ADAPTER_BLEND}" \
@@ -360,7 +365,13 @@ if checkpoint.exists():
         if not records and exit_code == 124:
             status = "Failed - Mission wall-time timeout"
             outcome = "FAIL"
-        elif "crash" in status.lower() or entry_status.lower() == "crashed" or exit_code not in (0, 1, 124):
+        elif (
+            "crash" in status.lower()
+            or "couldn't be set up" in status.lower()
+            or "could not be set up" in status.lower()
+            or entry_status.lower() == "crashed"
+            or exit_code not in (0, 1, 124)
+        ):
             outcome = "INVALID"
         elif status in {"Perfect", "Completed"} and score_route >= 99.0 and score_penalty >= 1.0 and num_infractions == 0:
             outcome = "PASS"

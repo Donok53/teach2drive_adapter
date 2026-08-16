@@ -16,7 +16,7 @@
 # Runs on H200 GPU7 inside the t2d-train:cu118 container.
 set -u
 
-RUN_DIR=${RUN_DIR:-/data/dataset/byeongjae/runs/train_v4_gist3h_teacher}
+RUN_DIR=${RUN_DIR:-/data/dataset/byeongjae/runs/train_v4_gist3h_teacher_tfpp_exact}
 OUT_DIR="${RUN_DIR}/train"
 mkdir -p "$OUT_DIR"
 
@@ -32,17 +32,17 @@ echo "commit=$(git rev-parse --short HEAD 2>/dev/null)"
 PYTHONPATH="${CODE_ROOT}/teach2drive_adapter:${CODE_ROOT}/carla_garage/team_code:${PYTHONPATH:-}" \
 python -m teach2drive_adapter.train_transfuserpp_task_feature_adapter \
   --index "${DATA_ROOT}/datasets/t2d_gist3h_index.npz" \
-  --episode-root-override "${DATA_ROOT}/datasets/t2d_pdm_lite_front_triplet_shifted_3h" \
+  --episode-root-override "${DATA_ROOT}/datasets/t2d_pdm_lite_front_triplet_shifted_3h_tfpp_exact" \
   --out-dir "${OUT_DIR}" \
   --garage-root "${CODE_ROOT}/carla_garage" \
   --team-config "${DATA_ROOT}/checkpoints/transfuserpp/pretrained_models/all_towns" \
   --checkpoint '' \
   --init-checkpoint '' \
-  --cameras left,front,right \
+  --cameras front \
   --tfpp-camera front \
   --command-mode target_angle \
-  --image-size 640 360 \
-  --lidar-size 128 \
+  --image-size 1024 512 \
+  --lidar-size 256 \
   --extrinsic-aware \
   --source-profile front_triplet_shifted \
   --extrinsic-hidden-dim 64 \

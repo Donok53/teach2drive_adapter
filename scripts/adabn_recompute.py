@@ -70,11 +70,11 @@ def main():
     ap.add_argument("--base-dir", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--index", required=True)
-    ap.add_argument("--cameras", default="left,front,right")
+    ap.add_argument("--cameras", default="front")
     ap.add_argument("--tfpp-camera", default="front")
     ap.add_argument("--command-mode", choices=["lane_follow", "target_angle"], default="lane_follow")
-    ap.add_argument("--image-size", type=int, nargs=2, default=[640, 360])
-    ap.add_argument("--lidar-size", type=int, default=128)
+    ap.add_argument("--image-size", type=int, nargs=2, default=[1024, 512])
+    ap.add_argument("--lidar-size", type=int, default=256)
     ap.add_argument("--max-samples", type=int, default=2000)
     ap.add_argument("--episode-root-override", default="")
     args = ap.parse_args()
@@ -88,6 +88,7 @@ def main():
     dataset = Teach2DriveIndexDataset(
         args.index, cameras=cameras, image_size=tuple(args.image_size),
         lidar_size=args.lidar_size, episode_root_override=args.episode_root_override,
+        strict_sensor_geometry=True,
     )
     total = len(dataset)
     if args.max_samples > 0 and args.max_samples < total:

@@ -199,6 +199,13 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             "TFPP_CAMERA_GROUND_PLANE_Z_M",
             float(camera_warp.get("ground_z_m", 0.0) or 0.0),
         )
+        # depth-based SE(3) reprojection (dense depth from an added CARLA depth camera).
+        # Falls back to the ground-plane homography for disocclusion holes.
+        self._depth_warp_enabled = _truthy(os.environ.get("TFPP_DEPTH_WARP"), False)
+        self._depth_metric = None
+        # spec-based feedforward steering correction: scale the lateral-PID steer command
+        # so a vehicle with different steering geometry follows the same path (open-loop).
+        self._steer_correction = _env_float("TFPP_STEER_CORRECTION", 1.0)
         lidar_shift = metadata.get("lidar_canonical_shift_m", [0.0, 0.0])
         if not isinstance(lidar_shift, (list, tuple)) or len(lidar_shift) < 2:
             lidar_shift = [0.0, 0.0]
@@ -279,6 +286,87 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             dtype=np.float64,
         )
         return k @ ego_to_cam
+
+    def sensors(self):
+        sensors = super().sensors()
+        if getattr(self, "_depth_warp_enabled", False):
+            cam = self.config.camera_pos
+            rot = getattr(self.config, "camera_rot_0", [0.0, 0.0, 0.0])
+            sensors.append({
+                "type": "sensor.camera.depth",
+                "x": float(cam[0]), "y": float(cam[1]), "z": float(cam[2]),
+                "roll": float(rot[0]), "pitch": float(rot[1]), "yaw": float(rot[2]),
+                "width": int(self.config.camera_width),
+                "height": int(self.config.camera_height),
+                "fov": float(self.config.camera_fov),
+                "id": "depth_front",
+            })
+        return sensors
+
+    def tick(self, input_data):
+        if getattr(self, "_depth_warp_enabled", False) and "depth_front" in input_data:
+            self._depth_metric = self._decode_carla_depth(input_data["depth_front"][1])
+        return super().tick(input_data)
+
+    @staticmethod
+    def _decode_carla_depth(raw: np.ndarray) -> np.ndarray:
+        """CARLA depth camera BGRA -> metric depth [m]."""
+        arr = np.asarray(raw)[:, :, :3].astype(np.float32)  # BGR
+        B, G, R = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+        norm = (R + G * 256.0 + B * 256.0 * 256.0) / (256.0 ** 3 - 1.0)
+        return norm * 1000.0
+
+    def _apply_camera_warp(self, config, image: np.ndarray) -> np.ndarray:
+        use_depth = getattr(self, "_depth_warp_enabled", False) and self._depth_metric is not None
+        if not getattr(self, "_warp_path_logged", False):
+            dm = self._depth_metric
+            info = "None" if dm is None else f"shape={getattr(dm,'shape',None)} range=[{float(np.nanmin(dm)):.1f},{float(np.nanmax(dm)):.1f}]"
+            print(f"[FeatureThenFusionAdapterSensorRigAgent] WARP PATH = {'DEPTH' if use_depth else 'GROUND(fallback)'}  depth_warp_enabled={getattr(self,'_depth_warp_enabled',False)}  depth_metric={info}", flush=True)
+            self._warp_path_logged = True
+        if use_depth:
+            return self._depth_warp_array(config, image)
+        return self._ground_plane_warp_array(config, image)
+
+    def _depth_warp_array(self, config, image: np.ndarray) -> np.ndarray:
+        """Depth-based SE(3) reprojection shifted->canonical; holes filled by ground homography."""
+        H, W = image.shape[:2]
+        depth = self._depth_metric
+        if depth is None:
+            return self._ground_plane_warp_array(config, image)
+        if depth.shape[:2] != (H, W):
+            depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
+        fov = float(getattr(config, "camera_fov", getattr(config, "fov", 110.0)))
+        focal = W / (2.0 * math.tan(math.radians(fov) / 2.0))
+        cx, cy = W / 2.0, H / 2.0
+        sx, sy, sz = self._camera_ground_plane_source_pose[:3]
+        tx, ty, tz = self._camera_ground_plane_target_pose[:3]
+        vv, uu = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+        d = depth.astype(np.float32)
+        xc = d
+        yc = d * (uu - cx) / focal
+        zc = d * (cy - vv) / focal
+        px, py, pz = xc + sx, yc + sy, zc + sz         # ego frame
+        xc2, yc2, zc2 = px - tx, py - ty, pz - tz      # canonical-cam frame
+        with np.errstate(divide="ignore", invalid="ignore"):
+            up = cx + focal * (yc2 / xc2)
+            vp = cy - focal * (zc2 / xc2)
+        ui = np.round(np.nan_to_num(up, nan=-1)).astype(np.int64)
+        vi = np.round(np.nan_to_num(vp, nan=-1)).astype(np.int64)
+        ok = (d > 0.5) & (d < 80.0) & (xc2 > 0.5) & (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+        fy, fx = np.where(ok)
+        tu, tv, tzb = ui[ok], vi[ok], xc2[ok]
+        col = image[fy, fx]
+        order = np.argsort(-tzb)                        # far first; nearer overwrites
+        flat = (tv * W + tu)[order]
+        out = np.zeros((H * W, image.shape[2]), image.dtype)
+        filled = np.zeros(H * W, dtype=bool)
+        out[flat] = col[order]
+        filled[flat] = True
+        out = out.reshape(H, W, image.shape[2])
+        holes = ~filled.reshape(H, W)
+        ground = self._ground_plane_warp_array(config, image)  # fill disocclusion holes
+        out[holes] = ground[holes]
+        return out
 
     def _ground_plane_warp_array(self, config, image: np.ndarray) -> np.ndarray:
         if not self._camera_ground_plane_warp:
@@ -388,6 +476,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
     def _setup_input_canonicalization(self) -> None:
         camera_enabled = (
             bool(self._camera_ground_plane_warp)
+            or bool(getattr(self, "_depth_warp_enabled", False))
             or
             abs(self._camera_crop_shift_x_px) > 1e-6
             or abs(self._camera_crop_shift_y_px) > 1e-6
@@ -398,7 +487,7 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
                 t_u._teach2drive_original_crop_array = t_u.crop_array
 
             def canonical_crop(config, image, _self=self):
-                image = _self._ground_plane_warp_array(config, image)
+                image = _self._apply_camera_warp(config, image)
                 return _self._canonical_crop_array(
                     config,
                     image,
@@ -1106,9 +1195,16 @@ class FeatureThenFusionAdapterSensorRigAgent(SensorAgent):
             )
         return control
 
+    def _apply_steer_correction(self, control):
+        factor = getattr(self, "_steer_correction", 1.0)
+        if control is not None and abs(factor - 1.0) > 1e-6:
+            control.steer = float(np.clip(control.steer * factor, -1.0, 1.0))
+        return control
+
     def run_step(self, input_data, timestamp, sensors=None):  # pylint: disable=unused-argument
         self._write_record_frame(input_data)
         control = super().run_step(input_data, timestamp, sensors=sensors)
+        control = self._apply_steer_correction(control)
         return self._apply_side_lidar_guard(input_data, control, timestamp=timestamp)
 
     def destroy(self, results=None):

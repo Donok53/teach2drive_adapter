@@ -113,15 +113,21 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
             speed_logit_scale=float(residual_meta.get("speed_logit_scale", 1.5)),
             gate_bias=float(residual_meta.get("gate_bias", -2.0)),
             dropout=0.0,
+            checkpoint_lateral_only=bool(residual_meta.get("checkpoint_lateral_only", False)),
         ).to(self.device)
         missing, unexpected = self._output_residual_head.load_state_dict(residual_state, strict=False)
         self._output_residual_head.eval()
+        self._output_residual_blend = min(
+            1.0, max(0.0, float(os.environ.get("TFPP_OUTPUT_RESIDUAL_BLEND", "1.0")))
+        )
         self._patch_output_residual_for_nets()
         print(
             "[FeatureThenFusionPeftAdapterSensorRigAgent] output_residual=on "
             f"missing={len(missing)} unexpected={len(unexpected)} "
             f"checkpoint_scale={float(residual_meta.get('checkpoint_scale', 0.75)):.3f} "
-            f"speed_logit_scale={float(residual_meta.get('speed_logit_scale', 1.5)):.3f}",
+            f"speed_logit_scale={float(residual_meta.get('speed_logit_scale', 1.5)):.3f} "
+            f"lateral_only={int(bool(residual_meta.get('checkpoint_lateral_only', False)))} "
+            f"blend={self._output_residual_blend:.3f}",
             flush=True,
         )
 
@@ -148,9 +154,11 @@ class FeatureThenFusionPeftAdapterSensorRigAgent(FeatureThenFusionAdapterSensorR
                     )
                 out = list(output)
                 if adapted_speed is not None:
-                    out[1] = adapted_speed
+                    blend = float(getattr(self, "_output_residual_blend", 1.0))
+                    out[1] = pred_target_speed + blend * (adapted_speed - pred_target_speed)
                 if adapted_checkpoint is not None:
-                    out[2] = adapted_checkpoint
+                    blend = float(getattr(self, "_output_residual_blend", 1.0))
+                    out[2] = pred_checkpoint + blend * (adapted_checkpoint - pred_checkpoint)
                 return tuple(out) if isinstance(output, tuple) else out
 
             net.forward = residual_forward

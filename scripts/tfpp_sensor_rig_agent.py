@@ -63,6 +63,20 @@ class SensorRigAgent(SensorAgent):
   def setup(self, path_to_conf_file, route_index=None, traffic_manager=None):
     super().setup(path_to_conf_file, route_index=route_index, traffic_manager=traffic_manager)
     self._apply_sensor_rig()
+    # spec-based feedforward steering correction (scale lateral-PID steer command).
+    try:
+      self._steer_correction = float(os.environ.get("TFPP_STEER_CORRECTION", "1.0") or "1.0")
+    except ValueError:
+      self._steer_correction = 1.0
+    if abs(self._steer_correction - 1.0) > 1e-6:
+      print(f"[SensorRigAgent] steer_correction factor={self._steer_correction:.4f}")
+
+  def run_step(self, input_data, timestamp, sensors=None):
+    control = super().run_step(input_data, timestamp, sensors=sensors)
+    f = getattr(self, "_steer_correction", 1.0)
+    if control is not None and abs(f - 1.0) > 1e-6:
+      control.steer = max(-1.0, min(1.0, float(control.steer) * f))
+    return control
 
   def _apply_sensor_rig(self) -> None:
     source, layout = _load_layout()

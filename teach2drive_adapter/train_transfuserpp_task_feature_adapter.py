@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -308,6 +309,7 @@ class _BackboneTaskPatch:
         # x=-1.5 view) into teacher_feats; the student pass then uses those as the
         # `_record` reference instead of its own un-adapted features.
         self.teacher_feats: dict[int, torch.Tensor] = {}
+        self.last_stage_images: dict[int, torch.Tensor] = {}
         self._capture_teacher = False
         self._install()
 
@@ -315,6 +317,7 @@ class _BackboneTaskPatch:
         self.records.clear()
         self.xmodal_records.clear()
         self.last_fused = None
+        self.last_stage_images.clear()
         # NOTE: do NOT clear teacher_feats here. clear() is called between the
         # prior pass and the student pass (see forward), and the student pass needs
         # the teacher features captured earlier. teacher_feats is (re)initialized at
@@ -375,6 +378,9 @@ class _BackboneTaskPatch:
             if patch.stage_adapter_layers is not None and idx not in patch.stage_adapter_layers:
                 return patch.original_fuse_features(image_features, lidar_features, layer_idx)
             if patch.stage_adapter_modalities == "none":
+                # A stage-2 canonical teacher bypasses adapters, but still needs
+                # to expose its raw camera token maps as distillation targets.
+                patch.last_stage_images[idx] = backbone.avgpool_img(image_features)
                 return patch.original_fuse_features(image_features, lidar_features, layer_idx)
 
             image_embd_layer = backbone.avgpool_img(image_features)
@@ -394,7 +400,7 @@ class _BackboneTaskPatch:
                 )
 
             adapted_image, adapted_lidar = patch.adapter.adapt_layer(idx, image_embd_layer.float(), lidar_embd_layer.float())
-            if patch.stage_adapter_modalities in {"all", "camera"}:
+            if patch.stage_adapter_modalities in {"all", "camera", "camera_keep_lidar"}:
                 # v4: distill toward the teacher (x=-1.5 reprojected view) feature when
                 # available; otherwise fall back to the original self-reference (drift reg).
                 cam_ref = patch.teacher_feats.get(idx, image_embd_layer)
@@ -404,7 +410,10 @@ class _BackboneTaskPatch:
             if patch.stage_adapter_modalities in {"all", "lidar"}:
                 patch._record(adapted_lidar, lidar_embd_layer)
             else:
+                # camera_keep_lidar means exactly that: never pass the adapter's
+                # (possibly random) LiDAR output into TF++.
                 adapted_lidar = lidar_embd_layer.float()
+            patch.last_stage_images[idx] = adapted_image
             adapted_image = adapted_image.to(dtype=image_embd_layer.dtype)
             adapted_lidar = adapted_lidar.to(dtype=lidar_embd_layer.dtype)
             if patch.stage_blend < 1.0:
@@ -501,6 +510,7 @@ class GatedOutputResidualHead(nn.Module):
         speed_logit_scale: float,
         gate_bias: float = -2.0,
         dropout: float = 0.0,
+        checkpoint_lateral_only: bool = False,
     ) -> None:
         super().__init__()
         self.fused_channels = int(fused_channels)
@@ -508,6 +518,7 @@ class GatedOutputResidualHead(nn.Module):
         self.speed_classes = int(speed_classes)
         self.checkpoint_scale = float(checkpoint_scale)
         self.speed_logit_scale = float(speed_logit_scale)
+        self.checkpoint_lateral_only = bool(checkpoint_lateral_only)
         input_dim = self.fused_channels + self.checkpoint_dim + self.speed_classes
         hidden = int(hidden_dim) if int(hidden_dim) > 0 else max(128, input_dim // 2)
         self.trunk = nn.Sequential(
@@ -570,6 +581,10 @@ class GatedOutputResidualHead(nn.Module):
         hidden = self.trunk(torch.cat([pooled, checkpoint_flat, speed_logits], dim=1))
         gates = torch.sigmoid(self.gate(hidden))
         checkpoint_delta = torch.tanh(self.checkpoint_delta(hidden)) * float(self.checkpoint_scale) * gates[:, :1]
+        if self.checkpoint_lateral_only:
+            lateral_mask = torch.zeros_like(checkpoint_delta)
+            lateral_mask[:, 1::2] = 1.0
+            checkpoint_delta = checkpoint_delta * lateral_mask
         speed_delta = torch.tanh(self.speed_delta(hidden)) * float(self.speed_logit_scale) * gates[:, 1:2]
 
         adapted_checkpoint = None
@@ -586,6 +601,8 @@ class GatedOutputResidualHead(nn.Module):
             "output_residual_speed_gate": gates[:, 1].mean(),
             "output_residual_checkpoint_norm": checkpoint_delta.abs().mean(),
             "output_residual_speed_norm": speed_delta.abs().mean(),
+            "_output_residual_checkpoint_gate_per_sample": gates[:, 0],
+            "_output_residual_checkpoint_norm_per_sample": checkpoint_delta.abs().mean(dim=1),
         }
         return adapted_checkpoint, adapted_speed, stats
 
@@ -618,6 +635,7 @@ class _TaskAdapterForward(nn.Module):
         output_residual_speed_logit_scale: float = 1.5,
         output_residual_gate_bias: float = -2.0,
         output_residual_dropout: float = 0.0,
+        output_residual_checkpoint_lateral_only: bool = False,
         camera_crop_shift_x_px: float = 0.0,
         camera_crop_shift_y_px: float = 0.0,
         camera_crop_scale: float = 1.0,
@@ -670,6 +688,7 @@ class _TaskAdapterForward(nn.Module):
                 speed_logit_scale=float(output_residual_speed_logit_scale),
                 gate_bias=float(output_residual_gate_bias),
                 dropout=float(output_residual_dropout),
+                checkpoint_lateral_only=bool(output_residual_checkpoint_lateral_only),
             )
             if use_output_residual
             else None
@@ -741,7 +760,9 @@ class _TaskAdapterForward(nn.Module):
         lidar: torch.Tensor,
         target_dim: int,
         speed_dim: int,
+        command: torch.Tensor | None = None,
         camera_teacher: torch.Tensor | None = None,
+        external_teacher_feats: dict[int, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         patch = self._ensure_patch()
         inputs = prepare_transfuserpp_inputs(
@@ -762,14 +783,17 @@ class _TaskAdapterForward(nn.Module):
             lidar_shift_x_m=self.lidar_shift_x_m,
             lidar_shift_y_m=self.lidar_shift_y_m,
             lidar_pixels_per_meter=self.lidar_pixels_per_meter,
+            command_override=command,
         )
 
         # v4: capture geometric-teacher features from the reprojected x=-1.5 view.
         # Only the camera(rgb) is swapped; lidar/scalar identical -> the fusion
         # layers' image branch encodes the pretrained-rig viewpoint, which becomes
         # the _record distillation target for the student pass below.
-        patch.teacher_feats = {}
-        if camera_teacher is not None:
+        patch.teacher_feats = {
+            int(idx): feature.detach() for idx, feature in (external_teacher_feats or {}).items()
+        }
+        if camera_teacher is not None and external_teacher_feats is None:
             teacher_inputs = prepare_transfuserpp_inputs(
                 scalar=scalar,
                 camera=camera_teacher,
@@ -788,6 +812,7 @@ class _TaskAdapterForward(nn.Module):
                 lidar_shift_x_m=self.lidar_shift_x_m,
                 lidar_shift_y_m=self.lidar_shift_y_m,
                 lidar_pixels_per_meter=self.lidar_pixels_per_meter,
+                command_override=command,
             )
             patch.enabled = False
             patch._capture_teacher = True
@@ -822,6 +847,7 @@ class _TaskAdapterForward(nn.Module):
             aux["pred_depth"] = outputs[5]
         pred_target_speed = outputs[1]
         pred_checkpoint = outputs[2]
+        prior_checkpoint = prior_outputs[2].detach()
         if self.output_residual_head is not None and patch.last_fused is not None:
             pred_checkpoint, pred_target_speed, residual_stats = self.output_residual_head(
                 patch.last_fused.float(),
@@ -829,6 +855,10 @@ class _TaskAdapterForward(nn.Module):
                 pred_target_speed,
             )
             aux.update(residual_stats)
+        aux["pred_checkpoint"] = pred_checkpoint
+        aux["pred_target_speed_logits"] = pred_target_speed
+        aux["prior_checkpoint"] = prior_checkpoint
+        aux["prior_target_speed_logits"] = prior_outputs[1].detach() if prior_outputs[1] is not None else None
         pred_target = base_target_from_checkpoint(
             pred_checkpoint=pred_checkpoint,
             pred_target_speed=pred_target_speed,
@@ -857,6 +887,9 @@ def _infer_feature_shapes(net: nn.Module, config, loader: DataLoader, cameras: l
         scalar = batch["scalar"].to(device, non_blocking=True)
         camera = batch["camera"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
+        command = batch.get("tfpp_command")
+        if command is not None:
+            command = command.to(device, non_blocking=True)
         inputs = prepare_transfuserpp_inputs(
             scalar=scalar,
             camera=camera,
@@ -875,6 +908,7 @@ def _infer_feature_shapes(net: nn.Module, config, loader: DataLoader, cameras: l
             lidar_shift_x_m=float(args.lidar_canonical_shift_x_m),
             lidar_shift_y_m=float(args.lidar_canonical_shift_y_m),
             lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
+            command_override=command,
         )
         captured.clear()
         with torch.no_grad():
@@ -1052,6 +1086,15 @@ def _losses(
         torch.mean(nn.functional.smooth_l1_loss(pred_speed, prior_speed_target, reduction="none"), dim=1),
         effective_weight,
     )
+    teacher_checkpoint = torch.zeros((), dtype=torch.float32, device=device)
+    if "teacher_checkpoint" in aux and "pred_checkpoint" in aux:
+        student_checkpoint = aux["pred_checkpoint"].float()
+        target_checkpoint = aux["teacher_checkpoint"].to(device=device, dtype=torch.float32)
+        point_count = min(int(student_checkpoint.shape[1]), int(target_checkpoint.shape[1]))
+        teacher_checkpoint = nn.functional.smooth_l1_loss(
+            student_checkpoint[:, :point_count, :2],
+            target_checkpoint[:, :point_count, :2],
+        )
     controller_metrics = _controller_proxy_losses(
         pred_traj=pred_traj,
         pred_speed=pred_speed,
@@ -1072,6 +1115,126 @@ def _losses(
     residual_speed_gate = aux.get("output_residual_speed_gate", zero)
     residual_checkpoint_norm = aux.get("output_residual_checkpoint_norm", zero)
     residual_speed_norm = aux.get("output_residual_speed_norm", zero)
+
+    route_lateral = zero
+    route_heading = zero
+    route_aim_angle = zero
+    route_straight_identity = zero
+    route_turn_gate = zero
+    route_xy = zero
+    route_turn_ratio = zero
+    route_valid_ratio = zero
+    tfpp_checkpoint = zero
+    tfpp_target_speed = zero
+    tfpp_original_loss = zero
+    tfpp_speed_valid_ratio = zero
+    if "pred_checkpoint" in aux and "route_target" in batch:
+        route_pred = aux["pred_checkpoint"].float()
+        route_prior = aux.get("prior_checkpoint", route_pred.detach()).float()
+        route_target = batch["route_target"].to(device, non_blocking=True).float()
+        route_valid = _per_sample_vector(
+            batch["route_target_mask"].to(device, non_blocking=True), int(route_target.shape[0])
+        ) > 0.5
+        point_count = min(int(route_pred.shape[1]), int(route_target.shape[1]))
+        route_pred = route_pred[:, :point_count, :2]
+        route_prior = route_prior[:, :point_count, :2]
+        route_target = route_target[:, :point_count, :2]
+
+        target_end_heading = torch.atan2(route_target[:, -1, 1], route_target[:, -1, 0].clamp_min(1e-6))
+        target_max_lateral = route_target[..., 1].abs().amax(dim=1)
+        route_turn = route_valid & (
+            (target_max_lateral >= float(args.route_turn_lateral_threshold_m))
+            | (target_end_heading.abs() >= float(args.route_turn_angle_threshold_rad))
+        )
+        route_straight = route_valid & ~route_turn
+        valid_weight = effective_weight * route_valid.to(dtype=effective_weight.dtype)
+        turn_weight = effective_weight * route_turn.to(dtype=effective_weight.dtype)
+        straight_weight = effective_weight * route_straight.to(dtype=effective_weight.dtype)
+
+        route_xy_raw = nn.functional.smooth_l1_loss(route_pred, route_target, reduction="none").mean(dim=(1, 2))
+        route_lateral_raw = nn.functional.smooth_l1_loss(
+            route_pred[..., 1], route_target[..., 1], reduction="none"
+        ).mean(dim=1)
+        route_xy = _weighted_mean(route_xy_raw, valid_weight)
+        route_lateral = _weighted_mean(route_lateral_raw, turn_weight)
+
+        # TF++'s lateral PID does not consume segment-to-segment heading.  It
+        # selects one checkpoint and computes atan2(y, x) from the ego origin.
+        # Optimizing this normalized aim angle prevents a degenerate solution
+        # that merely translates the whole checkpoint path sideways while
+        # leaving the steering-relevant geometry unchanged.
+        pred_aim = torch.atan2(route_pred[..., 1], route_pred[..., 0].clamp_min(1e-3)) / (0.5 * torch.pi)
+        target_aim = torch.atan2(route_target[..., 1], route_target[..., 0].clamp_min(1e-3)) / (0.5 * torch.pi)
+        route_aim_angle_raw = nn.functional.smooth_l1_loss(
+            pred_aim, target_aim, reduction="none"
+        ).mean(dim=1)
+        route_aim_angle = _weighted_mean(route_aim_angle_raw, turn_weight)
+
+        if point_count >= 2:
+            pred_segment = route_pred[:, 1:] - route_pred[:, :-1]
+            target_segment = route_target[:, 1:] - route_target[:, :-1]
+            pred_unit = nn.functional.normalize(pred_segment, dim=2, eps=1e-6)
+            target_unit = nn.functional.normalize(target_segment, dim=2, eps=1e-6)
+            route_heading_raw = (1.0 - (pred_unit * target_unit).sum(dim=2)).mean(dim=1)
+            route_heading = _weighted_mean(route_heading_raw, turn_weight)
+
+        identity_raw = (route_pred[..., 1] - route_prior[..., 1]).abs().mean(dim=1)
+        route_straight_identity = _weighted_mean(identity_raw, straight_weight)
+        checkpoint_gate_per_sample = aux.get("_output_residual_checkpoint_gate_per_sample")
+        if checkpoint_gate_per_sample is not None:
+            gate_raw = nn.functional.binary_cross_entropy(
+                checkpoint_gate_per_sample.float().clamp(1e-6, 1.0 - 1e-6),
+                route_turn.to(dtype=torch.float32),
+                reduction="none",
+            )
+            route_turn_gate = _weighted_mean(gate_raw, valid_weight)
+        route_turn_ratio = route_turn.float().sum() / torch.clamp(route_valid.float().sum(), min=1.0)
+        route_valid_ratio = route_valid.float().mean()
+
+    # Exact controller-input objective used by the released TF++ training code:
+    # L1 on the same-frame PDM spatial checkpoints and cross entropy on the
+    # same-frame PDM target-speed two-hot distribution.  This deliberately does
+    # not reuse the temporal ego-pose / future-realized-speed targets in the
+    # Teach2Drive token index.
+    if "pred_checkpoint" in aux and "tfpp_target_speed_twohot" in batch:
+        exact_checkpoint_pred = aux["pred_checkpoint"].float()
+        exact_checkpoint_target = batch["route_target"].to(device, non_blocking=True).float()
+        exact_checkpoint_mask = _per_sample_vector(
+            batch["route_target_mask"].to(device, non_blocking=True),
+            int(exact_checkpoint_target.shape[0]),
+        )
+        exact_point_count = min(
+            int(exact_checkpoint_pred.shape[1]), int(exact_checkpoint_target.shape[1])
+        )
+        exact_checkpoint_raw = torch.abs(
+            exact_checkpoint_pred[:, :exact_point_count, :2]
+            - exact_checkpoint_target[:, :exact_point_count, :2]
+        ).mean(dim=(1, 2))
+        tfpp_checkpoint = torch.sum(exact_checkpoint_raw * exact_checkpoint_mask) / torch.clamp(
+            exact_checkpoint_mask.sum(), min=1e-6
+        )
+
+        speed_logits = aux.get("pred_target_speed_logits")
+        if speed_logits is not None:
+            speed_logits = speed_logits.float()
+            speed_twohot = batch["tfpp_target_speed_twohot"].to(device, non_blocking=True).float()
+            speed_mask = _per_sample_vector(
+                batch["tfpp_target_speed_mask"].to(device, non_blocking=True),
+                int(speed_twohot.shape[0]),
+            )
+            speed_class_count = min(int(speed_logits.shape[1]), int(speed_twohot.shape[1]))
+            speed_ce_raw = -(
+                speed_twohot[:, :speed_class_count]
+                * nn.functional.log_softmax(speed_logits[:, :speed_class_count], dim=1)
+            ).sum(dim=1)
+            tfpp_target_speed = torch.sum(speed_ce_raw * speed_mask) / torch.clamp(
+                speed_mask.sum(), min=1e-6
+            )
+            tfpp_speed_valid_ratio = speed_mask.mean()
+        tfpp_original_loss = (
+            float(args.tfpp_checkpoint_loss_weight) * tfpp_checkpoint
+            + float(args.tfpp_target_speed_loss_weight) * tfpp_target_speed
+        )
 
     stop_state_aux = zero
     if "stop_state" in aux:
@@ -1109,6 +1272,29 @@ def _losses(
         + float(args.pdm_plan_throttle_loss_weight) * controller_metrics["plan_throttle_error"]
         + float(args.pdm_plan_brake_loss_weight) * controller_metrics["plan_brake_error"]
     )
+    if bool(args.teacher_distill_only):
+        total = (
+            float(args.feature_drift_loss_weight) * drift
+            + float(args.teacher_checkpoint_loss_weight) * teacher_checkpoint
+            + float(args.output_prior_speed_loss_weight) * prior_speed
+        )
+    elif bool(args.route_target_only):
+        # Route-only training is used for the policy-preserving planner-output
+        # adapter.  Keep the explicit TF++ output priors active here as well;
+        # previously these weights were silently ignored by this branch, so a
+        # turn sample could be pulled toward the expert path without any anchor
+        # to the pretrained TF++ policy.
+        total = (
+            float(args.route_lateral_loss_weight) * route_lateral
+            + float(args.route_heading_loss_weight) * route_heading
+            + float(args.route_aim_angle_loss_weight) * route_aim_angle
+            + float(args.route_straight_identity_loss_weight) * route_straight_identity
+            + float(args.route_turn_gate_loss_weight) * route_turn_gate
+            + float(args.output_prior_xy_loss_weight) * prior_xy
+            + float(args.output_prior_speed_loss_weight) * prior_speed
+        )
+    elif bool(args.tfpp_original_objective):
+        total = tfpp_original_loss
     metrics = {
         "loss": total,
         "xy": xy,
@@ -1129,6 +1315,7 @@ def _losses(
         "drift": drift,
         "prior_xy": prior_xy,
         "prior_speed": prior_speed,
+        "teacher_checkpoint": teacher_checkpoint,
         "controller_proxy": controller_metrics["controller_proxy"],
         "plan_steer_error": controller_metrics["plan_steer_error"],
         "plan_throttle_error": controller_metrics["plan_throttle_error"],
@@ -1138,6 +1325,18 @@ def _losses(
         "output_residual_speed_gate": residual_speed_gate,
         "output_residual_checkpoint_norm": residual_checkpoint_norm,
         "output_residual_speed_norm": residual_speed_norm,
+        "route_lateral": route_lateral,
+        "route_heading": route_heading,
+        "route_aim_angle": route_aim_angle,
+        "route_straight_identity": route_straight_identity,
+        "route_turn_gate": route_turn_gate,
+        "route_xy": route_xy,
+        "route_turn_ratio": route_turn_ratio,
+        "route_valid_ratio": route_valid_ratio,
+        "tfpp_checkpoint": tfpp_checkpoint,
+        "tfpp_target_speed": tfpp_target_speed,
+        "tfpp_original_loss": tfpp_original_loss,
+        "tfpp_speed_valid_ratio": tfpp_speed_valid_ratio,
         "stop_state_aux": stop_state_aux,
         "stop_reason_aux": stop_reason_aux,
         "moving_ratio": moving.float().mean(),
@@ -1251,6 +1450,7 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int, 
         "drift",
         "prior_xy",
         "prior_speed",
+        "teacher_checkpoint",
         "controller_proxy",
         "plan_steer_error",
         "plan_throttle_error",
@@ -1260,6 +1460,18 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int, 
         "output_residual_speed_gate",
         "output_residual_checkpoint_norm",
         "output_residual_speed_norm",
+        "route_lateral",
+        "route_heading",
+        "route_aim_angle",
+        "route_straight_identity",
+        "route_turn_gate",
+        "route_xy",
+        "route_turn_ratio",
+        "route_valid_ratio",
+        "tfpp_checkpoint",
+        "tfpp_target_speed",
+        "tfpp_original_loss",
+        "tfpp_speed_valid_ratio",
         "stop_state_aux",
         "stop_reason_aux",
         "moving_ratio",
@@ -1309,9 +1521,25 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int, 
         scalar = batch["scalar"].to(device, non_blocking=True)
         camera = batch["camera"].to(device, non_blocking=True)
         lidar = batch["lidar"].to(device, non_blocking=True)
+        command = batch.get("tfpp_command")
+        if command is not None:
+            command = command.to(device, non_blocking=True)
         camera_teacher = batch.get("camera_teacher")
         if camera_teacher is not None:
             camera_teacher = camera_teacher.to(device, non_blocking=True)
+        if bool(args.teacher_view_as_input):
+            if camera_teacher is None:
+                raise RuntimeError("--teacher-view-as-input requires --teacher-view-root")
+            if camera_teacher.shape[1] != camera.shape[1]:
+                if camera.shape[1] != 1 or camera_teacher.shape[1] != 1:
+                    raise ValueError(
+                        "teacher-view input must match the configured camera count: "
+                        f"input={tuple(camera.shape)} teacher={tuple(camera_teacher.shape)}"
+                    )
+            camera = camera_teacher
+            # This mode is used for stage-1 vehicle adaptation. The canonical
+            # view is the actual student input, not a second distillation pass.
+            camera_teacher = None
         loss_batch = batch
         if (train or force_perturb) and float(perturb_cfg["prob"]) > 0.0:
             camera, scalar, _pt = _apply_recovery_perturbation(
@@ -1320,14 +1548,42 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int, 
             loss_batch = dict(batch)
             loss_batch["target"] = _pt
         with torch.set_grad_enabled(train):
+            external_teacher_feats = None
+            external_teacher_target = None
+            frozen_teacher = getattr(args, "_frozen_init_teacher", None)
+            if frozen_teacher is not None:
+                if camera_teacher is None:
+                    raise RuntimeError("frozen init teacher requires paired canonical camera input")
+                frozen_teacher.set_runtime_mode(False)
+                with torch.no_grad():
+                    external_teacher_target, _, _, teacher_aux = frozen_teacher(
+                        scalar,
+                        camera_teacher,
+                        lidar,
+                        target_dim=loss_batch["target"].shape[1],
+                        speed_dim=int(args.speed_dim),
+                        command=command,
+                        camera_teacher=None,
+                    )
+                    teacher_patch = frozen_teacher._ensure_patch()
+                    external_teacher_feats = {
+                        int(idx): feature.detach() for idx, feature in teacher_patch.last_stage_images.items()
+                    }
             pred_target, drift_loss, prior_target, aux = model(
                 scalar,
                 camera,
                 lidar,
                 target_dim=loss_batch["target"].shape[1],
                 speed_dim=int(args.speed_dim),
-                camera_teacher=camera_teacher,
+                command=command,
+                camera_teacher=None if frozen_teacher is not None else camera_teacher,
+                external_teacher_feats=external_teacher_feats,
             )
+            if external_teacher_target is not None:
+                prior_target = external_teacher_target.detach()
+                teacher_checkpoint = teacher_aux.get("pred_checkpoint")
+                if teacher_checkpoint is not None:
+                    aux["teacher_checkpoint"] = teacher_checkpoint.detach()
             losses = _losses(pred_target, loss_batch, drift_loss, prior_target, aux, device, args)
             anchor_loss = _trainable_anchor_loss(model, getattr(args, "_trainable_anchor_state", {}), device)
             losses["anchor"] = anchor_loss
@@ -1392,7 +1648,14 @@ def _run_epoch(model, loader, optimizer, device, args, train: bool, epoch: int, 
                 f"plan={totals['plan_steer_error']/samples:.6f}/{totals['plan_throttle_error']/samples:.6f}/{totals['plan_brake_error']/samples:.6f} "
                 f"res={totals['output_residual_checkpoint_gate']/samples:.3f}/{totals['output_residual_speed_gate']/samples:.3f}/"
                 f"{totals['output_residual_checkpoint_norm']/samples:.3f}/{totals['output_residual_speed_norm']/samples:.3f} "
+                f"route={totals['route_lateral']/samples:.4f}/{totals['route_heading']/samples:.4f}/"
+                f"{totals['route_aim_angle']/samples:.4f}/"
+                f"{totals['route_straight_identity']/samples:.4f}/{totals['route_turn_gate']/samples:.4f} "
+                f"turn={totals['route_turn_ratio']/samples:.3f} valid={totals['route_valid_ratio']/samples:.3f} "
+                f"tfpp={totals['tfpp_checkpoint']/samples:.5f}/{totals['tfpp_target_speed']/samples:.5f}/"
+                f"{totals['tfpp_original_loss']/samples:.5f} speed_valid={totals['tfpp_speed_valid_ratio']/samples:.3f} "
                 f"prior={totals['prior_xy']/samples:.6f}/{totals['prior_speed']/samples:.6f} "
+                f"teacher_cp={totals['teacher_checkpoint']/samples:.6f} "
                 f"aux={totals['control']/samples:.6f}/{totals['stop_state_aux']/samples:.6f}/{totals['stop_reason_aux']/samples:.6f} "
                 f"drift={totals['drift']/samples:.6f} xmodal={totals['xmodal']/samples:.4f} depth={totals['depth']/samples:.4f} moving={totals['moving_ratio']/samples:.3f} "
                 f"samples/s={samples/elapsed:.1f}",
@@ -1453,6 +1716,11 @@ def train(args: argparse.Namespace) -> None:
         teacher_view_root=_teacher_root,
         teacher_view_dirname=args.teacher_view_dirname,
         teacher_view_camera=args.tfpp_camera,
+        strict_sensor_geometry=True,
+        measurement_root=args.measurement_root or None,
+        route_target_len=int(args.route_target_len),
+        route_target_source=str(args.route_target_source),
+        future_ego_max_horizon_s=float(args.future_ego_max_horizon_s),
     )
     val_ds = Teach2DriveIndexDataset(
         args.index,
@@ -1464,7 +1732,20 @@ def train(args: argparse.Namespace) -> None:
         teacher_view_root=_teacher_root,
         teacher_view_dirname=args.teacher_view_dirname,
         teacher_view_camera=args.tfpp_camera,
+        strict_sensor_geometry=True,
+        measurement_root=args.measurement_root or None,
+        route_target_len=int(args.route_target_len),
+        route_target_source=str(args.route_target_source),
+        future_ego_max_horizon_s=float(args.future_ego_max_horizon_s),
     )
+    if train_ds.spatial_route_target_masks is not None:
+        train_valid = float(train_ds.spatial_route_target_masks[train_indices].mean())
+        val_valid = float(val_ds.spatial_route_target_masks[val_indices].mean())
+        print(
+            f"expert_spatial_targets train_valid={train_valid:.4f} val_valid={val_valid:.4f} "
+            f"horizon_s={float(args.future_ego_max_horizon_s):.2f}",
+            flush=True,
+        )
     train_loader = DataLoader(
         train_ds,
         batch_size=int(args.batch_size),
@@ -1498,6 +1779,13 @@ def train(args: argparse.Namespace) -> None:
         )
         if not peft_lora_modules:
             raise ValueError(f"No LoRA modules matched include={args.lora_include!r} exclude={args.lora_exclude!r}")
+        required_lora_modules = _split_patterns(args.lora_require_modules)
+        missing_lora_modules = [name for name in required_lora_modules if name not in peft_lora_modules]
+        if missing_lora_modules:
+            raise ValueError(
+                "Required LoRA modules were not installed: "
+                f"missing={missing_lora_modules} installed={peft_lora_modules}"
+            )
     unfrozen_tfpp_params = _unfreeze_matching_tfpp_parameters(net, args.unfreeze_include, args.unfreeze_exclude)
 
     probe_loader = DataLoader(
@@ -1556,6 +1844,7 @@ def train(args: argparse.Namespace) -> None:
         output_residual_speed_logit_scale=float(args.output_residual_speed_logit_scale),
         output_residual_gate_bias=float(args.output_residual_gate_bias),
         output_residual_dropout=float(args.output_residual_dropout),
+        output_residual_checkpoint_lateral_only=bool(args.output_residual_checkpoint_lateral_only),
         camera_crop_shift_x_px=float(args.camera_crop_shift_x_px),
         camera_crop_shift_y_px=float(args.camera_crop_shift_y_px),
         camera_crop_scale=float(args.camera_crop_scale),
@@ -1568,6 +1857,27 @@ def train(args: argparse.Namespace) -> None:
         lidar_pixels_per_meter=float(args.lidar_pixels_per_meter),
     ).to(device)
     init_extra_load_info = _load_task_checkpoint_extras(model, args.init_checkpoint, strict=False)
+    if bool(args.freeze_output_residual) and model.output_residual_head is not None:
+        for parameter in model.output_residual_head.parameters():
+            parameter.requires_grad_(False)
+    if bool(args.freeze_init_as_teacher):
+        if not args.init_checkpoint:
+            raise ValueError("--freeze-init-as-teacher requires --init-checkpoint")
+        frozen_teacher = copy.deepcopy(model).to(device)
+        # The canonical teacher represents frozen TF++ plus the learned stage-1
+        # vehicle-output correction.  Stage-2 camera adapters must not be active
+        # in this branch, especially because their stage-1 weights were unused.
+        frozen_teacher.stage_adapter_modalities = "none"
+        frozen_teacher.fusion_adapter_enabled = False
+        frozen_teacher.set_runtime_mode(False)
+        for parameter in frozen_teacher.parameters():
+            parameter.requires_grad_(False)
+        args._frozen_init_teacher = frozen_teacher
+    frozen_adapter_patterns = _split_patterns(args.freeze_adapter_include)
+    if frozen_adapter_patterns:
+        for parameter_name, parameter in model.named_parameters():
+            if parameter_name.startswith("adapter.") and _matches_any(parameter_name, frozen_adapter_patterns):
+                parameter.requires_grad_(False)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
         model = nn.DataParallel(model)
@@ -1658,11 +1968,14 @@ def train(args: argparse.Namespace) -> None:
             "speed_logit_scale": float(args.output_residual_speed_logit_scale),
             "gate_bias": float(args.output_residual_gate_bias),
             "dropout": float(args.output_residual_dropout),
+            "checkpoint_lateral_only": bool(args.output_residual_checkpoint_lateral_only),
             "checkpoint_dim": int((getattr(config, "predict_checkpoint_len", 10) or 10) * 2),
             "speed_classes": int(len(getattr(config, "target_speeds", [])) or 1),
         },
         "extrinsic_aware": bool(args.extrinsic_aware),
         "source_profile": args.source_profile,
+        "route_target_source": str(args.route_target_source),
+        "future_ego_max_horizon_s": float(args.future_ego_max_horizon_s),
         "extrinsic_vector": [float(v) for v in extrinsic_vector],
         "train_samples": int(len(train_ds)),
         "val_samples": int(len(val_ds)),
@@ -1792,7 +2105,12 @@ def train(args: argparse.Namespace) -> None:
                 f"lr={val_metrics['launch_go_recall']:.3f}/{val_metrics['release_go_recall']:.3f} "
                 f"res={val_metrics['output_residual_checkpoint_gate']:.3f}/{val_metrics['output_residual_speed_gate']:.3f}/"
                 f"{val_metrics['output_residual_checkpoint_norm']:.3f}/{val_metrics['output_residual_speed_norm']:.3f} "
+                f"route={val_metrics['route_lateral']:.5f}/{val_metrics['route_heading']:.5f}/"
+                f"{val_metrics['route_aim_angle']:.5f}/"
+                f"{val_metrics['route_straight_identity']:.5f}/{val_metrics['route_turn_gate']:.5f} "
+                f"turn={val_metrics['route_turn_ratio']:.3f} valid={val_metrics['route_valid_ratio']:.3f} "
                 f"prior={val_metrics['prior_xy']:.6f}/{val_metrics['prior_speed']:.6f} "
+                f"teacher_cp={val_metrics['teacher_checkpoint']:.6f} "
                 f"aux={val_metrics['control']:.6f}/{val_metrics['stop_state_aux']:.6f}/{val_metrics['stop_reason_aux']:.6f} "
                 f"drift={val_metrics['drift']:.6f} xmodal={val_metrics.get('xmodal', 0.0):.4f}",
                 flush=True,
@@ -1845,20 +2163,53 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a target-only task-driven TransFuser++ feature-then-fusion adapter.")
     parser.add_argument("--index", required=True)
     parser.add_argument("--episode-root-override", default="")
+    parser.add_argument(
+        "--measurement-root",
+        default="",
+        help="Raw paired-data root containing <source_route>/measurements/<step>.json.gz.",
+    )
+    parser.add_argument("--route-target-len", type=int, default=10)
+    parser.add_argument(
+        "--route-target-source",
+        choices=["measurement_route", "future_ego_path"],
+        default="measurement_route",
+        help="Spatial checkpoint supervision: navigation route or the expert's future driven ego path.",
+    )
+    parser.add_argument(
+        "--future-ego-max-horizon-s",
+        type=float,
+        default=6.0,
+        help="Maximum future time used to obtain distance-resampled expert ego checkpoints.",
+    )
     # v4 geometric-teacher distillation: root that holds <source_route>/<dirname>/<step>.jpg
     # reprojected x=-1.5 views. Empty -> disabled (drift stays a self-reference regularizer).
     parser.add_argument("--teacher-view-root", default="")
     parser.add_argument("--teacher-view-dirname", default="rgb_front_teacher_xm15")
+    parser.add_argument(
+        "--teacher-view-as-input",
+        action="store_true",
+        help="Use the paired teacher/canonical camera as the primary model input (stage-1 vehicle adaptation).",
+    )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--garage-root", required=True)
     parser.add_argument("--team-config", required=True)
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--init-checkpoint", default="")
+    parser.add_argument(
+        "--freeze-init-as-teacher",
+        action="store_true",
+        help="Keep a frozen copy of the initialized stage-1 model as the canonical teacher.",
+    )
+    parser.add_argument(
+        "--freeze-adapter-include",
+        default="",
+        help="Comma-separated regexes for initialized adapter parameters to keep frozen during stage 2.",
+    )
     parser.add_argument("--init-param-anchor-loss-weight", type=float, default=0.0)
-    parser.add_argument("--cameras", default="left,front,right")
+    parser.add_argument("--cameras", default="front")
     parser.add_argument("--tfpp-camera", default="front")
     parser.add_argument("--command-mode", choices=["lane_follow", "target_angle"], default="target_angle")
-    parser.add_argument("--image-size", type=int, nargs=2, default=[640, 360], metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--image-size", type=int, nargs=2, default=[1024, 512], metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--camera-crop-shift-x-px", type=float, default=0.0)
     parser.add_argument("--camera-crop-shift-y-px", type=float, default=0.0)
     parser.add_argument("--camera-crop-scale", type=float, default=1.0)
@@ -1878,7 +2229,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
     )
     parser.add_argument("--camera-ground-plane-z-m", type=float, default=0.0)
-    parser.add_argument("--lidar-size", type=int, default=128)
+    parser.add_argument("--lidar-size", type=int, default=256)
     parser.add_argument("--extrinsic-aware", action="store_true")
     parser.add_argument("--source-profile", default="front_triplet_shifted", choices=["front_triplet_shifted", "tfpp_ego"])
     parser.add_argument("--extrinsic-hidden-dim", type=int, default=64)
@@ -1893,7 +2244,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stage-adapter-modalities",
-        choices=["all", "camera", "lidar", "none"],
+        choices=["all", "camera", "camera_keep_lidar", "lidar", "none"],
         default="all",
         help="Which stage token streams are replaced by the learned adapter output.",
     )
@@ -1908,6 +2259,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="^join\\.,^checkpoint_decoder\\.(encoder|decoder)\\.,^target_speed_network\\.",
     )
     parser.add_argument("--lora-exclude", default="")
+    parser.add_argument(
+        "--lora-require-modules",
+        default="",
+        help="Comma-separated exact module names that must receive LoRA; fail before training if any are absent.",
+    )
     parser.add_argument(
         "--unfreeze-include",
         default="",
@@ -1967,6 +2323,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-residual-speed-logit-scale", type=float, default=1.5)
     parser.add_argument("--output-residual-gate-bias", type=float, default=-2.0)
     parser.add_argument("--output-residual-dropout", type=float, default=0.0)
+    parser.add_argument("--output-residual-checkpoint-lateral-only", action="store_true")
+    parser.add_argument(
+        "--freeze-output-residual",
+        action="store_true",
+        help="Load and deploy the output residual head, but exclude it from stage-2 optimization.",
+    )
+    parser.add_argument(
+        "--teacher-distill-only",
+        action="store_true",
+        help="Use only canonical-teacher feature, full-checkpoint, and speed distillation losses.",
+    )
+    parser.add_argument("--teacher-checkpoint-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--route-target-only",
+        action="store_true",
+        help="Train only against same-frame spatial route checkpoints; disable temporal/control objectives.",
+    )
+    parser.add_argument(
+        "--tfpp-original-objective",
+        action="store_true",
+        help=(
+            "Use the original TF++ controller-input objective: same-frame PDM route checkpoint L1 "
+            "plus direct PDM target-speed two-hot cross entropy."
+        ),
+    )
+    parser.add_argument("--tfpp-checkpoint-loss-weight", type=float, default=1.0)
+    parser.add_argument("--tfpp-target-speed-loss-weight", type=float, default=1.0)
+    parser.add_argument("--route-lateral-loss-weight", type=float, default=1.0)
+    parser.add_argument("--route-heading-loss-weight", type=float, default=0.25)
+    parser.add_argument("--route-aim-angle-loss-weight", type=float, default=0.0)
+    parser.add_argument("--route-straight-identity-loss-weight", type=float, default=0.2)
+    parser.add_argument("--route-turn-gate-loss-weight", type=float, default=0.1)
+    parser.add_argument("--route-turn-lateral-threshold-m", type=float, default=0.5)
+    parser.add_argument("--route-turn-angle-threshold-rad", type=float, default=0.08)
     parser.add_argument("--stop-state-aux-loss-weight", type=float, default=0.0)
     parser.add_argument("--stop-reason-aux-loss-weight", type=float, default=0.0)
     parser.add_argument("--moving-speed-threshold", type=float, default=1.0)
