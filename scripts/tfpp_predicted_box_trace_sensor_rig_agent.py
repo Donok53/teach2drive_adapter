@@ -16,6 +16,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -106,7 +107,7 @@ class PredictedBoxTraceSensorRigAgent(SensorRigAgent):
             checkpoints = (
                 pred_checkpoints.detach().float().cpu().reshape(-1, 2).tolist()
                 if torch.is_tensor(pred_checkpoints)
-                else []
+                else np.asarray(pred_checkpoints, dtype=np.float32).reshape(-1, 2).tolist()
             )
             payload = {
                 "step": int(self._pred_box_step),

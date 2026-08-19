@@ -126,3 +126,52 @@ Offline replay of the same traces shows that threshold 0.2 would make only six
 meaningful target-speed changes on mission 002 and five on mission 003.  That
 candidate is the next closed-loop A/B; it is materially narrower than V20's
 hundreds of modified frames.
+
+The isolated threshold-0.2 A/B preserved mission 002 but mission 003 still
+collided with the same Dodge Charger at essentially the same world position.
+V21 epoch 1 is therefore not a candidate.
+
+## Sensor-only predicted-box stop extension
+
+Run `diag_v49_predbox_base_isolated_m3_20260819` wrapped the released TF++
+policy without changing its action and recorded the existing CenterNet BEV
+box-head output.  Mission 003 again collided with a Dodge Charger at
+`(6773.228, 4921.471)`.  The detector was not the bottleneck:
+
+- the first oncoming car was visible from about 31 m and passed while TF++
+  held a zero target speed;
+- the second oncoming car was also visible from about 31 m;
+- while that car closed from 26 m to 8 m, TF++ released its target speed from
+  roughly 3.2 to 10.0 m/s and accelerated into the collision.
+
+This motivates a narrow sensor-only shield using TF++'s own class-0/class-4
+boxes.  It does not replace the planner and does not access CARLA actors.
+Early closed-loop versions exposed two important negative controls:
+
+- remembering left-turn intent for 40 frames caused a later straight-road
+  intervention;
+- interpreting PID `brake=1` as a semantic stop was wrong, because PID also
+  brakes when current speed is merely above a nonzero target speed.
+
+The accepted trigger under evaluation is consequently limited to:
+
+1. TF++ is currently steering left;
+2. its own detector sees a high-confidence oncoming vehicle in the conflict
+   lane;
+3. TF++ itself has selected a target speed at or below 0.5 m/s.
+
+After triggering, the shield only extends that already-selected stop until
+the detected conflict clears (plus eight frames for detector flicker).  In
+closed loop, `diag_v52_targetzero_stop_pair_m2_m3_20260819` produced:
+
+- mission 002: zero interventions over the complete trace.  This particular
+  repetition still failed with the same base-policy lane/min-speed variance,
+  so it is an action-identity control rather than a PASS claim;
+- mission 003: PASS 100 with no infraction.  The shield triggered once,
+  extended the existing stop for 83 frames, released after the second
+  oncoming car cleared, and avoided the repeated Dodge Charger collision.
+
+The next cumulative test is
+`eval_v53_v1_targetspeed_boxshield_selected_20260819`: combine this shield with
+the prior sensor-only target-speed adapter that scored 11/20, then screen
+mission 003 and 013 improvements against mission 004 and 005 preservation.
