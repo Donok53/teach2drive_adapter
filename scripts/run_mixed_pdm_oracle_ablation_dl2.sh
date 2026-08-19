@@ -9,6 +9,7 @@ HOST_CARLA_ROOT=${HOST_CARLA_ROOT:-${HOST_WORK_ROOT}/carla/carla_0.9.15}
 IMAGE=${IMAGE:-teach2drive-eval-py310:dl2}
 MODE=${MODE:?Set MODE=checkpoint or MODE=speed}
 GPU=${GPU:-0}
+CARLA_GRAPHICS_ADAPTER=${CARLA_GRAPHICS_ADAPTER:-0}
 PORT=${PORT:-2063}
 TM_PORT=${TM_PORT:-8063}
 START_INDEX=${START_INDEX:-0}
@@ -58,9 +59,9 @@ start_carla() {
   fi
   (
     cd "${HOST_CARLA_ROOT}"
-    exec setsid env DISPLAY=:0 CUDA_VISIBLE_DEVICES="${GPU}" ./CarlaUE4.sh \
+    exec setsid env DISPLAY=:0 ./CarlaUE4.sh \
       -RenderOffScreen -nosound -quality-level=Low \
-      -carla-rpc-port="${PORT}" -graphicsadapter="${GPU}"
+      -carla-rpc-port="${PORT}" -graphicsadapter="${CARLA_GRAPHICS_ADAPTER}"
   ) > "${HOST_RUN_ROOT}/carla_logs/carla.log" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 75); do
