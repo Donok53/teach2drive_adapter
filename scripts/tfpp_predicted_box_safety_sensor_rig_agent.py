@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""TF++ sensor-rig agent with a narrowly gated left-turn safety shield.
+"""TF++ sensor-rig agent with narrowly gated sensor-only safety shields.
 
 The base planner, target-speed prediction, steering PID, and sensor rig remain
-unchanged.  Only when the base policy is already steering left and TF++'s own
-BEV detector sees an oncoming vehicle in the conflict lane do we replace
-throttle with full brake.  No CARLA actor or future ground-truth information
-is used.
+unchanged. The wrapper can extend an existing zero-speed decision, or start an
+early stop when the predicted checkpoint path already bends left and an
+oncoming detection has a short conservative TTC. Late mid-turn activation is
+forbidden. No CARLA actor or future ground-truth information is used.
 """
 
 from __future__ import annotations
@@ -24,9 +24,15 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from teach2drive_adapter.predicted_box_safety import (  # noqa: E402
+    LeftTurnTTCGateConfig,
     OncomingStopExtensionLatch,
     OncomingBoxGateConfig,
+    RightTurnCrossingGateConfig,
+    RightTurnOncomingTTCGateConfig,
+    find_left_turn_ttc_trigger_boxes,
     find_oncoming_conflict_boxes,
+    find_right_turn_crossing_boxes,
+    find_right_turn_oncoming_ttc_boxes,
     should_trigger_oncoming_stop_extension,
 )
 from tfpp_sensor_rig_agent import SensorRigAgent  # noqa: E402
@@ -62,12 +68,37 @@ class PredictedBoxSafetyMixin:
             min_abs_yaw_rad=_env_float("TFPP_BOX_SAFETY_MIN_ABS_YAW_RAD", 2.30),
             min_score=_env_float("TFPP_BOX_SAFETY_MIN_SCORE", 0.50),
         )
+        self._ttc_gate_config = LeftTurnTTCGateConfig(
+            activation_x_min_m=_env_float("TFPP_BOX_TTC_X_MIN_M", 15.0),
+            activation_x_max_m=_env_float("TFPP_BOX_TTC_X_MAX_M", 35.0),
+            y_min_m=_env_float("TFPP_BOX_TTC_Y_MIN_M", -3.5),
+            y_max_m=_env_float("TFPP_BOX_TTC_Y_MAX_M", 0.5),
+            min_abs_yaw_rad=_env_float("TFPP_BOX_TTC_MIN_ABS_YAW_RAD", 2.30),
+            min_score=_env_float("TFPP_BOX_TTC_MIN_SCORE", 0.50),
+            assumed_oncoming_speed_mps=_env_float(
+                "TFPP_BOX_TTC_ASSUMED_ONCOMING_SPEED_MPS", 10.0
+            ),
+            max_ttc_s=_env_float("TFPP_BOX_TTC_MAX_S", 2.0),
+            left_last_checkpoint_y_max_m=_env_float(
+                "TFPP_BOX_TTC_LEFT_LAST_CHECKPOINT_Y_MAX_M", -0.5
+            ),
+        )
         self._left_steer_threshold = _env_float("TFPP_BOX_SAFETY_LEFT_STEER", -0.10)
+        self._right_crossing_config = RightTurnCrossingGateConfig()
+        self._right_oncoming_config = RightTurnOncomingTTCGateConfig()
+        # Right-turn hard stops are experimental and disabled by default. In
+        # closed loop they can leave the ego vehicle inside the conflict zone,
+        # where repeated traffic retriggers the latch and causes a side impact
+        # or route timeout. Keep the proven left-turn shields independent.
+        self._right_safety_enabled = bool(_env_int("TFPP_BOX_RIGHT_SAFETY", 0))
         self._max_trigger_target_speed_mps = _env_float(
             "TFPP_BOX_SAFETY_MAX_TRIGGER_TARGET_SPEED_MPS", 0.5
         )
         self._clear_hold_frames = _env_int("TFPP_BOX_SAFETY_CLEAR_HOLD_FRAMES", 8)
-        self._conflict_latch = OncomingStopExtensionLatch(self._clear_hold_frames)
+        self._stop_extension_latch = OncomingStopExtensionLatch(self._clear_hold_frames)
+        self._ttc_latch = OncomingStopExtensionLatch(self._clear_hold_frames)
+        self._right_crossing_latch = OncomingStopExtensionLatch(self._clear_hold_frames)
+        self._right_oncoming_latch = OncomingStopExtensionLatch(self._clear_hold_frames)
         self._pred_boxes_by_net: dict[int, list] = {}
         self._safety_step = 0
 
@@ -84,7 +115,7 @@ class PredictedBoxSafetyMixin:
             "[PredictedBoxSafetySensorRigAgent] sensor_only=on "
             f"left_steer<={self._left_steer_threshold:.3f} "
             f"max_trigger_target_speed={self._max_trigger_target_speed_mps:.3f} "
-            f"box_gate={self._box_gate_config}",
+            f"box_gate={self._box_gate_config} ttc_gate={self._ttc_gate_config}",
             flush=True,
         )
 
@@ -136,6 +167,11 @@ class PredictedBoxSafetyMixin:
                 if torch.is_tensor(pred_target_speed)
                 else float(pred_target_speed)
             )
+            checkpoints = (
+                pred_checkpoints.detach().float().cpu().reshape(-1, 2).tolist()
+                if torch.is_tensor(pred_checkpoints)
+                else np.asarray(pred_checkpoints, dtype=np.float32).reshape(-1, 2).tolist()
+            )
             # This shield may extend a stop the released TF++ policy already
             # selected, but it must never invent a new mid-turn stop.  The
             # latter caused a large lane excursion in the preservation route.
@@ -145,20 +181,85 @@ class PredictedBoxSafetyMixin:
                 has_conflict=bool(conflicts),
                 max_target_speed_mps=self._max_trigger_target_speed_mps,
             )
-            triggered, applied, clear_remaining = self._conflict_latch.update(
-                trigger_now=trigger_context,
+            ttc_trigger_boxes = find_left_turn_ttc_trigger_boxes(
+                boxes,
+                checkpoints,
+                speed_scalar,
+                self._ttc_gate_config,
+            )
+            right_crossing_trigger_boxes = []
+            right_crossing_conflicts = []
+            right_oncoming_trigger_boxes = []
+            right_oncoming_conflicts = []
+            if self._right_safety_enabled:
+                right_crossing_trigger_boxes = find_right_turn_crossing_boxes(
+                    boxes,
+                    checkpoints,
+                    self._right_crossing_config,
+                    activation=True,
+                )
+                right_crossing_conflicts = find_right_turn_crossing_boxes(
+                    boxes,
+                    checkpoints,
+                    self._right_crossing_config,
+                    activation=False,
+                )
+                right_oncoming_trigger_boxes = find_right_turn_oncoming_ttc_boxes(
+                    boxes,
+                    checkpoints,
+                    speed_scalar,
+                    self._right_oncoming_config,
+                    activation=True,
+                )
+                right_oncoming_conflicts = find_right_turn_oncoming_ttc_boxes(
+                    boxes,
+                    checkpoints,
+                    speed_scalar,
+                    self._right_oncoming_config,
+                    activation=False,
+                )
+            stop_triggered, stop_active, stop_clear_remaining = (
+                self._stop_extension_latch.update(
+                    trigger_now=trigger_context,
+                    conflict_now=bool(conflicts),
+                )
+            )
+            ttc_triggered, ttc_active, ttc_clear_remaining = self._ttc_latch.update(
+                trigger_now=bool(ttc_trigger_boxes),
                 conflict_now=bool(conflicts),
+            )
+            crossing_triggered, crossing_active, crossing_clear_remaining = (
+                self._right_crossing_latch.update(
+                    trigger_now=bool(right_crossing_trigger_boxes),
+                    conflict_now=bool(right_crossing_conflicts),
+                )
+            )
+            right_oncoming_triggered, right_oncoming_active, right_oncoming_clear_remaining = (
+                self._right_oncoming_latch.update(
+                    trigger_now=bool(right_oncoming_trigger_boxes),
+                    conflict_now=bool(right_oncoming_conflicts),
+                )
+            )
+            triggered = (
+                stop_triggered
+                or ttc_triggered
+                or crossing_triggered
+                or right_oncoming_triggered
+            )
+            applied = (
+                stop_active or ttc_active or crossing_active or right_oncoming_active
+            )
+            clear_remaining = max(
+                stop_clear_remaining,
+                ttc_clear_remaining,
+                crossing_clear_remaining,
+                right_oncoming_clear_remaining,
             )
             base_control = (float(steer), float(throttle), float(brake))
             if applied:
                 throttle, brake = 0.0, 1.0
 
             if self._safety_trace_handle is not None:
-                checkpoints = (
-                    pred_checkpoints.detach().float().cpu().reshape(-1, 2).tolist()
-                    if torch.is_tensor(pred_checkpoints)
-                    else np.asarray(pred_checkpoints, dtype=np.float32).reshape(-1, 2).tolist()
-                )
                 payload = {
                     "step": int(self._safety_step),
                     "ego_speed_mps": speed_scalar,
@@ -178,10 +279,29 @@ class PredictedBoxSafetyMixin:
                     "base_stop_now": bool(base_stop_now),
                     "trigger_context": bool(trigger_context),
                     "triggered": bool(triggered),
+                    "stop_triggered": bool(stop_triggered),
+                    "stop_active": bool(stop_active),
+                    "ttc_triggered": bool(ttc_triggered),
+                    "ttc_active": bool(ttc_active),
+                    "right_crossing_triggered": bool(crossing_triggered),
+                    "right_crossing_active": bool(crossing_active),
+                    "right_oncoming_triggered": bool(right_oncoming_triggered),
+                    "right_oncoming_active": bool(right_oncoming_active),
                     "clear_hold_remaining": int(clear_remaining),
                     "hazard": bool(conflicts),
                     "applied": bool(applied),
                     "conflicts": [[float(value) for value in box] for box in conflicts],
+                    "ttc_trigger_boxes": [
+                        [float(value) for value in box] for box in ttc_trigger_boxes
+                    ],
+                    "right_crossing_trigger_boxes": [
+                        [float(value) for value in box]
+                        for box in right_crossing_trigger_boxes
+                    ],
+                    "right_oncoming_trigger_boxes": [
+                        [float(value) for value in box]
+                        for box in right_oncoming_trigger_boxes
+                    ],
                     "boxes": [[float(value) for value in box] for box in boxes],
                 }
                 self._safety_trace_handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -192,4 +312,4 @@ class PredictedBoxSafetyMixin:
 
 
 class PredictedBoxSafetySensorRigAgent(PredictedBoxSafetyMixin, SensorRigAgent):
-    """Preserve released TF++ actions except for a detected left-turn conflict."""
+    """Preserve released TF++ actions except for narrowly detected conflicts."""

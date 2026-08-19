@@ -183,3 +183,20 @@ infraction: the shield triggers at frame 302, blocks the adapter's premature
 speed release, and clears after the two oncoming vehicles pass.  Screening of
 mission 013 improvement and mission 004/005 preservation continues in
 `eval_v54_v1_early_boxshield_selected_20260819`.
+
+V54 showed that mission 013 needs an earlier decision than the zero-speed
+extension can provide.  A second, independent left-turn gate uses only TF++
+checkpoints and detected boxes: the far checkpoint must already bend left, an
+oncoming box must first appear between 15 and 35 m, and conservative TTC must
+be at most 2.0 s.  Late activation inside 15 m is forbidden.  In
+`eval_v55_v1_left_ttc_m13_20260819` it triggered at frame 319 with the threat
+at about 24.7 m and completed mission 013 at PASS 100 with no infraction.
+
+An attempted symmetric right-turn hard-stop gate was rejected by closed-loop
+evaluation.  In `eval_v56_v1_right_conflicts_m4_m5_20260819`, crossing traffic
+retriggered the latch multiple times after Tesla had entered the junction.
+Mission 004 was then struck laterally while stopped and mission 005 timed out
+at 58.21% route.  Right-turn hard stops are therefore disabled by default via
+`TFPP_BOX_RIGHT_SAFETY=0`; their detector geometry remains diagnostic only.
+The candidate under full-20 evaluation is the prior 11/20 speed adapter plus
+the two validated left-turn shields, with all other outputs preserved.
