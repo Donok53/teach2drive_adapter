@@ -11,6 +11,7 @@ from teach2drive_adapter.predicted_box_safety import (
     find_right_turn_crossing_boxes,
     find_right_turn_oncoming_ttc_boxes,
     is_oncoming_conflict_box,
+    is_left_route_command,
     should_trigger_oncoming_stop_extension,
 )
 
@@ -77,6 +78,13 @@ def test_stop_extension_trigger_rejects_a_new_mid_turn_stop():
     assert not should_trigger_oncoming_stop_extension(
         target_speed_mps=0.0, has_conflict=False
     )
+
+
+def test_left_route_command_is_explicit_and_does_not_match_right_or_straight():
+    assert is_left_route_command(1)
+    assert not is_left_route_command(2)
+    assert not is_left_route_command(3)
+    assert not is_left_route_command(4)
 
 
 def test_left_turn_ttc_triggers_early_mission13_like_threat():

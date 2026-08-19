@@ -33,6 +33,7 @@ from teach2drive_adapter.predicted_box_safety import (  # noqa: E402
     find_oncoming_conflict_boxes,
     find_right_turn_crossing_boxes,
     find_right_turn_oncoming_ttc_boxes,
+    is_left_route_command,
     should_trigger_oncoming_stop_extension,
 )
 from tfpp_sensor_rig_agent import SensorRigAgent  # noqa: E402
@@ -172,20 +173,26 @@ class PredictedBoxSafetyMixin:
                 if torch.is_tensor(pred_checkpoints)
                 else np.asarray(pred_checkpoints, dtype=np.float32).reshape(-1, 2).tolist()
             )
+            route_command = int(self.commands[-2]) if len(self.commands) >= 2 else 4
+            left_route_context = is_left_route_command(route_command)
             # This shield may extend a stop the released TF++ policy already
             # selected, but it must never invent a new mid-turn stop.  The
             # latter caused a large lane excursion in the preservation route.
             base_stop_now = target_scalar <= self._max_trigger_target_speed_mps
-            trigger_context = should_trigger_oncoming_stop_extension(
+            trigger_context = left_route_context and should_trigger_oncoming_stop_extension(
                 target_speed_mps=target_scalar,
                 has_conflict=bool(conflicts),
                 max_target_speed_mps=self._max_trigger_target_speed_mps,
             )
-            ttc_trigger_boxes = find_left_turn_ttc_trigger_boxes(
-                boxes,
-                checkpoints,
-                speed_scalar,
-                self._ttc_gate_config,
+            ttc_trigger_boxes = (
+                find_left_turn_ttc_trigger_boxes(
+                    boxes,
+                    checkpoints,
+                    speed_scalar,
+                    self._ttc_gate_config,
+                )
+                if left_route_context
+                else []
             )
             right_crossing_trigger_boxes = []
             right_crossing_conflicts = []
@@ -276,6 +283,8 @@ class PredictedBoxSafetyMixin:
                         "brake": float(brake),
                     },
                     "left_turn_now": bool(left_turn_now),
+                    "route_command": int(route_command),
+                    "left_route_context": bool(left_route_context),
                     "base_stop_now": bool(base_stop_now),
                     "trigger_context": bool(trigger_context),
                     "triggered": bool(triggered),

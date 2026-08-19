@@ -200,3 +200,12 @@ at 58.21% route.  Right-turn hard stops are therefore disabled by default via
 `TFPP_BOX_RIGHT_SAFETY=0`; their detector geometry remains diagnostic only.
 The candidate under full-20 evaluation is the prior 11/20 speed adapter plus
 the two validated left-turn shields, with all other outputs preserved.
+
+The first full-20 attempt exposed one more scope bug before it reached a
+previously passing route.  On right-turn mission 001, the zero-speed extension
+could still latch because it checked boxes and target speed but not TF++'s
+standard route command.  The mission was already a timeout in the historical
+11/20 run, but the intervention was outside the intended contract and could
+regress other routes.  Both left-turn shields now additionally require
+`RoadOption.LEFT` (`self.commands[-2] == 1`).  Right, straight, and lane-follow
+commands therefore use the exact base/adapter output.

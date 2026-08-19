@@ -277,3 +277,9 @@ def should_trigger_oncoming_stop_extension(
         bool(has_conflict)
         and float(target_speed_mps) <= float(max_target_speed_mps)
     )
+
+
+def is_left_route_command(command: int | float, left_command_value: int = 1) -> bool:
+    """Match CARLA Leaderboard's standard RoadOption.LEFT route command."""
+
+    return int(command) == int(left_command_value)
