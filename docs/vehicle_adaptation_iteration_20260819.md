@@ -153,12 +153,18 @@ Early closed-loop versions exposed two important negative controls:
 - interpreting PID `brake=1` as a semantic stop was wrong, because PID also
   brakes when current speed is merely above a nonzero target speed.
 
-The accepted trigger under evaluation is consequently limited to:
+The trigger is consequently limited to:
 
-1. TF++ is currently steering left;
-2. its own detector sees a high-confidence oncoming vehicle in the conflict
+1. TF++'s own detector sees a high-confidence oncoming vehicle in the conflict
    lane;
-3. TF++ itself has selected a target speed at or below 0.5 m/s.
+2. TF++ itself has selected a target speed at or below 0.5 m/s.
+
+Current steering cannot be required: the target-speed adapter can wait while
+its short-horizon checkpoints are still straight and begin steering only after
+releasing speed.  In V53 this delayed the trigger from frame 302 to frame 396,
+after the repeated collision point.  Removing current steering from the
+trigger still produces zero activations over all three recorded mission-002
+preservation traces.
 
 After triggering, the shield only extends that already-selected stop until
 the detected conflict clears (plus eight frames for detector flicker).  In
@@ -171,7 +177,9 @@ closed loop, `diag_v52_targetzero_stop_pair_m2_m3_20260819` produced:
   extended the existing stop for 83 frames, released after the second
   oncoming car cleared, and avoided the repeated Dodge Charger collision.
 
-The next cumulative test is
-`eval_v53_v1_targetspeed_boxshield_selected_20260819`: combine this shield with
-the prior sensor-only target-speed adapter that scored 11/20, then screen
-mission 003 and 013 improvements against mission 004 and 005 preservation.
+The cumulative V54 test combines the shield with the prior sensor-only
+target-speed adapter that scored 11/20.  Mission 003 is again PASS 100 with no
+infraction: the shield triggers at frame 302, blocks the adapter's premature
+speed release, and clears after the two oncoming vehicles pass.  Screening of
+mission 013 improvement and mission 004/005 preservation continues in
+`eval_v54_v1_early_boxshield_selected_20260819`.

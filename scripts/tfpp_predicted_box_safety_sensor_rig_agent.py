@@ -24,10 +24,10 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from teach2drive_adapter.predicted_box_safety import (  # noqa: E402
-    LeftTurnConflictLatch,
+    OncomingStopExtensionLatch,
     OncomingBoxGateConfig,
     find_oncoming_conflict_boxes,
-    should_trigger_left_turn_stop_extension,
+    should_trigger_oncoming_stop_extension,
 )
 from tfpp_sensor_rig_agent import SensorRigAgent  # noqa: E402
 import transfuser_utils as t_u  # noqa: E402
@@ -67,7 +67,7 @@ class PredictedBoxSafetyMixin:
             "TFPP_BOX_SAFETY_MAX_TRIGGER_TARGET_SPEED_MPS", 0.5
         )
         self._clear_hold_frames = _env_int("TFPP_BOX_SAFETY_CLEAR_HOLD_FRAMES", 8)
-        self._conflict_latch = LeftTurnConflictLatch(self._clear_hold_frames)
+        self._conflict_latch = OncomingStopExtensionLatch(self._clear_hold_frames)
         self._pred_boxes_by_net: dict[int, list] = {}
         self._safety_step = 0
 
@@ -140,15 +140,13 @@ class PredictedBoxSafetyMixin:
             # selected, but it must never invent a new mid-turn stop.  The
             # latter caused a large lane excursion in the preservation route.
             base_stop_now = target_scalar <= self._max_trigger_target_speed_mps
-            trigger_context = should_trigger_left_turn_stop_extension(
-                steer=float(steer),
+            trigger_context = should_trigger_oncoming_stop_extension(
                 target_speed_mps=target_scalar,
                 has_conflict=bool(conflicts),
-                left_steer_threshold=self._left_steer_threshold,
                 max_target_speed_mps=self._max_trigger_target_speed_mps,
             )
             triggered, applied, clear_remaining = self._conflict_latch.update(
-                left_turn_now=trigger_context,
+                trigger_now=trigger_context,
                 conflict_now=bool(conflicts),
             )
             base_control = (float(steer), float(throttle), float(brake))

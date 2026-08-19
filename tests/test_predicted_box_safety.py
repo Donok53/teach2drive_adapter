@@ -1,11 +1,11 @@
 from math import pi
 
 from teach2drive_adapter.predicted_box_safety import (
-    LeftTurnConflictLatch,
+    OncomingStopExtensionLatch,
     OncomingBoxGateConfig,
     find_oncoming_conflict_boxes,
     is_oncoming_conflict_box,
-    should_trigger_left_turn_stop_extension,
+    should_trigger_oncoming_stop_extension,
 )
 
 
@@ -44,31 +44,30 @@ def test_custom_range_is_honored():
     assert not is_oncoming_conflict_box(box(x=11.0), config)
 
 
-def test_conflict_latch_requires_left_turn_for_initial_trigger():
-    latch = LeftTurnConflictLatch(clear_hold_frames=2)
-    assert latch.update(left_turn_now=False, conflict_now=True) == (False, False, 0)
-    assert latch.update(left_turn_now=True, conflict_now=True) == (True, True, 2)
+def test_conflict_latch_requires_explicit_initial_trigger():
+    latch = OncomingStopExtensionLatch(clear_hold_frames=2)
+    assert latch.update(trigger_now=False, conflict_now=True) == (False, False, 0)
+    assert latch.update(trigger_now=True, conflict_now=True) == (True, True, 2)
 
 
 def test_active_latch_tracks_conflict_without_stale_turn_memory():
-    latch = LeftTurnConflictLatch(clear_hold_frames=2)
-    latch.update(left_turn_now=True, conflict_now=True)
-    assert latch.update(left_turn_now=False, conflict_now=True) == (False, True, 2)
-    assert latch.update(left_turn_now=False, conflict_now=False) == (False, True, 1)
-    assert latch.update(left_turn_now=False, conflict_now=False) == (False, True, 0)
-    assert latch.update(left_turn_now=False, conflict_now=False) == (False, False, 0)
+    latch = OncomingStopExtensionLatch(clear_hold_frames=2)
+    latch.update(trigger_now=True, conflict_now=True)
+    assert latch.update(trigger_now=False, conflict_now=True) == (False, True, 2)
+    assert latch.update(trigger_now=False, conflict_now=False) == (False, True, 1)
+    assert latch.update(trigger_now=False, conflict_now=False) == (False, True, 0)
+    assert latch.update(trigger_now=False, conflict_now=False) == (False, False, 0)
     # A new straight-road vehicle must not reactivate the cleared latch.
-    assert latch.update(left_turn_now=False, conflict_now=True) == (False, False, 0)
+    assert latch.update(trigger_now=False, conflict_now=True) == (False, False, 0)
 
 
 def test_stop_extension_trigger_rejects_a_new_mid_turn_stop():
-    common = dict(steer=-0.22, has_conflict=True)
-    assert not should_trigger_left_turn_stop_extension(
-        target_speed_mps=10.0, **common
+    assert not should_trigger_oncoming_stop_extension(
+        target_speed_mps=10.0, has_conflict=True
     )
-    assert should_trigger_left_turn_stop_extension(
-        target_speed_mps=0.0, **common
+    assert should_trigger_oncoming_stop_extension(
+        target_speed_mps=0.0, has_conflict=True
     )
-    assert not should_trigger_left_turn_stop_extension(
-        steer=0.0, target_speed_mps=0.0, has_conflict=True
+    assert not should_trigger_oncoming_stop_extension(
+        target_speed_mps=0.0, has_conflict=False
     )

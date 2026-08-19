@@ -27,21 +27,21 @@ class OncomingBoxGateConfig:
 
 
 @dataclass
-class LeftTurnConflictLatch:
-    """Latch only a conflict that was first observed during an active left turn.
+class OncomingStopExtensionLatch:
+    """Latch a conflict first observed during an existing zero-speed decision.
 
     Once triggered, the latch remains active while the vehicle is still
     detected.  A short clear hold bridges detector flicker.  A later oncoming
-    vehicle cannot retrigger the latch on a straight road.
+    vehicle cannot retrigger the latch unless TF++ again selects zero speed.
     """
 
     clear_hold_frames: int = 8
     active: bool = False
     clear_remaining: int = 0
 
-    def update(self, *, left_turn_now: bool, conflict_now: bool) -> tuple[bool, bool, int]:
+    def update(self, *, trigger_now: bool, conflict_now: bool) -> tuple[bool, bool, int]:
         triggered = False
-        if not self.active and left_turn_now and conflict_now:
+        if not self.active and trigger_now and conflict_now:
             self.active = True
             triggered = True
 
@@ -85,18 +85,15 @@ def find_oncoming_conflict_boxes(
     return [box for box in boxes if is_oncoming_conflict_box(box, config)]
 
 
-def should_trigger_left_turn_stop_extension(
+def should_trigger_oncoming_stop_extension(
     *,
-    steer: float,
     target_speed_mps: float,
     has_conflict: bool,
-    left_steer_threshold: float = -0.10,
     max_target_speed_mps: float = 0.5,
 ) -> bool:
-    """Allow extending an existing stop, never inventing a mid-turn stop."""
+    """Extend a zero-speed decision; never invent a new moving stop."""
 
     return (
         bool(has_conflict)
-        and float(steer) <= float(left_steer_threshold)
         and float(target_speed_mps) <= float(max_target_speed_mps)
     )
